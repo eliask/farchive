@@ -2,7 +2,40 @@
 
 Content-addressed archive with locator-scoped observation history and adaptive zstd compression.
 
-Farchive stores opaque byte payloads and remembers where and when they were observed. It deduplicates by content (SHA-256), tracks state changes at each locator as contiguous spans, and transparently compresses everything with zstd — including corpus-trained dictionaries that adapt to your data.
+Farchive stores opaque byte payloads and remembers where and when they were observed. It deduplicates by content (SHA-256), tracks state changes at each locator as contiguous spans, and transparently compresses everything with zstd -- including corpus-trained dictionaries that adapt to your data.
+
+## Why
+
+You're fetching web pages, downloading API responses, or archiving regulatory documents. You want to:
+
+- **Know what changed and when.** Not just "the latest version" but the full history of what you observed at each URL. If a page reverted to an earlier version, you want to see that -- not have it silently collapsed into one record.
+- **Store it efficiently.** Thousands of XML documents that are 90% identical structure shouldn't cost 90% redundant storage.
+- **Keep it simple.** One SQLite file. No server. No configuration. Works from a script, a notebook, a cron job.
+
+Existing tools cover parts of this -- SQLar does single-file archives, WARC does web archival, Fossil does versioned content -- but nothing combines content-addressed dedup, temporal observation history, and adaptive corpus compression in a single queryable local file.
+
+### Use cases
+
+**Web scraping with change detection.** Archive pages as you crawl. Query what changed between observations. Detect when a page reverted. Freshness checks avoid redundant fetches.
+
+```python
+with Farchive("scrape.farchive") as fa:
+    for url in urls:
+        if not fa.has(url, max_age_hours=24):
+            resp = httpx.get(url)
+            fa.store(url, resp.content, storage_class="html")
+    # Later: what changed?
+    for span in fa.history("https://example.com/pricing"):
+        print(f"{span.observed_from}  {span.digest[:12]}")
+```
+
+**API response archival.** Store every response from a REST or SOAP API. Dedup means identical responses cost nothing. Point-in-time queries let you reconstruct what you knew at any moment.
+
+**Legal/regulatory corpus management.** Archive legislation, regulations, court decisions. Track amendments over time. Corpus-trained zstd dictionaries compress thousands of structurally similar XML documents at 5-10x ratios. (This is the use case farchive was extracted from.)
+
+**ML dataset versioning.** Store training data snapshots at locators like `dataset://v3/train.jsonl`. Content-addressed storage means identical data across versions is stored once. History shows the full lineage.
+
+**Configuration/infrastructure snapshots.** Periodically archive config files, terraform state, DNS records. Spans show exactly when each change was first observed.
 
 ## Install
 

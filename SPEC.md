@@ -4,6 +4,22 @@ Status: implemented (v0.1.0), living spec.
 
 ---
 
+## 0. Motivation
+
+Many programs need to fetch, store, and re-read opaque byte payloads from external sources -- web pages, API responses, regulatory documents, configuration snapshots. The common requirements are:
+
+1. **Don't re-fetch what hasn't changed.** Content-addressed dedup and freshness checks.
+2. **Know what changed and when.** Not just the latest version, but when each distinct version was first and last observed.
+3. **Don't lose history.** If content reverts to an earlier version, that's a distinct event -- not something to silently collapse.
+4. **Store it compactly.** Thousands of structurally similar documents (XML statutes, HTML pages, JSON API responses) should benefit from corpus-level compression, not just per-file.
+5. **Keep it boring.** One local file. No server. No configuration. Queryable with SQL if needed.
+
+Adjacent tools each cover a subset: SQLar (single-file SQLite archive, Deflate only), WARC (web archival format, not queryable), Fossil (DVCS with delta compression, repository model not observation model), `sqlite-zstd` (zstd inside SQLite, no observation semantics). None combines content-addressed dedup, locator-scoped temporal history, and adaptive corpus compression in a single queryable local store.
+
+Farchive fills that gap.
+
+---
+
 ## 1. Design Goal
 
 Farchive is a local archive for opaque byte payloads observed at opaque locators over time.
