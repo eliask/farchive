@@ -62,8 +62,11 @@ def _cmd_locators(args: argparse.Namespace) -> None:
 
 
 def _cmd_train_dict(args: argparse.Namespace) -> None:
+    if not args.storage_class:
+        print("Error: --storage-class is required", file=sys.stderr)
+        sys.exit(1)
     with Farchive(args.db) as fa:
-        sc = args.storage_class or None
+        sc = args.storage_class
         print(
             f"Training dict (storage_class={sc!r}, samples={args.sample_size})...",
             file=sys.stderr,

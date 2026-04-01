@@ -473,8 +473,23 @@ def test_events_api_returns_event_objects(archive_with_events):
     assert evts[0].occurred_at == _T0
 
 
-def test_events_api_returns_empty_when_disabled(archive):
+def test_events_api_returns_empty_when_disabled_and_no_table(archive):
     assert archive.events("loc/any") == []
+
+
+def test_events_readable_on_reopen_without_enable(tmp_path):
+    """Event history should be readable even if reopened without enable_events."""
+    db = tmp_path / "reopen_events.farchive"
+    # Write with events enabled
+    with Farchive(db, enable_events=True) as fa:
+        d = fa.put_blob(b"reopen test")
+        fa.observe("loc/re", d, observed_at=_T0)
+
+    # Reopen WITHOUT enable_events — should still read existing events
+    with Farchive(db) as fa2:
+        evts = fa2.events("loc/re")
+        assert len(evts) == 1
+        assert evts[0].kind == "fa.observe"
 
 
 def test_events_api_since_filter(archive_with_events):

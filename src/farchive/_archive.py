@@ -99,10 +99,8 @@ class Farchive:
 
         # Use default isolation_level ("") for proper transaction support.
         # `with self._conn:` gives atomic BEGIN/COMMIT blocks.
-        self._conn = sqlite3.connect(
-            str(self._db_path),
-            check_same_thread=False,
-        )
+        # check_same_thread=True enforces the documented "not thread-safe" contract.
+        self._conn = sqlite3.connect(str(self._db_path))
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA busy_timeout=5000")
@@ -284,7 +282,13 @@ class Farchive:
 
         Enforces monotone observation time per locator.
         """
-        metadata_json = json.dumps(metadata) if metadata else None
+        if metadata:
+            try:
+                metadata_json = json.dumps(metadata)
+            except (TypeError, ValueError) as e:
+                raise TypeError(f"metadata must be JSON-serializable: {e}") from e
+        else:
+            metadata_json = None
 
         # Find current open span for this locator
         current = self._conn.execute(
@@ -595,11 +599,17 @@ class Farchive:
         since: int | None = None,
         limit: int = 1000,
     ) -> list[Event]:
-        """Query event log. Requires enable_events=True.
+        """Query event log.
 
+        Reads existing event history whenever the event table exists,
+        regardless of whether this instance has enable_events=True.
         Returns events newest-first, optionally filtered by locator and/or time.
         """
-        if not self._events_enabled:
+        # Check if event table exists (may have been created by a prior session)
+        has_table = self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='event'"
+        ).fetchone()
+        if not has_table:
             return []
 
         conditions = []
@@ -627,10 +637,13 @@ class Farchive:
     def train_dict(
         self,
         *,
+        storage_class: str,
         sample_size: int = 500,
-        storage_class: str | None = None,
     ) -> int:
-        """Train a zstd dict from corpus samples. Returns dict_id."""
+        """Train a zstd dict from corpus samples. Returns dict_id.
+
+        Requires storage_class — global dictionaries are not supported.
+        """
         return self._train_dict_impl(
             storage_class=storage_class,
             sample_size=sample_size,
@@ -642,19 +655,16 @@ class Farchive:
         storage_class: str | None = None,
         sample_size: int = 500,
     ) -> int:
-        # Sample blobs
-        if storage_class is not None:
-            rows = self._conn.execute(
-                "SELECT payload, codec, codec_dict_id, raw_size "
-                "FROM blob WHERE storage_class=? ORDER BY RANDOM() LIMIT ?",
-                (storage_class, sample_size * 2),
-            ).fetchall()
-        else:
-            rows = self._conn.execute(
-                "SELECT payload, codec, codec_dict_id, raw_size "
-                "FROM blob ORDER BY RANDOM() LIMIT ?",
-                (sample_size * 2,),
-            ).fetchall()
+        if not storage_class:
+            raise ValueError(
+                "train_dict() requires storage_class. Global (unscoped) "
+                "dictionaries are not supported — train per storage class."
+            )
+        rows = self._conn.execute(
+            "SELECT payload, codec, codec_dict_id, raw_size "
+            "FROM blob WHERE storage_class=? ORDER BY RANDOM() LIMIT ?",
+            (storage_class, sample_size * 2),
+        ).fetchall()
 
         samples: list[bytes] = []
         for row in rows:
@@ -672,9 +682,7 @@ class Farchive:
             except Exception:
                 continue
 
-        target_size = self._policy.dict_target_sizes.get(
-            storage_class or "", 112 * 1024,
-        )
+        target_size = self._policy.dict_target_sizes.get(storage_class, 112 * 1024)
         dict_data = train_dict_from_samples(samples, target_size=target_size)
         serialized = dict_data.as_bytes()
 
@@ -684,7 +692,7 @@ class Farchive:
                 cursor = self._conn.execute(
                     "INSERT INTO dict (storage_class, trained_at, sample_count, "
                     "dict_bytes, dict_size) VALUES (?, ?, ?, ?, ?)",
-                    (storage_class or "", now, len(samples), serialized, len(serialized)),
+                    (storage_class, now, len(samples), serialized, len(serialized)),
                 )
                 dict_id = cursor.lastrowid
                 assert dict_id is not None
@@ -724,6 +732,15 @@ class Farchive:
             dict_id = self._get_latest_dict_id(storage_class)
             if dict_id is None:
                 raise ValueError(f"No trained dict for storage_class={storage_class!r}")
+
+        # If dict_id given without storage_class, derive class from the dict
+        # to ensure we only repack blobs matching this dict's class
+        if storage_class is None:
+            row = self._conn.execute(
+                "SELECT storage_class FROM dict WHERE dict_id=?", (dict_id,),
+            ).fetchone()
+            if row and row["storage_class"]:
+                storage_class = row["storage_class"]
 
         d = self._load_dict(dict_id)
         with self._write_lock():
