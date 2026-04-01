@@ -93,7 +93,7 @@ class Farchive:
         self._has_dict_for_class: dict[str, bool | None] = {}
 
         # File-based write lock
-        self._lock_path = self._db_path.with_suffix(".farchive.lock")
+        self._lock_path = self._db_path.with_name(self._db_path.name + ".writer.lock")
         self._lock_held = False
 
     @contextmanager
