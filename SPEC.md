@@ -1,6 +1,6 @@
 # Farchive Spec v1 and SQLite/Zstd Profile
 
-Status: conformant with v0.2.1 implementation, living spec.
+Status: conformant with v0.3.0 implementation, living spec.
 
 ---
 
@@ -295,27 +295,69 @@ Query the event audit log. Returns events newest-first, optionally filtered by l
 
 ---
 
-## 8. Compression Semantics
+## 8. Failure Modes
+
+The following error behaviors are part of the public contract:
+
+| Condition | Exception | Message pattern |
+|---|---|---|
+| `observe(locator, missing_digest)` | `ValueError` | "not found — call put_blob() first" |
+| Out-of-order observation | `ValueError` | "Out-of-order observation" |
+| Same-timestamp digest change | `ValueError` | "Same-timestamp digest change" |
+| Non-JSON-serializable metadata | `TypeError` | "metadata must be JSON-serializable" |
+| `repack()` without scoping | `ValueError` | "requires storage_class or dict_id" |
+| `repack()` with mismatched dict/class | `ValueError` | "does not match dict" |
+| `train_dict()` without storage_class | `ValueError` | "requires storage_class" |
+| `train_dict()` with <10 samples | `ValueError` | "Need at least 10 samples" |
+| DB version newer than library | `RuntimeError` | "Upgrade farchive" |
+
+---
+
+## 9. Metadata Semantics
+
+### 9.1 Type contract
+
+Metadata MUST be a JSON object (`dict[str, Any]` where values are JSON-serializable) or `None`. The runtime enforces this — non-serializable values raise `TypeError`.
+
+### 9.2 Metadata on span confirmation
+
+When `observe()` is called with the same digest (Case B, extending a span):
+
+- `metadata={"key": "val"}` — replaces span's `last_metadata`
+- `metadata=None` — preserves existing metadata (no-op, not "clear")
+
+This means callers can confirm a span without losing its metadata.
+
+### 9.3 Python vs SQLite representation
+
+- **Python API:** `dict[str, Any] | None` (structured)
+- **SQLite storage:** `last_metadata_json TEXT` (JSON text)
+
+The library handles serialization/deserialization transparently.
+
+---
+
+## 10. Compression Semantics
 
 Compression is a storage concern, not an archive-identity concern.
 
-### 8.1 Required properties
+### 10.1 Required properties
 
 Any compression strategy MUST satisfy: exact reversibility, raw-byte round-trip, no digest change, no history change.
 
-### 8.2 Repacking
+### 10.2 Repacking
 
 Repacking MAY rewrite stored blob payloads and storage metadata. Repacking MUST preserve: digest, raw bytes, spans, events, query semantics.
 
 The official profile requires `storage_class` or an explicit `dict_id` for repack operations to prevent cross-applying a dictionary trained on one storage class to blobs of another.
 
-### 8.3 Dictionaries
+### 10.3 Dictionaries
 
 An implementation MAY train and use corpus-specific compression dictionaries. Dictionary usage is storage-only and MUST be invisible to readers.
 
 ---
 
-## 9. Field Taxonomy
+## 11. Field Taxonomy
 
 ### Closed fields
 
@@ -341,9 +383,9 @@ In Python APIs these are structured values. In the SQLite profile they are persi
 
 ---
 
-## 10. Official SQLite Single-File Profile
+## 12. Official SQLite Single-File Profile
 
-### 10.1 Configuration
+### 12.1 Configuration
 
 - SQLite WAL mode
 - `busy_timeout = 5000`
@@ -352,7 +394,7 @@ In Python APIs these are structured values. In the SQLite profile they are persi
 - POSIX advisory file lock for single-writer coordination across processes
 - Not thread-safe (one instance per thread)
 
-### 10.2 Schema (v1)
+### 12.2 Schema (v1)
 
 ```sql
 CREATE TABLE schema_info (
@@ -414,7 +456,7 @@ CREATE INDEX idx_event_locator_time
     ON event(locator, occurred_at DESC);
 ```
 
-### 10.3 Blob table notes
+### 12.3 Blob table notes
 
 - `payload` stores the physical bytes as encoded by `codec`.
 - `codec='raw'` means `payload` is exact raw bytes.
@@ -423,7 +465,7 @@ CREATE INDEX idx_event_locator_time
 - The meaning of the blob is always the raw bytes identified by `digest`, not the physical `payload`.
 - `storage_class` is an insertion-time compression hint, not semantic MIME truth. First-insert wins for deduped blobs.
 
-### 10.4 Locator span table notes
+### 12.4 Locator span table notes
 
 - `observed_from` is inclusive.
 - `observed_until` is exclusive.
@@ -433,9 +475,9 @@ CREATE INDEX idx_event_locator_time
 
 ---
 
-## 11. Official Zstd Adaptive Compression Profile
+## 13. Official Zstd Adaptive Compression Profile
 
-### 11.1 Codec families
+### 13.1 Codec families
 
 The official profile supports three compression modes:
 
@@ -443,7 +485,7 @@ The official profile supports three compression modes:
 2. **Vanilla zstd** -- standard compression, no dictionary
 3. **Dictionary zstd** -- `codec_dict_id` references a trained dictionary
 
-### 11.2 CompressionPolicy
+### 13.2 CompressionPolicy
 
 ```python
 @dataclass
@@ -456,7 +498,7 @@ class CompressionPolicy:
 
 These are policy defaults, not spec law. An implementation MAY choose different defaults.
 
-### 11.3 Dictionary usage vs auto-training
+### 13.3 Dictionary usage vs auto-training
 
 Dictionary **usage** and **auto-training** are decoupled:
 
@@ -464,44 +506,72 @@ Dictionary **usage** and **auto-training** are decoupled:
 - `auto_train_thresholds` only governs **automatic** training. Storage classes not listed can still have dictionaries trained manually via `train_dict()`, and those dictionaries will be used.
 - `put_blob()`, `store()`, and `store_batch()` all resolve and use the latest trained dictionary for the given storage class.
 
-### 11.4 Auto-training
+### 13.4 Auto-training
 
-When enough blobs of a storage class listed in `auto_train_thresholds` accumulate, the archive auto-trains a zstd dictionary and repacks existing blobs. This is a storage optimization that MUST NOT alter archive semantics.
+When enough blobs of a storage class listed in `auto_train_thresholds` accumulate, the archive auto-trains a zstd dictionary. New blobs of that class immediately use the trained dictionary.
+
+Recompression of older blobs is **not automatic** -- it requires an explicit `repack()` call. This keeps write latency predictable and separates semantic operations (store/observe) from maintenance operations (repack).
+
+Auto-training MUST NOT alter archive semantics.
 
 ---
 
-## 12. HTTP Integration Conventions
+## 14. HTTP Integration Conventions
 
 Farchive core is transport-neutral. HTTP is one source of observations. This section documents recommended conventions for callers that integrate HTTP sources.
 
 HTTP fetching is NOT implemented in the farchive library. The caller fetches bytes using their preferred HTTP library and calls `store()`.
 
-### 12.1 Archived bytes
+### 14.1 Archived bytes
 
 Store **response body bytes** after HTTP framing is removed.
 
-### 12.2 Headers and metadata
+### 14.2 Headers and metadata
 
 - Full response headers go in `event metadata["http"]["response_headers"]` as ordered `[name, value]` pairs.
 - Span metadata holds only a small latest summary (e.g. `etag`, `last_modified`, `content_type`).
 - Headers MUST be stored as ordered pairs, not a dict (header names can repeat).
 
-### 12.3 304 Not Modified
+### 14.3 304 Not Modified
 
 A 304 can be represented by re-observing the current span's digest at the locator. The current span gets `last_confirmed_at` updated and `observation_count` incremented. No new blob, no span transition.
 
-### 12.4 Errors
+### 14.4 Errors
 
 Transport errors (timeout, connection failure) are not represented in core span semantics. Callers may record them in event metadata (if events are enabled) or track them externally.
 
 ---
 
-## 13. File Extension
+## 15. File Extension
 
 The official file extension is `.farchive`. Default filename: `archive.farchive`. Lock file: `<name>.writer.lock`.
 
 ---
 
-## 14. Summary
+## 16. Compatibility Promise
+
+### 16.1 On-disk format
+
+A `.farchive` file written by farchive 1.x MUST remain readable by later farchive 1.x releases. Schema version 1 is the 1.0 schema.
+
+### 16.2 Unknown columns
+
+Readers MUST tolerate unknown columns in existing tables (ignore them). This allows forward-compatible schema extensions without breaking older readers.
+
+### 16.3 Pre-1.0 databases
+
+Pre-1.0 databases (v0.x) are not guaranteed to be compatible. Users should recreate archives from source data when upgrading to 1.0.
+
+### 16.4 Writer version
+
+A 1.x writer MUST NOT write a schema version higher than the one it declares. Schema bumps require a new minor version at minimum.
+
+### 16.5 Platform
+
+POSIX file locking (fcntl) provides multi-process writer serialization. On platforms without fcntl (Windows), the archive falls back to no file locking — safe for single-process use only. Cross-platform multi-process locking is a post-1.0 goal.
+
+---
+
+## 17. Summary
 
 Farchive is a positive-observation archive for opaque bytes: it preserves what was observed at each locator over time, but does not infer unobserved world state between observations. It provides immutable content-addressed blobs, locator-scoped contiguous observation spans, optional append-only event logs, and transparent pluggable storage optimization, where adaptive zstd dictionaries are the default optimization profile rather than the core semantic model.

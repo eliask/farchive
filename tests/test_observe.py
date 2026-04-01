@@ -180,6 +180,18 @@ def test_equal_timestamp_different_digest_rejected(archive):
         archive.observe("loc/eqd", d_b, observed_at=_T0)
 
 
+def test_observe_missing_digest_raises(archive):
+    fake_digest = "a" * 64
+    with pytest.raises(ValueError, match="not found"):
+        archive.observe("loc/missing", fake_digest, observed_at=_T0)
+
+
+def test_non_json_metadata_raises(archive):
+    digest = archive.put_blob(b"meta fail")
+    with pytest.raises(TypeError, match="JSON-serializable"):
+        archive.observe("loc/badjson", digest, observed_at=_T0, metadata={"bad": object()})
+
+
 # ---------------------------------------------------------------------------
 # resolve -- current span
 # ---------------------------------------------------------------------------
@@ -519,3 +531,11 @@ def test_metadata_updated_on_extend(archive):
     archive.observe("loc/mupd", digest, observed_at=_T0, metadata={"v": 1})
     span = archive.observe("loc/mupd", digest, observed_at=_T1, metadata={"v": 2})
     assert span.last_metadata == {"v": 2}
+
+
+def test_metadata_none_on_confirm_preserves_existing(archive):
+    """metadata=None on a confirm means 'no update', not 'clear'."""
+    digest = archive.put_blob(b"preserve meta")
+    archive.observe("loc/pres", digest, observed_at=_T0, metadata={"key": "value"})
+    span = archive.observe("loc/pres", digest, observed_at=_T1)  # metadata=None
+    assert span.last_metadata == {"key": "value"}

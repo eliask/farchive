@@ -1,18 +1,20 @@
 # farchive
 
-Content-addressed archive with locator-scoped observation history and adaptive zstd compression.
+A local, history-preserving archive for opaque bytes observed at named locators.
 
-Farchive stores opaque byte payloads and remembers where and when they were observed. It deduplicates by content (SHA-256), tracks state changes at each locator as contiguous spans, and optimizes storage transparently with zstd -- including corpus-trained dictionaries that adapt to your data.
+Farchive stores bytes once by SHA-256 digest, preserves each locator's observation history as contiguous spans, and optimizes storage transparently with zstd dictionaries.
 
 ## Why
 
-You're fetching web pages, downloading API responses, or archiving regulatory documents. You want to:
+Most tools make you choose between a cache, a blob store, a version-control system, and a web archive. Farchive is the boring local thing in the middle: you record what bytes you observed at a locator and when, read them back exactly, resolve the current state or the state at a past time, and keep repetitive corpora compact.
 
-- **Know what changed and when.** Not just "the latest version" but the full history of what you observed at each URL. If a page reverted to an earlier version, you want to see that -- not have it silently collapsed into one record.
-- **Store it efficiently.** Thousands of XML documents that are 90% identical structure shouldn't cost 90% redundant storage.
-- **Keep it simple.** One SQLite file. No server. No configuration. Works from a script, a notebook, a cron job.
+- **Preserve what was observed.** If a locator goes A -> B -> A, that is three spans, not one collapsed record.
+- **Store bytes once.** Identical payloads deduplicate by digest.
+- **Query it simply.** Latest, as-of, history, freshness.
+- **Keep it small.** Repetitive XML/HTML/PDF corpora benefit from trained zstd dictionaries.
+- **Keep it local and boring.** One SQLite file, no server, no daemon.
 
-Existing tools cover parts of this -- SQLar does single-file archives, WARC does web archival, Fossil does versioned content -- but nothing combines content-addressed dedup, temporal observation history, and adaptive corpus compression in a single queryable local file.
+I wanted a local tool that combined content-addressed dedup, locator history, and corpus-adaptive compression in one queryable file.
 
 ### Use cases
 
@@ -104,15 +106,15 @@ fa.stats()                          # archive statistics
 
 ## Compression
 
-Farchive uses zstd with three strategies, chosen automatically:
+Farchive stores blobs using three physical strategies:
 
-1. **Raw** — blobs under 64 bytes stored uncompressed
+1. **Raw** — blobs under the raw threshold (default 64 bytes) are stored uncompressed
 2. **Vanilla zstd** — standard compression
-3. **Dictionary zstd** — corpus-trained dictionaries for 2-5x better compression on repetitive data (XML, HTML, PDF)
+3. **Dictionary zstd** — corpus-trained dictionaries for configured storage classes
 
-Dictionaries are auto-trained when enough blobs of a storage class accumulate. Existing blobs are automatically repacked with the new dictionary.
+All compression is transparent: `read()` and `get()` always return exact raw bytes.
 
-All compression is transparent — `read()` and `get()` always return exact raw bytes.
+Dictionary training is policy-driven. Defaults auto-train for `xml` (at 1000 blobs), `html` (at 500), and `pdf` (at 16). Other classes can use dictionaries trained manually via `train_dict()`. After training, new blobs use the dictionary immediately. Run `repack()` to recompress older blobs.
 
 ## CLI
 
@@ -128,10 +130,11 @@ farchive repack [db_path] [--batch-size 1000]
 
 - Single SQLite file, WAL mode
 - SHA-256 content identity
-- Span-based history (not observation-aggregated -- A->B->A creates 3 spans)
+- Positive-observation model (records what was seen, not what was absent)
+- Span-based history (A->B->A creates 3 spans, not 1 collapsed record)
 - Monotone observation time enforced per locator
 - Optional event audit log with public read API
-- Configurable `CompressionPolicy`
-- File-based write lock for multi-process safety (POSIX only)
-- Not thread-safe (one instance per thread)
+- Configurable `CompressionPolicy` (training is automatic, repack is explicit)
+- File-based write lock for multi-process safety (POSIX fcntl; no-lock fallback on Windows)
+- Not thread-safe (one instance per thread, enforced by SQLite)
 - No HTTP, no domain-specific logic -- the caller brings bytes

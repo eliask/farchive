@@ -7,12 +7,13 @@ Thread safety: instances are NOT thread-safe. Use one instance per thread,
 or protect access with an external lock. The file-based write lock
 serializes writers across processes, not threads within one process.
 
-Platform: POSIX only (uses fcntl for file locking).
+Platform: POSIX file locking (fcntl) for multi-process safety. On platforms
+without fcntl (Windows), falls back to no file locking — safe for
+single-process use only.
 """
 
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import json
 import os
@@ -23,6 +24,12 @@ from pathlib import Path
 from typing import Any, Callable
 
 import zstandard as zstd
+
+try:
+    import fcntl
+    _HAS_FCNTL = True
+except ImportError:
+    _HAS_FCNTL = False
 
 from farchive._compression import (
     compress_blob,
@@ -82,7 +89,7 @@ class Farchive:
     - The same blob returning after interruption creates a new span.
     - Observations for a given locator must arrive in nondecreasing time order.
 
-    Not thread-safe. POSIX only (fcntl file locking).
+    Not thread-safe. POSIX fcntl locking for multi-process; no-lock fallback elsewhere.
     """
 
     def __init__(
@@ -119,9 +126,20 @@ class Farchive:
 
     @contextmanager
     def _write_lock(self):
-        """Exclusive file lock for writes. Re-entrant, blocks until available."""
+        """Exclusive file lock for writes. Re-entrant, blocks until available.
+
+        Uses POSIX fcntl if available, falls back to no-lock on other platforms.
+        """
         if self._lock_held:
             yield
+            return
+        if not _HAS_FCNTL:
+            # No file locking on this platform — single-process assumed
+            self._lock_held = True
+            try:
+                yield
+            finally:
+                self._lock_held = False
             return
         fd = os.open(str(self._lock_path), os.O_CREAT | os.O_RDWR)
         try:
@@ -201,17 +219,9 @@ class Farchive:
             sample_size=500,
         )
         print(
-            f"[farchive] Dict trained (dict_id={dict_id}). Repacking...",
-            file=sys.stderr,
-        )
-        stats = self._repack_impl(
-            dict_id=dict_id,
-            storage_class=storage_class,
-            batch_size=count + 1000,
-        )
-        print(
-            f"[farchive] Repacked {stats.blobs_repacked:,} blobs, "
-            f"saved {stats.bytes_saved:,} bytes.",
+            f"[farchive] Dict trained (dict_id={dict_id}). "
+            f"New blobs will use it immediately. "
+            f"Run repack(storage_class={storage_class!r}) to recompress old blobs.",
             file=sys.stderr,
         )
         self._has_dict_for_class[storage_class] = True
@@ -280,8 +290,15 @@ class Farchive:
     ) -> StateSpan:
         """Core span-update logic. Must be called inside a transaction.
 
-        Enforces monotone observation time per locator.
+        Enforces: blob must exist, monotone observation time per locator,
+        no same-timestamp digest transitions.
         """
+        # Verify blob exists (clean error instead of SQLite FK violation)
+        if not self._conn.execute(
+            "SELECT 1 FROM blob WHERE digest=?", (digest,),
+        ).fetchone():
+            raise ValueError(f"Digest {digest[:16]}.. not found — call put_blob() first")
+
         if metadata:
             try:
                 metadata_json = json.dumps(metadata)
@@ -320,13 +337,22 @@ class Farchive:
 
         if current is not None and current["digest"] == digest:
             # Case B: same digest — extend current span
-            self._conn.execute(
-                "UPDATE locator_span SET last_confirmed_at=?, "
-                "observation_count=observation_count+1, "
-                "last_metadata_json=? "
-                "WHERE span_id=?",
-                (now, metadata_json, current["span_id"]),
-            )
+            # metadata=None means "no update" (preserve existing), not "clear"
+            if metadata_json is not None:
+                self._conn.execute(
+                    "UPDATE locator_span SET last_confirmed_at=?, "
+                    "observation_count=observation_count+1, "
+                    "last_metadata_json=? "
+                    "WHERE span_id=?",
+                    (now, metadata_json, current["span_id"]),
+                )
+            else:
+                self._conn.execute(
+                    "UPDATE locator_span SET last_confirmed_at=?, "
+                    "observation_count=observation_count+1 "
+                    "WHERE span_id=?",
+                    (now, current["span_id"]),
+                )
             span_id = current["span_id"]
         else:
             if current is not None:
@@ -733,14 +759,20 @@ class Farchive:
             if dict_id is None:
                 raise ValueError(f"No trained dict for storage_class={storage_class!r}")
 
-        # If dict_id given without storage_class, derive class from the dict
-        # to ensure we only repack blobs matching this dict's class
+        # Resolve dict's storage class — ensure agreement or derive
+        dict_row = self._conn.execute(
+            "SELECT storage_class FROM dict WHERE dict_id=?", (dict_id,),
+        ).fetchone()
+        if dict_row is None:
+            raise ValueError(f"dict_id {dict_id} not found")
+        dict_class = dict_row["storage_class"] or None
         if storage_class is None:
-            row = self._conn.execute(
-                "SELECT storage_class FROM dict WHERE dict_id=?", (dict_id,),
-            ).fetchone()
-            if row and row["storage_class"]:
-                storage_class = row["storage_class"]
+            storage_class = dict_class
+        elif dict_class and storage_class != dict_class:
+            raise ValueError(
+                f"storage_class={storage_class!r} does not match "
+                f"dict {dict_id}'s storage_class={dict_class!r}"
+            )
 
         d = self._load_dict(dict_id)
         with self._write_lock():
