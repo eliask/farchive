@@ -192,6 +192,31 @@ def test_non_json_metadata_raises(archive):
         archive.observe("loc/badjson", digest, observed_at=_T0, metadata={"bad": object()})
 
 
+def test_non_dict_metadata_raises(archive):
+    digest = archive.put_blob(b"list meta")
+    with pytest.raises(TypeError, match="must be a dict"):
+        archive.observe("loc/listmeta", digest, observed_at=_T0, metadata=[1, 2, 3])  # type: ignore[arg-type]
+
+
+def test_empty_dict_metadata_stored(archive):
+    """Empty dict {} is valid metadata, distinct from None."""
+    digest = archive.put_blob(b"empty meta")
+    span = archive.observe("loc/empty", digest, observed_at=_T0, metadata={})
+    assert span.last_metadata == {}
+
+
+def test_implicit_timestamp_auto_bumps_on_rapid_changes(tmp_path):
+    """Rapid store() calls without explicit timestamps should not fail."""
+    from farchive import Farchive
+    db = tmp_path / "rapid.farchive"
+    with Farchive(db) as fa:
+        fa.store("loc/rapid", b"version-1")
+        fa.store("loc/rapid", b"version-2")
+        fa.store("loc/rapid", b"version-3")
+        spans = fa.history("loc/rapid")
+        assert len(spans) == 3
+
+
 # ---------------------------------------------------------------------------
 # resolve -- current span
 # ---------------------------------------------------------------------------

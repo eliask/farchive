@@ -226,6 +226,23 @@ class Farchive:
         )
         self._has_dict_for_class[storage_class] = True
 
+    def _try_auto_train(self, storage_class: str | None) -> None:
+        """Attempt auto-training, swallowing failures.
+
+        Auto-training is a storage optimization, not a semantic operation.
+        If it fails, the semantic write has already succeeded — don't propagate.
+        """
+        if not storage_class:
+            return
+        try:
+            self._check_auto_train(storage_class)
+        except Exception as e:
+            import warnings
+            warnings.warn(
+                f"[farchive] Auto-training failed for '{storage_class}': {e}",
+                stacklevel=3,
+            )
+
     # ------------------------------------------------------------------
     # Internal blob storage
     # ------------------------------------------------------------------
@@ -287,11 +304,15 @@ class Farchive:
         now: int,
         *,
         metadata: dict | None = None,
+        _caller_provided_time: bool = False,
     ) -> StateSpan:
         """Core span-update logic. Must be called inside a transaction.
 
         Enforces: blob must exist, monotone observation time per locator,
         no same-timestamp digest transitions.
+
+        When _caller_provided_time=False (implicit timestamp), auto-bumps
+        the timestamp to maintain monotonicity for digest changes.
         """
         # Verify blob exists (clean error instead of SQLite FK violation)
         if not self._conn.execute(
@@ -299,9 +320,13 @@ class Farchive:
         ).fetchone():
             raise ValueError(f"Digest {digest[:16]}.. not found — call put_blob() first")
 
-        if metadata:
+        if metadata is not None:
+            if not isinstance(metadata, dict):
+                raise TypeError(
+                    f"metadata must be a dict or None, got {type(metadata).__name__}"
+                )
             try:
-                metadata_json = json.dumps(metadata)
+                metadata_json: str | None = json.dumps(metadata)
             except (TypeError, ValueError) as e:
                 raise TypeError(f"metadata must be JSON-serializable: {e}") from e
         else:
@@ -315,25 +340,29 @@ class Farchive:
             (locator,),
         ).fetchone()
 
-        # Enforce monotone observation time
-        if current is not None and now < current["last_confirmed_at"]:
-            raise ValueError(
-                f"Out-of-order observation for {locator!r}: "
-                f"observed_at={now} < last_confirmed_at={current['last_confirmed_at']}. "
-                f"Observations must be in nondecreasing time order per locator."
-            )
+        if current is not None:
+            last_ts = current["last_confirmed_at"]
 
-        # Reject same-timestamp digest changes (would create zero-duration spans)
-        if (
-            current is not None
-            and current["digest"] != digest
-            and now == current["last_confirmed_at"]
-        ):
-            raise ValueError(
-                f"Same-timestamp digest change for {locator!r} at {now}: "
-                f"cannot transition from {current['digest'][:12]}.. to {digest[:12]}.. "
-                f"at the same timestamp. Use a later timestamp for digest changes."
-            )
+            # Enforce monotone observation time
+            if now < last_ts:
+                if _caller_provided_time:
+                    raise ValueError(
+                        f"Out-of-order observation for {locator!r}: "
+                        f"observed_at={now} < last_confirmed_at={last_ts}. "
+                        f"Observations must be in nondecreasing time order per locator."
+                    )
+                # Auto-bump: use last_confirmed_at for same-digest, +1 for transitions
+                now = last_ts if digest == current["digest"] else last_ts + 1
+
+            # Reject same-timestamp digest changes (would create zero-duration spans)
+            if current["digest"] != digest and now == last_ts:
+                if _caller_provided_time:
+                    raise ValueError(
+                        f"Same-timestamp digest change for {locator!r} at {now}: "
+                        f"cannot transition from {current['digest'][:12]}.. to {digest[:12]}.. "
+                        f"at the same timestamp. Use a later timestamp for digest changes."
+                    )
+                now = last_ts + 1
 
         if current is not None and current["digest"] == digest:
             # Case B: same digest — extend current span
@@ -401,11 +430,9 @@ class Farchive:
         with self._write_lock():
             with self._conn:
                 self._store_blob(digest, data, storage_class, dict_id=dict_id)
-        # Auto-train if eligible and no dict yet
-        if storage_class and dict_id is None:
-            eligible = set(self._policy.auto_train_thresholds)
-            if storage_class in eligible:
-                self._check_auto_train(storage_class)
+        # Auto-train if eligible and no dict yet (non-fatal)
+        if dict_id is None:
+            self._try_auto_train(storage_class)
         return digest
 
     def observe(
@@ -424,11 +451,16 @@ class Farchive:
         Raises ValueError if observed_at is earlier than the locator's
         last_confirmed_at (monotone time enforcement).
         """
-        now = observed_at if observed_at is not None else _now_ms()
+        if observed_at is not None:
+            now, caller_ts = observed_at, True
+        else:
+            now, caller_ts = _now_ms(), False
         with self._write_lock():
             with self._conn:
                 return self._observe_impl(
-                    locator, digest, now, metadata=metadata,
+                    locator, digest, now,
+                    metadata=metadata,
+                    _caller_provided_time=caller_ts,
                 )
 
     def store(
@@ -441,13 +473,17 @@ class Farchive:
         metadata: dict | None = None,
     ) -> str:
         """Store content at a locator. put_blob + observe, atomic. Returns digest."""
-        now = observed_at if observed_at is not None else _now_ms()
+        if observed_at is not None:
+            now, caller_ts = observed_at, True
+        else:
+            now, caller_ts = _now_ms(), False
         digest = _sha256(data)
         with self._write_lock():
             return self._store_impl(
                 locator, data, digest, now,
                 storage_class=storage_class,
                 metadata=metadata,
+                _caller_provided_time=caller_ts,
             )
 
     def _store_impl(
@@ -459,17 +495,22 @@ class Farchive:
         *,
         storage_class: str | None = None,
         metadata: dict | None = None,
+        _caller_provided_time: bool = False,
     ) -> str:
         # Use any trained dict for this storage class (not gated by auto-train eligibility)
         dict_id = self._get_latest_dict_id(storage_class) if storage_class else None
 
         with self._conn:
             self._store_blob(digest, data, storage_class, dict_id=dict_id)
-            self._observe_impl(locator, digest, now, metadata=metadata)
+            self._observe_impl(
+                locator, digest, now,
+                metadata=metadata,
+                _caller_provided_time=_caller_provided_time,
+            )
 
-        # Auto-train if eligible and no dict yet
-        if storage_class and dict_id is None:
-            self._check_auto_train(storage_class)
+        # Auto-train if eligible and no dict yet (non-fatal)
+        if dict_id is None:
+            self._try_auto_train(storage_class)
 
         return digest
 
@@ -539,9 +580,9 @@ class Farchive:
                 if progress and (i + 1) % 1000 == 0:
                     progress(i + 1, len(items))
 
-        # Auto-train check after batch
-        if storage_class and dict_id is None:
-            self._check_auto_train(storage_class)
+        # Auto-train check after batch (non-fatal)
+        if dict_id is None:
+            self._try_auto_train(storage_class)
 
         return stats
 
