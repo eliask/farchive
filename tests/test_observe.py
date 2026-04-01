@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pytest
 
 from farchive import Farchive, StateSpan
 
@@ -16,13 +17,6 @@ _T2 = _T0 + 2_000
 _T3 = _T0 + 3_000
 _T4 = _T0 + 4_000
 _T5 = _T0 + 5_000
-
-
-def _store(fa: Farchive, locator: str, data: bytes, at: int) -> str:
-    """put_blob + observe, deterministic timestamp."""
-    digest = fa.put_blob(data)
-    fa.observe(locator, digest, observed_at=at)
-    return digest
 
 
 # ---------------------------------------------------------------------------
@@ -80,11 +74,9 @@ def test_observe_different_digest_closes_old_span(archive):
     archive.observe("loc/y", d_a, observed_at=_T0)
     span_b = archive.observe("loc/y", d_b, observed_at=_T1)
 
-    # New span is open for B
     assert span_b.digest == d_b
     assert span_b.observed_until is None
 
-    # Old span for A was closed
     old = archive._conn.execute(
         "SELECT observed_until FROM locator_span "
         "WHERE locator='loc/y' AND digest=?",
@@ -107,11 +99,10 @@ def test_observe_different_digest_total_two_spans(archive):
 
 
 # ---------------------------------------------------------------------------
-# A→B→A creates exactly 3 spans (core semantic invariant)
+# A->B->A creates exactly 3 spans (core semantic invariant)
 # ---------------------------------------------------------------------------
 
 def test_aba_creates_three_spans(archive):
-    """The same blob returning after interruption opens a NEW span."""
     d_a = archive.put_blob(b"content-A")
     d_b = archive.put_blob(b"content-B")
 
@@ -135,7 +126,7 @@ def test_aba_third_span_is_open(archive):
 
     assert span3.digest == d_a
     assert span3.observed_until is None
-    assert span3.observation_count == 1  # fresh span, not accumulated
+    assert span3.observation_count == 1
 
 
 def test_aba_first_span_closed_at_t1(archive):
@@ -153,19 +144,35 @@ def test_aba_first_span_closed_at_t1(archive):
         ).fetchall(),
         key=lambda r: r["observed_from"],
     )
-    # Span 0: A from T0, closed at T1
     assert spans[0]["digest"] == d_a
     assert spans[0]["observed_until"] == _T1
-    # Span 1: B from T1, closed at T2
     assert spans[1]["digest"] == d_b
     assert spans[1]["observed_until"] == _T2
-    # Span 2: A from T2, still open
     assert spans[2]["digest"] == d_a
     assert spans[2]["observed_until"] is None
 
 
 # ---------------------------------------------------------------------------
-# resolve — current span
+# Monotone time enforcement
+# ---------------------------------------------------------------------------
+
+def test_out_of_order_observation_raises(archive):
+    digest = archive.put_blob(b"monotone")
+    archive.observe("loc/mono", digest, observed_at=_T2)
+
+    with pytest.raises(ValueError, match="Out-of-order"):
+        archive.observe("loc/mono", digest, observed_at=_T0)
+
+
+def test_equal_timestamp_allowed(archive):
+    digest = archive.put_blob(b"equal-time")
+    archive.observe("loc/eq", digest, observed_at=_T0)
+    span = archive.observe("loc/eq", digest, observed_at=_T0)
+    assert span.observation_count == 2
+
+
+# ---------------------------------------------------------------------------
+# resolve -- current span
 # ---------------------------------------------------------------------------
 
 def test_resolve_returns_current_span(archive):
@@ -194,7 +201,7 @@ def test_resolve_after_transition_returns_newest(archive):
 
 
 # ---------------------------------------------------------------------------
-# resolve(at=...) — point-in-time
+# resolve(at=...) -- point-in-time
 # ---------------------------------------------------------------------------
 
 def test_resolve_at_past_timestamp_returns_correct_span(archive):
@@ -204,7 +211,6 @@ def test_resolve_at_past_timestamp_returns_correct_span(archive):
     archive.observe("loc/pit", d_a, observed_at=_T0)
     archive.observe("loc/pit", d_b, observed_at=_T2)
 
-    # Midpoint _T1 falls within first span [T0, T2)
     span = archive.resolve("loc/pit", at=_T1)
     assert span is not None
     assert span.digest == d_a
@@ -217,7 +223,6 @@ def test_resolve_at_current_time_returns_open_span(archive):
     archive.observe("loc/pit2", d_a, observed_at=_T0)
     archive.observe("loc/pit2", d_b, observed_at=_T2)
 
-    # After T2 should be B
     span = archive.resolve("loc/pit2", at=_T3)
     assert span is not None
     assert span.digest == d_b
@@ -239,9 +244,9 @@ def test_resolve_aba_at_each_timestamp(archive):
     archive.observe("loc/aba3", d_b, observed_at=_T2)
     archive.observe("loc/aba3", d_a, observed_at=_T4)
 
-    assert archive.resolve("loc/aba3", at=_T1).digest == d_a   # first A span
-    assert archive.resolve("loc/aba3", at=_T3).digest == d_b   # B span
-    assert archive.resolve("loc/aba3", at=_T5).digest == d_a   # second A span
+    assert archive.resolve("loc/aba3", at=_T1).digest == d_a
+    assert archive.resolve("loc/aba3", at=_T3).digest == d_b
+    assert archive.resolve("loc/aba3", at=_T5).digest == d_a
 
 
 # ---------------------------------------------------------------------------
@@ -259,9 +264,9 @@ def test_history_returns_newest_first(archive):
 
     spans = archive.history("loc/h")
     assert len(spans) == 3
-    assert spans[0].digest == d_c  # newest
+    assert spans[0].digest == d_c
     assert spans[1].digest == d_b
-    assert spans[2].digest == d_a  # oldest
+    assert spans[2].digest == d_a
 
 
 def test_history_empty_for_unknown_locator(archive):
@@ -303,9 +308,7 @@ def test_has_returns_false_for_missing_locator(archive):
 
 
 def test_has_max_age_fresh(archive):
-    """Span confirmed at _T0; max_age_hours=999 should be True."""
     import time
-    # Use a very recent timestamp so the age check passes
     now_ms = int(time.time() * 1000)
     digest = archive.put_blob(b"fresh content")
     archive.observe("loc/fresh", digest, observed_at=now_ms)
@@ -313,22 +316,17 @@ def test_has_max_age_fresh(archive):
 
 
 def test_has_max_age_stale(archive):
-    """Span confirmed very far in the past should fail freshness check."""
-    # Use a timestamp from 2020 — guaranteed stale
     stale_ms = 1_577_836_800_000  # 2020-01-01 00:00:00 UTC
     digest = archive.put_blob(b"stale content")
     archive.observe("loc/stale", digest, observed_at=stale_ms)
-    # max_age_hours=1 — this observation is years old
     assert archive.has("loc/stale", max_age_hours=1) is False
 
 
 def test_has_closed_span_is_false(archive):
-    """A locator whose only open span was superseded has no current span."""
     d_a = archive.put_blob(b"A")
     d_b = archive.put_blob(b"B")
     archive.observe("loc/closed", d_a, observed_at=_T0)
     archive.observe("loc/closed", d_b, observed_at=_T1)
-    # Both spans exist but only B's is open — has() checks open spans
     assert archive.has("loc/closed") is True  # B span is current
 
 
@@ -355,7 +353,6 @@ def test_locators_pattern_filtering(archive):
 
 
 def test_locators_no_duplicates_after_multiple_spans(archive):
-    """A locator with A→B→A history should still appear once."""
     d_a = archive.put_blob(b"A")
     d_b = archive.put_blob(b"B")
     archive.observe("loc/dedup", d_a, observed_at=_T0)
@@ -411,7 +408,6 @@ def test_events_record_correct_locator_and_digest(archive_with_events):
 
 
 def test_events_each_observe_call_records_one_event(archive_with_events):
-    """Three observe calls (same digest) produce three event rows."""
     fa = archive_with_events
     digest = fa.put_blob(b"triple")
     for t in [_T0, _T1, _T2]:
@@ -428,7 +424,6 @@ def test_events_each_observe_call_records_one_event(archive_with_events):
 # ---------------------------------------------------------------------------
 
 def test_events_table_absent_when_not_enabled(archive):
-    """Default archive must NOT have an event table."""
     tables = {
         r[0]
         for r in archive._conn.execute(
@@ -439,13 +434,10 @@ def test_events_table_absent_when_not_enabled(archive):
 
 
 def test_events_table_absent_means_no_recording(tmp_path):
-    """Constructing with enable_events=False and storing should not fail."""
     db = tmp_path / "no_events.db"
     with Farchive(db, enable_events=False) as fa:
         digest = fa.put_blob(b"no events here")
         fa.observe("loc/noev", digest, observed_at=_T0)
-        # No exception means no silent write to a non-existent table
-    # Reopen and verify no event table was created
     import sqlite3
     conn = sqlite3.connect(str(db))
     tables = {r[0] for r in conn.execute(
@@ -456,25 +448,50 @@ def test_events_table_absent_means_no_recording(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# status_code and metadata passthrough
+# Public events() API
 # ---------------------------------------------------------------------------
 
-def test_observe_stores_status_code(archive):
-    digest = archive.put_blob(b"status")
-    span = archive.observe("loc/sc", digest, observed_at=_T0, status_code=200)
-    assert span.last_status_code == 200
+def test_events_api_returns_event_objects(archive_with_events):
+    fa = archive_with_events
+    digest = fa.put_blob(b"api test")
+    fa.observe("loc/api", digest, observed_at=_T0)
+
+    evts = fa.events("loc/api")
+    assert len(evts) == 1
+    assert evts[0].locator == "loc/api"
+    assert evts[0].digest == digest
+    assert evts[0].kind == "fa.observe"
+    assert evts[0].occurred_at == _T0
 
 
-def test_observe_stores_metadata_json(archive):
-    import json
+def test_events_api_returns_empty_when_disabled(archive):
+    assert archive.events("loc/any") == []
+
+
+def test_events_api_since_filter(archive_with_events):
+    fa = archive_with_events
+    digest = fa.put_blob(b"since test")
+    fa.observe("loc/since", digest, observed_at=_T0)
+    fa.observe("loc/since", digest, observed_at=_T2)
+
+    evts = fa.events("loc/since", since=_T1)
+    assert len(evts) == 1
+    assert evts[0].occurred_at == _T2
+
+
+# ---------------------------------------------------------------------------
+# metadata passthrough
+# ---------------------------------------------------------------------------
+
+def test_observe_stores_metadata(archive):
     digest = archive.put_blob(b"meta")
     meta = {"source": "test", "version": 42}
     span = archive.observe("loc/meta", digest, observed_at=_T0, metadata=meta)
-    assert json.loads(span.last_metadata_json) == meta
+    assert span.last_metadata == meta
 
 
-def test_status_code_updated_on_extend(archive):
-    digest = archive.put_blob(b"update sc")
-    archive.observe("loc/scupd", digest, observed_at=_T0, status_code=200)
-    span = archive.observe("loc/scupd", digest, observed_at=_T1, status_code=304)
-    assert span.last_status_code == 304
+def test_metadata_updated_on_extend(archive):
+    digest = archive.put_blob(b"update meta")
+    archive.observe("loc/mupd", digest, observed_at=_T0, metadata={"v": 1})
+    span = archive.observe("loc/mupd", digest, observed_at=_T1, metadata={"v": 2})
+    assert span.last_metadata == {"v": 2}

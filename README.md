@@ -52,13 +52,13 @@ from farchive import Farchive
 
 with Farchive("my_archive.farchive") as fa:
     # Store content at a locator
-    fa.store("https://example.com/page", page_bytes)
+    fa.store("https://example.com/page", page_bytes, storage_class="html")
 
     # Retrieve latest content
     data = fa.get("https://example.com/page")
 
     # Track changes over time
-    fa.store("https://example.com/page", new_page_bytes)
+    fa.store("https://example.com/page", new_page_bytes, storage_class="html")
     for span in fa.history("https://example.com/page"):
         print(f"{span.digest[:12]}  {span.observed_from}..{span.observed_until}")
 ```
@@ -91,6 +91,7 @@ fa.get(locator)                    # convenience: resolve + read
 fa.history(locator)                # all spans, newest first
 fa.has(locator, max_age_hours=24)  # freshness check
 fa.locators(pattern="https://%")   # list locators (LIKE pattern)
+fa.events(locator)                 # audit log (if enable_events=True)
 ```
 
 ### Maintenance
@@ -127,8 +128,10 @@ farchive repack [db_path] [--batch-size 1000]
 
 - Single SQLite file, WAL mode
 - SHA-256 content identity
-- Span-based history (not observation-aggregated — A→B→A creates 3 spans)
-- Optional event audit log
+- Span-based history (not observation-aggregated -- A->B->A creates 3 spans)
+- Monotone observation time enforced per locator
+- Optional event audit log with public read API
 - Configurable `CompressionPolicy`
-- File-based write lock for multi-process safety
-- No HTTP, no domain-specific logic — the caller brings bytes
+- File-based write lock for multi-process safety (POSIX only)
+- Not thread-safe (one instance per thread)
+- No HTTP, no domain-specific logic -- the caller brings bytes

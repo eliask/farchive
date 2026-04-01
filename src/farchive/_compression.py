@@ -1,8 +1,7 @@
 """Farchive zstd compression engine.
 
-Handles vanilla zstd, dictionary-based zstd, and reference-blob zstd.
-All three use codec='zstd' in the schema — dict and reference info is
-stored in separate columns (codec_dict_id, codec_base_digest).
+Handles vanilla zstd and dictionary-based zstd.
+codec is always 'raw' or 'zstd' — dict info is in a separate column.
 """
 
 from __future__ import annotations
@@ -16,18 +15,17 @@ from farchive._types import CompressionPolicy, RepackStats
 
 
 # ---------------------------------------------------------------------------
-# Lazy singleton compressors (vanilla, no dict)
+# Compressor cache — keyed by level to avoid first-level-wins bug
 # ---------------------------------------------------------------------------
 
-_vanilla_compressor: Any = None
+_vanilla_compressors: dict[int, Any] = {}
 _vanilla_decompressor: Any = None
 
 
 def _get_vanilla_compressor(level: int = 3) -> Any:
-    global _vanilla_compressor
-    if _vanilla_compressor is None:
-        _vanilla_compressor = zstd.ZstdCompressor(level=level)
-    return _vanilla_compressor
+    if level not in _vanilla_compressors:
+        _vanilla_compressors[level] = zstd.ZstdCompressor(level=level)
+    return _vanilla_compressors[level]
 
 
 def _get_vanilla_decompressor() -> Any:
@@ -62,27 +60,13 @@ def compress_blob(
     *,
     dict_data: Any = None,
     dict_id: int | None = None,
-    base_digest: str | None = None,
-    read_blob: Callable[[str], bytes | None] | None = None,
-) -> tuple[bytes, str, int | None, str | None]:
-    """Compress raw bytes. Returns (payload, codec, codec_dict_id, codec_base_digest).
+) -> tuple[bytes, str, int | None]:
+    """Compress raw bytes. Returns (payload, codec, codec_dict_id).
 
-    codec is always 'raw' or 'zstd'. Dict and reference info is orthogonal.
+    codec is always 'raw' or 'zstd'. Dict info is orthogonal.
     """
     if len(raw) < policy.raw_threshold:
-        return raw, "raw", None, None
-
-    # Try reference-blob compression if base provided
-    if base_digest is not None and read_blob is not None:
-        base_data = read_blob(base_digest)
-        if base_data is not None:
-            ref_dict = zstd.ZstdCompressionDict(base_data)
-            ref_compressed = _make_compressor(
-                level=policy.compression_level, dict_data=ref_dict,
-            ).compress(raw)
-            vanilla = _get_vanilla_compressor(policy.compression_level).compress(raw)
-            if len(ref_compressed) < len(vanilla) * policy.reference_savings_gate:
-                return ref_compressed, "zstd", None, base_digest
+        return raw, "raw", None
 
     # Try dict compression
     if dict_data is not None and dict_id is not None:
@@ -90,13 +74,13 @@ def compress_blob(
             compressed = _make_compressor(
                 level=policy.compression_level, dict_data=dict_data,
             ).compress(raw)
-            return compressed, "zstd", dict_id, None
+            return compressed, "zstd", dict_id
         except Exception:
             pass
 
     # Vanilla zstd
     compressed = _get_vanilla_compressor(policy.compression_level).compress(raw)
-    return compressed, "zstd", None, None
+    return compressed, "zstd", None
 
 
 def decompress_blob(
@@ -104,9 +88,7 @@ def decompress_blob(
     codec: str,
     *,
     codec_dict_id: int | None = None,
-    codec_base_digest: str | None = None,
     load_dict: Callable[[int], Any] | None = None,
-    read_blob: Callable[[str], bytes | None] | None = None,
 ) -> bytes:
     """Decompress a stored blob payload back to raw bytes."""
     if codec == "raw":
@@ -114,16 +96,6 @@ def decompress_blob(
 
     if codec != "zstd":
         raise ValueError(f"Unknown codec: {codec}")
-
-    # Reference-blob decompression
-    if codec_base_digest is not None:
-        if read_blob is None:
-            raise ValueError("read_blob required for reference-blob decompression")
-        base_data = read_blob(codec_base_digest)
-        if base_data is None:
-            raise ValueError(f"Reference blob {codec_base_digest[:12]} not found")
-        ref_dict = zstd.ZstdCompressionDict(base_data)
-        return _make_decompressor(dict_data=ref_dict).decompress(payload)
 
     # Dict decompression
     if codec_dict_id is not None:
@@ -166,15 +138,14 @@ def repack_blobs(
 ) -> RepackStats:
     """Recompress vanilla-zstd blobs with a trained dictionary.
 
-    Only recompresses blobs that have no dict and no reference base.
-    Returns stats on how many were repacked and bytes saved.
+    Only recompresses blobs that have no dict.
     """
     compressor = _make_compressor(level=policy.compression_level, dict_data=dict_data)
     decompressor = _get_vanilla_decompressor()
 
     query = (
         "SELECT digest, payload, raw_size, stored_size FROM blob "
-        "WHERE codec = 'zstd' AND codec_dict_id IS NULL AND codec_base_digest IS NULL"
+        "WHERE codec = 'zstd' AND codec_dict_id IS NULL"
     )
     params: list = []
     if storage_class is not None:
@@ -202,11 +173,10 @@ def repack_blobs(
             continue
 
     if updates:
-        with conn:
-            conn.executemany(
-                "UPDATE blob SET payload=?, codec_dict_id=?, stored_size=? "
-                "WHERE digest=?",
-                updates,
-            )
+        conn.executemany(
+            "UPDATE blob SET payload=?, codec_dict_id=?, stored_size=? "
+            "WHERE digest=?",
+            updates,
+        )
 
     return stats

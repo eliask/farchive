@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any
 
 
 @dataclass(frozen=True, slots=True)
@@ -16,8 +17,7 @@ class StateSpan:
     observed_until: int | None  # UTC Unix ms, exclusive; None = current
     last_confirmed_at: int  # UTC Unix ms
     observation_count: int
-    last_status_code: int | None = None
-    last_metadata_json: str | None = None
+    last_metadata: dict[str, Any] | None = None
 
 
 @dataclass
@@ -29,13 +29,12 @@ class CompressionPolicy:
 
     raw_threshold: int = 64
     auto_train_thresholds: dict[str, int] = field(
-        default_factory=lambda: {"xml": 1000, "pdf": 16},
+        default_factory=lambda: {"xml": 1000, "html": 500, "pdf": 16},
     )
     dict_target_sizes: dict[str, int] = field(
-        default_factory=lambda: {"xml": 112 * 1024, "pdf": 64 * 1024},
+        default_factory=lambda: {"xml": 112 * 1024, "html": 112 * 1024, "pdf": 64 * 1024},
     )
     compression_level: int = 3
-    reference_savings_gate: float = 0.8  # delta must beat vanilla by this factor
 
 
 @dataclass
@@ -55,6 +54,18 @@ class RepackStats:
 
     blobs_repacked: int = 0
     bytes_saved: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class Event:
+    """An append-only audit record of one archival operation."""
+
+    event_id: int
+    occurred_at: int  # UTC Unix ms
+    locator: str
+    digest: str | None
+    kind: str
+    metadata: dict[str, Any] | None
 
 
 @dataclass(frozen=True, slots=True)

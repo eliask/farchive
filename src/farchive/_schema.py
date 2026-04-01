@@ -5,8 +5,8 @@ from __future__ import annotations
 import sqlite3
 from datetime import datetime, timezone
 
-SCHEMA_VERSION = 1
-_GENERATOR = "farchive 0.1.0"
+SCHEMA_VERSION = 2
+_GENERATOR = "farchive 0.2.0"
 
 
 def _now_ms() -> int:
@@ -15,10 +15,15 @@ def _now_ms() -> int:
 
 
 # ---------------------------------------------------------------------------
-# DDL — Farchive schema v1
+# DDL — Farchive schema v2
 # ---------------------------------------------------------------------------
+# v2 changes from v1:
+# - Removed codec_base_digest (reference compression cut from v1)
+# - Removed last_status_code from locator_span (HTTP-specific, use metadata)
+# - Removed status_code from event (use metadata_json)
+# - last_metadata_json stays as storage format (Python API deserializes)
 
-_SCHEMA_V1 = """
+_SCHEMA_V2 = """
 CREATE TABLE IF NOT EXISTS schema_info (
     version         INTEGER NOT NULL,
     created_at      INTEGER NOT NULL,
@@ -42,7 +47,6 @@ CREATE TABLE IF NOT EXISTS blob (
     stored_size         INTEGER NOT NULL,
     codec               TEXT NOT NULL CHECK (codec IN ('raw', 'zstd')),
     codec_dict_id       INTEGER REFERENCES dict(dict_id),
-    codec_base_digest   TEXT REFERENCES blob(digest),
     storage_class       TEXT,
     created_at          INTEGER NOT NULL
 );
@@ -55,7 +59,6 @@ CREATE TABLE IF NOT EXISTS locator_span (
     observed_until      INTEGER,
     last_confirmed_at   INTEGER NOT NULL,
     observation_count   INTEGER NOT NULL DEFAULT 1,
-    last_status_code    INTEGER,
     last_metadata_json  TEXT
 );
 
@@ -65,8 +68,6 @@ CREATE INDEX IF NOT EXISTS idx_span_locator
     ON locator_span(locator, observed_from DESC);
 CREATE INDEX IF NOT EXISTS idx_span_locator_time
     ON locator_span(locator, observed_from, observed_until);
-CREATE INDEX IF NOT EXISTS idx_blob_base
-    ON blob(codec_base_digest);
 """
 
 _EVENT_TABLE = """
@@ -76,9 +77,7 @@ CREATE TABLE IF NOT EXISTS event (
     locator         TEXT NOT NULL,
     digest          TEXT,
     kind            TEXT NOT NULL,
-    status_code     INTEGER,
-    metadata_json   TEXT,
-    error_text      TEXT
+    metadata_json   TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_event_locator_time
@@ -109,16 +108,15 @@ def init_schema(conn: sqlite3.Connection, *, enable_events: bool = False) -> Non
         )
     if version == 0:
         now = _now_ms()
-        conn.executescript(_SCHEMA_V1)
+        conn.executescript(_SCHEMA_V2)
         if enable_events:
             conn.executescript(_EVENT_TABLE)
         conn.execute(
             "INSERT OR IGNORE INTO schema_info VALUES (?, ?, NULL, ?)",
             (SCHEMA_VERSION, now, _GENERATOR),
         )
-    # version == 1: already current; event table added on demand below
+    # version >= 1: already has tables; event table added on demand below
     if enable_events:
-        # Ensure event table exists even if DB was created without it
         tables = {
             r[0]
             for r in conn.execute(

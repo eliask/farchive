@@ -4,6 +4,7 @@ from farchive._archive import Farchive
 from farchive._types import (
     ArchiveStats,
     CompressionPolicy,
+    Event,
     ImportStats,
     RepackStats,
     StateSpan,
@@ -12,9 +13,10 @@ from farchive._types import (
 __all__ = [
     "ArchiveStats",
     "CompressionPolicy",
+    "Event",
     "Farchive",
     "ImportStats",
     "RepackStats",
     "StateSpan",
 ]
-__version__ = "0.1.0"
+__version__ = "0.2.0"

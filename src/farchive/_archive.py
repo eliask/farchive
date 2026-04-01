@@ -2,6 +2,12 @@
 
 This is the main public class. It delegates to _schema.py for DDL,
 _compression.py for codec operations, and _types.py for data objects.
+
+Thread safety: instances are NOT thread-safe. Use one instance per thread,
+or protect access with an external lock. The file-based write lock
+serializes writers across processes, not threads within one process.
+
+Platform: POSIX only (uses fcntl for file locking).
 """
 
 from __future__ import annotations
@@ -16,6 +22,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable
 
+import zstandard as zstd
+
 from farchive._compression import (
     compress_blob,
     decompress_blob,
@@ -26,12 +34,11 @@ from farchive._schema import SCHEMA_VERSION, _now_ms, init_schema
 from farchive._types import (
     ArchiveStats,
     CompressionPolicy,
+    Event,
     ImportStats,
     RepackStats,
     StateSpan,
 )
-
-import zstandard as zstd
 
 
 def _sha256(data: bytes) -> str:
@@ -39,6 +46,7 @@ def _sha256(data: bytes) -> str:
 
 
 def _row_to_span(row: sqlite3.Row) -> StateSpan:
+    meta_json = row["last_metadata_json"]
     return StateSpan(
         span_id=row["span_id"],
         locator=row["locator"],
@@ -47,8 +55,19 @@ def _row_to_span(row: sqlite3.Row) -> StateSpan:
         observed_until=row["observed_until"],
         last_confirmed_at=row["last_confirmed_at"],
         observation_count=row["observation_count"],
-        last_status_code=row["last_status_code"],
-        last_metadata_json=row["last_metadata_json"],
+        last_metadata=json.loads(meta_json) if meta_json else None,
+    )
+
+
+def _row_to_event(row: sqlite3.Row) -> Event:
+    meta_json = row["metadata_json"]
+    return Event(
+        event_id=row["event_id"],
+        occurred_at=row["occurred_at"],
+        locator=row["locator"],
+        digest=row["digest"],
+        kind=row["kind"],
+        metadata=json.loads(meta_json) if meta_json else None,
     )
 
 
@@ -61,6 +80,9 @@ class Farchive:
     - Compression is invisible to readers.
     - A span is a contiguous observed run of one blob at one locator.
     - The same blob returning after interruption creates a new span.
+    - Observations for a given locator must arrive in nondecreasing time order.
+
+    Not thread-safe. POSIX only (fcntl file locking).
     """
 
     def __init__(
@@ -75,10 +97,11 @@ class Farchive:
         self._policy = compression or CompressionPolicy()
         self._events_enabled = enable_events
 
+        # Use default isolation_level ("") for proper transaction support.
+        # `with self._conn:` gives atomic BEGIN/COMMIT blocks.
         self._conn = sqlite3.connect(
             str(self._db_path),
             check_same_thread=False,
-            isolation_level=None,
         )
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
@@ -92,7 +115,7 @@ class Farchive:
         # Per-storage-class auto-train flag: True/False after first check, None = unchecked
         self._has_dict_for_class: dict[str, bool | None] = {}
 
-        # File-based write lock
+        # File-based write lock (POSIX only)
         self._lock_path = self._db_path.with_name(self._db_path.name + ".writer.lock")
         self._lock_held = False
 
@@ -200,10 +223,9 @@ class Farchive:
     # ------------------------------------------------------------------
 
     def _read_raw(self, digest: str) -> bytes | None:
-        """Read and decompress a blob by digest. Used internally for reference chains."""
+        """Read and decompress a blob by digest."""
         row = self._conn.execute(
-            "SELECT payload, codec, codec_dict_id, codec_base_digest FROM blob "
-            "WHERE digest=?",
+            "SELECT payload, codec, codec_dict_id FROM blob WHERE digest=?",
             (digest,),
         ).fetchone()
         if row is None:
@@ -212,9 +234,7 @@ class Farchive:
             bytes(row["payload"]),
             row["codec"],
             codec_dict_id=row["codec_dict_id"],
-            codec_base_digest=row["codec_base_digest"],
             load_dict=self._load_dict,
-            read_blob=self._read_raw,
         )
 
     def _store_blob(
@@ -223,7 +243,6 @@ class Farchive:
         raw: bytes,
         storage_class: str | None,
         *,
-        base_digest: str | None = None,
         dict_id: int | None = None,
     ) -> None:
         """Store blob with best available compression. Idempotent by digest."""
@@ -235,20 +254,18 @@ class Farchive:
 
         dict_data = self._load_dict(dict_id) if dict_id is not None else None
 
-        payload, codec, used_dict_id, used_base = compress_blob(
+        payload, codec, used_dict_id = compress_blob(
             raw,
             self._policy,
             dict_data=dict_data,
             dict_id=dict_id,
-            base_digest=base_digest,
-            read_blob=self._read_raw,
         )
         self._conn.execute(
             "INSERT INTO blob (digest, payload, raw_size, stored_size, "
-            "codec, codec_dict_id, codec_base_digest, storage_class, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "codec, codec_dict_id, storage_class, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (digest, payload, len(raw), len(payload), codec,
-             used_dict_id, used_base, storage_class, _now_ms()),
+             used_dict_id, storage_class, _now_ms()),
         )
 
     # ------------------------------------------------------------------
@@ -261,28 +278,38 @@ class Farchive:
         digest: str,
         now: int,
         *,
-        status_code: int | None = None,
         metadata: dict | None = None,
     ) -> StateSpan:
-        """Core span-update logic. Must be called inside a transaction."""
+        """Core span-update logic. Must be called inside a transaction.
+
+        Enforces monotone observation time per locator.
+        """
         metadata_json = json.dumps(metadata) if metadata else None
 
         # Find current open span for this locator
         current = self._conn.execute(
-            "SELECT span_id, digest FROM locator_span "
+            "SELECT span_id, digest, last_confirmed_at FROM locator_span "
             "WHERE locator=? AND observed_until IS NULL "
             "ORDER BY span_id DESC LIMIT 1",
             (locator,),
         ).fetchone()
+
+        # Enforce monotone observation time
+        if current is not None and now < current["last_confirmed_at"]:
+            raise ValueError(
+                f"Out-of-order observation for {locator!r}: "
+                f"observed_at={now} < last_confirmed_at={current['last_confirmed_at']}. "
+                f"Observations must be in nondecreasing time order per locator."
+            )
 
         if current is not None and current["digest"] == digest:
             # Case B: same digest — extend current span
             self._conn.execute(
                 "UPDATE locator_span SET last_confirmed_at=?, "
                 "observation_count=observation_count+1, "
-                "last_status_code=?, last_metadata_json=? "
+                "last_metadata_json=? "
                 "WHERE span_id=?",
-                (now, status_code, metadata_json, current["span_id"]),
+                (now, metadata_json, current["span_id"]),
             )
             span_id = current["span_id"]
         else:
@@ -296,19 +323,18 @@ class Farchive:
             cursor = self._conn.execute(
                 "INSERT INTO locator_span (locator, digest, observed_from, "
                 "observed_until, last_confirmed_at, observation_count, "
-                "last_status_code, last_metadata_json) "
-                "VALUES (?, ?, ?, NULL, ?, 1, ?, ?)",
-                (locator, digest, now, now, status_code, metadata_json),
+                "last_metadata_json) "
+                "VALUES (?, ?, ?, NULL, ?, 1, ?)",
+                (locator, digest, now, now, metadata_json),
             )
             span_id = cursor.lastrowid
 
         # Optionally record event
         if self._events_enabled:
-            kind = "fa.observe"
             self._conn.execute(
                 "INSERT INTO event (occurred_at, locator, digest, kind, "
-                "status_code, metadata_json) VALUES (?, ?, ?, ?, ?, ?)",
-                (now, locator, digest, kind, status_code, metadata_json),
+                "metadata_json) VALUES (?, ?, ?, ?, ?)",
+                (now, locator, digest, "fa.observe", metadata_json),
             )
 
         # Fetch the final span state
@@ -335,20 +361,21 @@ class Farchive:
         digest: str,
         *,
         observed_at: int | None = None,
-        status_code: int | None = None,
         metadata: dict | None = None,
     ) -> StateSpan:
         """Record an observation of a digest at a locator.
 
         The digest MUST already exist (call put_blob first).
         Creates a new span or extends the current one.
+
+        Raises ValueError if observed_at is earlier than the locator's
+        last_confirmed_at (monotone time enforcement).
         """
         now = observed_at if observed_at is not None else _now_ms()
         with self._write_lock():
             with self._conn:
                 return self._observe_impl(
-                    locator, digest, now,
-                    status_code=status_code, metadata=metadata,
+                    locator, digest, now, metadata=metadata,
                 )
 
     def store(
@@ -358,7 +385,6 @@ class Farchive:
         *,
         observed_at: int | None = None,
         storage_class: str | None = None,
-        status_code: int | None = None,
         metadata: dict | None = None,
     ) -> str:
         """Store content at a locator. put_blob + observe, atomic. Returns digest."""
@@ -368,7 +394,6 @@ class Farchive:
             return self._store_impl(
                 locator, data, digest, now,
                 storage_class=storage_class,
-                status_code=status_code,
                 metadata=metadata,
             )
 
@@ -380,7 +405,6 @@ class Farchive:
         now: int,
         *,
         storage_class: str | None = None,
-        status_code: int | None = None,
         metadata: dict | None = None,
     ) -> str:
         eligible_classes = set(self._policy.auto_train_thresholds)
@@ -392,27 +416,9 @@ class Farchive:
             else None
         )
 
-        # Find previous digest for reference-blob compression
-        current_span = self._conn.execute(
-            "SELECT digest FROM locator_span "
-            "WHERE locator=? AND observed_until IS NULL LIMIT 1",
-            (locator,),
-        ).fetchone()
-        base_digest = (
-            current_span["digest"]
-            if current_span and current_span["digest"] != digest
-            else None
-        )
-
         with self._conn:
-            self._store_blob(
-                digest, data, storage_class,
-                base_digest=base_digest, dict_id=dict_id,
-            )
-            self._observe_impl(
-                locator, digest, now,
-                status_code=status_code, metadata=metadata,
-            )
+            self._store_blob(digest, data, storage_class, dict_id=dict_id)
+            self._observe_impl(locator, digest, now, metadata=metadata)
 
         # Auto-train if eligible and no dict yet
         if storage_class in eligible_classes and dict_id is None:
@@ -470,7 +476,7 @@ class Farchive:
                     self._observe_impl(locator, digest, now)
                     continue
 
-                payload, codec, used_dict, used_base = compress_blob(
+                payload, codec, used_dict = compress_blob(
                     data,
                     self._policy,
                     dict_data=self._load_dict(dict_id) if dict_id else None,
@@ -478,10 +484,10 @@ class Farchive:
                 )
                 self._conn.execute(
                     "INSERT INTO blob (digest, payload, raw_size, stored_size, "
-                    "codec, codec_dict_id, codec_base_digest, storage_class, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "codec, codec_dict_id, storage_class, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     (digest, payload, len(data), len(payload), codec,
-                     used_dict, used_base, storage_class, now),
+                     used_dict, storage_class, now),
                 )
                 self._observe_impl(locator, digest, now)
                 stats.items_stored += 1
@@ -567,6 +573,42 @@ class Farchive:
         return [r[0] for r in rows]
 
     # ------------------------------------------------------------------
+    # Public API — events
+    # ------------------------------------------------------------------
+
+    def events(
+        self,
+        locator: str | None = None,
+        *,
+        since: int | None = None,
+        limit: int = 1000,
+    ) -> list[Event]:
+        """Query event log. Requires enable_events=True.
+
+        Returns events newest-first, optionally filtered by locator and/or time.
+        """
+        if not self._events_enabled:
+            return []
+
+        conditions = []
+        params: list = []
+        if locator is not None:
+            conditions.append("locator = ?")
+            params.append(locator)
+        if since is not None:
+            conditions.append("occurred_at >= ?")
+            params.append(since)
+
+        where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
+        params.append(limit)
+
+        rows = self._conn.execute(
+            f"SELECT * FROM event{where} ORDER BY occurred_at DESC, event_id DESC LIMIT ?",
+            params,
+        ).fetchall()
+        return [_row_to_event(r) for r in rows]
+
+    # ------------------------------------------------------------------
     # Public API — maintenance
     # ------------------------------------------------------------------
 
@@ -591,13 +633,13 @@ class Farchive:
         # Sample blobs
         if storage_class is not None:
             rows = self._conn.execute(
-                "SELECT payload, codec, codec_dict_id, codec_base_digest, raw_size "
+                "SELECT payload, codec, codec_dict_id, raw_size "
                 "FROM blob WHERE storage_class=? ORDER BY RANDOM() LIMIT ?",
                 (storage_class, sample_size * 2),
             ).fetchall()
         else:
             rows = self._conn.execute(
-                "SELECT payload, codec, codec_dict_id, codec_base_digest, raw_size "
+                "SELECT payload, codec, codec_dict_id, raw_size "
                 "FROM blob ORDER BY RANDOM() LIMIT ?",
                 (sample_size * 2,),
             ).fetchall()
@@ -611,9 +653,7 @@ class Farchive:
                     bytes(row["payload"]),
                     row["codec"],
                     codec_dict_id=row["codec_dict_id"],
-                    codec_base_digest=row["codec_base_digest"],
                     load_dict=self._load_dict,
-                    read_blob=self._read_raw,
                 )
                 if len(data) > 100:
                     samples.append(data)
@@ -628,13 +668,14 @@ class Farchive:
 
         now = _now_ms()
         with self._write_lock():
-            cursor = self._conn.execute(
-                "INSERT INTO dict (storage_class, trained_at, sample_count, "
-                "dict_bytes, dict_size) VALUES (?, ?, ?, ?, ?)",
-                (storage_class or "", now, len(samples), serialized, len(serialized)),
-            )
-            dict_id = cursor.lastrowid
-            assert dict_id is not None
+            with self._conn:
+                cursor = self._conn.execute(
+                    "INSERT INTO dict (storage_class, trained_at, sample_count, "
+                    "dict_bytes, dict_size) VALUES (?, ?, ?, ?, ?)",
+                    (storage_class or "", now, len(samples), serialized, len(serialized)),
+                )
+                dict_id = cursor.lastrowid
+                assert dict_id is not None
 
         self._dict_cache[dict_id] = dict_data
         if storage_class:
@@ -672,10 +713,11 @@ class Farchive:
 
         d = self._load_dict(dict_id)
         with self._write_lock():
-            return repack_blobs(
-                self._conn, dict_id, d, self._policy,
-                storage_class=storage_class, batch_size=batch_size,
-            )
+            with self._conn:
+                return repack_blobs(
+                    self._conn, dict_id, d, self._policy,
+                    storage_class=storage_class, batch_size=batch_size,
+                )
 
     def stats(self) -> ArchiveStats:
         """Non-semantic reporting snapshot."""
@@ -699,7 +741,6 @@ class Farchive:
         for row in self._conn.execute(
             "SELECT codec, "
             "  CASE WHEN codec_dict_id IS NOT NULL THEN 'dict' "
-            "       WHEN codec_base_digest IS NOT NULL THEN 'ref' "
             "       ELSE 'plain' END AS variant, "
             "  COUNT(*), SUM(raw_size), SUM(stored_size) "
             "FROM blob GROUP BY codec, variant",
