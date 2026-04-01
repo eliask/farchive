@@ -32,4 +32,4 @@
 - Reference-blob compression (cut from v1; may return if depth-1 enforcement is clean)
 - Tombstone / null-state transitions
 - Multi-hash support (sha512, blake3)
-- Async API
+- Optional `AsyncFarchive` adapter over the sync core (single worker thread, no separate on-disk format or semantics)

@@ -572,6 +572,14 @@ POSIX file locking (fcntl) provides multi-process writer serialization. On platf
 
 ---
 
-## 17. Summary
+## 17. Concurrency Model
+
+The Farchive core API is synchronous. Both the underlying storage engine (Python's `sqlite3`) and the compression library (`python-zstandard`) are synchronous, thread-affine interfaces. The core enforces this with `check_same_thread=True`.
+
+Any future async API is an adapter over the same archive semantics and on-disk format. It does not introduce different history, timing, compression, or compatibility semantics.
+
+---
+
+## 18. Summary
 
 Farchive is a positive-observation archive for opaque bytes: it preserves what was observed at each locator over time, but does not infer unobserved world state between observations. It provides immutable content-addressed blobs, locator-scoped contiguous observation spans, optional append-only event logs, and transparent pluggable storage optimization, where adaptive zstd dictionaries are the default optimization profile rather than the core semantic model.
