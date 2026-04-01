@@ -352,7 +352,7 @@ In Python APIs these are structured values. In the SQLite profile they are persi
 - POSIX advisory file lock for single-writer coordination across processes
 - Not thread-safe (one instance per thread)
 
-### 10.2 Schema (v2)
+### 10.2 Schema (v1)
 
 ```sql
 CREATE TABLE schema_info (
