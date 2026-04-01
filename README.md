@@ -93,7 +93,7 @@ fa.get(locator)                    # convenience: resolve + read
 fa.history(locator)                # all spans, newest first
 fa.has(locator, max_age_hours=24)  # freshness check
 fa.locators(pattern="https://%")   # list locators (LIKE pattern)
-fa.events(locator)                 # audit log (if enable_events=True)
+fa.events(locator)                 # audit log (if event history exists)
 ```
 
 ### Maintenance

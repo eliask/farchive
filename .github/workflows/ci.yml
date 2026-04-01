@@ -37,3 +37,44 @@ jobs:
       - name: Run ty check
         run: uv run ty check src/
         if: matrix.python-version == '3.12'
+
+  package:
+    name: Package smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build wheel
+        run: pip install build && python -m build
+
+      - name: Install from wheel
+        run: pip install dist/farchive-*.whl
+
+      - name: Import smoke test
+        run: python -c "from farchive import Farchive, StateSpan, Event; print('import ok')"
+
+      - name: CLI smoke test
+        run: farchive --help || farchive 2>&1 | head -5
+
+      - name: Roundtrip smoke test
+        run: |
+          python -c "
+          from farchive import Farchive
+          import tempfile, os
+          with tempfile.TemporaryDirectory() as td:
+              with Farchive(os.path.join(td, 't.farchive')) as fa:
+                  fa.store('loc/a', b'hello')
+                  assert fa.get('loc/a') == b'hello'
+                  fa.store('loc/a', b'world')
+                  fa.store('loc/a', b'hello')
+                  assert len(fa.history('loc/a')) == 3
+          print('roundtrip ok')
+          "
+
+      - name: Verify twine check
+        run: pip install twine && twine check dist/*

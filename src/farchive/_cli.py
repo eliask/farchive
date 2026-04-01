@@ -77,11 +77,10 @@ def _cmd_train_dict(args: argparse.Namespace) -> None:
             (dict_id,),
         ).fetchone()
         print(f"  dict_id={dict_id}, samples={row[0]}, size={row[1]:,} bytes")
-
-        print("Repacking...", file=sys.stderr)
-        stats = fa.repack(dict_id=dict_id, storage_class=sc)
         print(
-            f"  Repacked: {stats.blobs_repacked:,}, saved: {stats.bytes_saved:,} bytes"
+            f"  New blobs will use this dict. Run 'farchive repack "
+            f"--storage-class {sc}' to recompress old blobs.",
+            file=sys.stderr,
         )
 
 

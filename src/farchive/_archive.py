@@ -102,7 +102,6 @@ class Farchive:
         self._db_path = Path(db_path)
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         self._policy = compression or CompressionPolicy()
-        self._events_enabled = enable_events
 
         # Use default isolation_level ("") for proper transaction support.
         # `with self._conn:` gives atomic BEGIN/COMMIT blocks.
@@ -114,6 +113,13 @@ class Farchive:
         self._conn.execute("PRAGMA foreign_keys=ON")
 
         init_schema(self._conn, enable_events=enable_events)
+
+        # Event logging is an archive property: once the event table exists
+        # (created by any session with enable_events=True), ALL subsequent
+        # sessions append events automatically.
+        self._events_enabled = self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='event'"
+        ).fetchone() is not None
 
         # Dict cache: dict_id -> ZstdCompressionDict
         self._dict_cache: dict[int, Any] = {}
@@ -540,6 +546,12 @@ class Farchive:
         progress: Callable[[int, int], None] | None = None,
     ) -> ImportStats:
         stats = ImportStats()
+        if observed_at is not None:
+            batch_ts: int = observed_at
+            caller_ts = True
+        else:
+            batch_ts = 0  # unused; per-item _now_ms() below
+            caller_ts = False
 
         # Use any trained dict for this storage class (not gated by auto-train eligibility)
         dict_id = self._get_latest_dict_id(storage_class) if storage_class else None
@@ -547,7 +559,7 @@ class Farchive:
         with self._conn:
             for i, (locator, data) in enumerate(items):
                 stats.items_scanned += 1
-                now = observed_at if observed_at is not None else _now_ms()
+                now: int = batch_ts if caller_ts else _now_ms()
                 digest = _sha256(data)
 
                 # Check dedup
@@ -556,7 +568,10 @@ class Farchive:
                 ).fetchone()
                 if existing:
                     stats.items_deduped += 1
-                    self._observe_impl(locator, digest, now)
+                    self._observe_impl(
+                        locator, digest, now,
+                        _caller_provided_time=caller_ts,
+                    )
                     continue
 
                 payload, codec, used_dict = compress_blob(
@@ -572,7 +587,10 @@ class Farchive:
                     (digest, payload, len(data), len(payload), codec,
                      used_dict, storage_class, now),
                 )
-                self._observe_impl(locator, digest, now)
+                self._observe_impl(
+                    locator, digest, now,
+                    _caller_provided_time=caller_ts,
+                )
                 stats.items_stored += 1
                 stats.bytes_raw += len(data)
                 stats.bytes_stored += len(payload)
@@ -668,9 +686,9 @@ class Farchive:
     ) -> list[Event]:
         """Query event log.
 
-        Reads existing event history whenever the event table exists,
-        regardless of whether this instance has enable_events=True.
-        Returns events newest-first, optionally filtered by locator and/or time.
+        Event logging is an archive property: once any session creates the
+        event table (via enable_events=True), all subsequent sessions append
+        events and can read the full history. Returns events newest-first.
         """
         # Check if event table exists (may have been created by a prior session)
         has_table = self._conn.execute(

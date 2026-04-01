@@ -529,6 +529,22 @@ def test_events_readable_on_reopen_without_enable(tmp_path):
         assert evts[0].kind == "fa.observe"
 
 
+def test_events_written_on_reopen_without_enable(tmp_path):
+    """Once event table exists, all sessions append events automatically."""
+    db = tmp_path / "reopen_write.farchive"
+    with Farchive(db, enable_events=True) as fa:
+        d = fa.put_blob(b"session1")
+        fa.observe("loc/s1", d, observed_at=_T0)
+
+    # Reopen WITHOUT enable_events — new writes should still emit events
+    with Farchive(db) as fa2:
+        d2 = fa2.put_blob(b"session2")
+        fa2.observe("loc/s2", d2, observed_at=_T1)
+
+        evts = fa2.events()
+        assert len(evts) == 2  # one from each session
+
+
 def test_events_api_since_filter(archive_with_events):
     fa = archive_with_events
     digest = fa.put_blob(b"since test")

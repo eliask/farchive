@@ -162,7 +162,9 @@ This yields three spans:
 
 ### 4.5 Event
 
-An event is an optional append-only audit record of an observation write.
+An event is an append-only audit record of an observation write.
+
+Event logging is an **archive property**, not a session property. Once any session creates the event table (via `enable_events=True`), all subsequent sessions append events automatically, even if opened without `enable_events`. The `events()` read API works whenever the event table exists.
 
 Currently the implementation emits events of kind `fa.observe` (one per `observe()` / `store()` call). Future versions may emit additional kinds such as `fa.train_dict` or `fa.repack`.
 
@@ -237,6 +239,15 @@ The official profile REQUIRES observations for a given locator to be appended in
 
 Additionally, a digest transition (Case C) at the exact same timestamp as the current span's `last_confirmed_at` is rejected. This prevents zero-duration spans. Same-timestamp confirmations of the same digest (Case B) are allowed.
 
+### 6.5 Implicit timestamp auto-bump
+
+For calls without explicit `observed_at`, the implementation may internally adjust the generated timestamp to preserve span validity. Specifically:
+
+- Same-digest confirmation: timestamp is bumped to at least `last_confirmed_at`
+- Digest transition: timestamp is bumped to at least `last_confirmed_at + 1`
+
+This ensures the default path (no explicit timestamps) is boring and safe. Callers who provide explicit timestamps get strict enforcement with no auto-adjustment.
+
 ### 6.3 Current span
 
 A span is current iff `observed_until IS NULL`.
@@ -304,6 +315,7 @@ The following error behaviors are part of the public contract:
 | `observe(locator, missing_digest)` | `ValueError` | "not found — call put_blob() first" |
 | Out-of-order observation | `ValueError` | "Out-of-order observation" |
 | Same-timestamp digest change | `ValueError` | "Same-timestamp digest change" |
+| Non-dict metadata (e.g. list) | `TypeError` | "metadata must be a dict or None" |
 | Non-JSON-serializable metadata | `TypeError` | "metadata must be JSON-serializable" |
 | `repack()` without scoping | `ValueError` | "requires storage_class or dict_id" |
 | `repack()` with mismatched dict/class | `ValueError` | "does not match dict" |
@@ -511,6 +523,8 @@ Dictionary **usage** and **auto-training** are decoupled:
 When enough blobs of a storage class listed in `auto_train_thresholds` accumulate, the archive auto-trains a zstd dictionary. New blobs of that class immediately use the trained dictionary.
 
 Recompression of older blobs is **not automatic** -- it requires an explicit `repack()` call. This keeps write latency predictable and separates semantic operations (store/observe) from maintenance operations (repack).
+
+Auto-training is **best-effort and non-fatal**. If training fails (insufficient samples, internal error), the semantic write that triggered it has already succeeded. Failures are reported via `warnings.warn`, not exceptions. Manual `train_dict()` and `repack()` are the strict maintenance APIs.
 
 Auto-training MUST NOT alter archive semantics.
 
