@@ -6,15 +6,38 @@ requires-python = ">=3.11"
 dependencies = ["zstandard>=0.21"]
 readme = "README.md"
 license = "MIT"
+authors = [
+    { name = "Elias Kunnas" },
+]
+keywords = [
+    "archive",
+    "content-addressed",
+    "sqlite",
+    "zstd",
+    "history",
+    "blob-store",
+    "web-scraping",
+]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Database",
     "Topic :: System :: Archiving",
+    "Typing :: Typed",
 ]
+
+[project.urls]
+Homepage = "https://github.com/eliask/farchive"
+Repository = "https://github.com/eliask/farchive"
+Issues = "https://github.com/eliask/farchive/issues"
 
 [project.optional-dependencies]
 test = ["pytest>=8.0"]
+dev = ["pytest>=8.0", "ruff>=0.4", "ty>=0.0.1a1"]
 
 [project.scripts]
 farchive = "farchive._cli:main"
