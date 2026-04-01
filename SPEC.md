@@ -1,6 +1,6 @@
 # Farchive Spec v1 and SQLite/Zstd Profile
 
-Status: conformant with v0.2.0 implementation, living spec.
+Status: conformant with v0.2.1 implementation, living spec.
 
 ---
 
@@ -162,13 +162,13 @@ This yields three spans:
 
 ### 4.5 Event
 
-An event is an optional exact audit record of one archival operation.
+An event is an optional append-only audit record of an observation write.
 
-Events are append-only. They are distinct from state spans.
+Currently the implementation emits events of kind `fa.observe` (one per `observe()` / `store()` call). Future versions may emit additional kinds such as `fa.train_dict` or `fa.repack`.
 
 State spans answer: what was the archive's best-known state for this locator?
 
-Events answer: what happened when the archive looked or wrote?
+Events answer: what observation writes occurred?
 
 ### 4.6 Storage Class
 
@@ -234,6 +234,8 @@ Every observation has an `observed_at` instant in UTC. The official profile stor
 ### 6.2 Monotone write requirement
 
 The official profile REQUIRES observations for a given locator to be appended in nondecreasing `observed_at` order. An implementation MUST reject out-of-order observations rather than silently corrupt span history.
+
+Additionally, a digest transition (Case C) at the exact same timestamp as the current span's `last_confirmed_at` is rejected. This prevents zero-duration spans. Same-timestamp confirmations of the same digest (Case B) are allowed.
 
 ### 6.3 Current span
 
@@ -304,6 +306,8 @@ Any compression strategy MUST satisfy: exact reversibility, raw-byte round-trip,
 ### 8.2 Repacking
 
 Repacking MAY rewrite stored blob payloads and storage metadata. Repacking MUST preserve: digest, raw bytes, spans, events, query semantics.
+
+The official profile requires `storage_class` or an explicit `dict_id` for repack operations to prevent cross-applying a dictionary trained on one storage class to blobs of another.
 
 ### 8.3 Dictionaries
 
@@ -450,11 +454,19 @@ class CompressionPolicy:
     compression_level: int = 3
 ```
 
-These are policy defaults, not spec law. An implementation MAY choose different defaults. Storage classes not listed in `auto_train_thresholds` can still use dictionaries via manual `train_dict()`.
+These are policy defaults, not spec law. An implementation MAY choose different defaults.
 
-### 11.3 Auto-training
+### 11.3 Dictionary usage vs auto-training
 
-When enough blobs of an eligible storage class accumulate, the archive auto-trains a zstd dictionary and repacks existing blobs. This is a storage optimization that MUST NOT alter archive semantics.
+Dictionary **usage** and **auto-training** are decoupled:
+
+- Any storage class with a trained dictionary will use it for new blob writes, regardless of whether that class is in `auto_train_thresholds`.
+- `auto_train_thresholds` only governs **automatic** training. Storage classes not listed can still have dictionaries trained manually via `train_dict()`, and those dictionaries will be used.
+- `put_blob()`, `store()`, and `store_batch()` all resolve and use the latest trained dictionary for the given storage class.
+
+### 11.4 Auto-training
+
+When enough blobs of a storage class listed in `auto_train_thresholds` accumulate, the archive auto-trains a zstd dictionary and repacks existing blobs. This is a storage optimization that MUST NOT alter archive semantics.
 
 ---
 

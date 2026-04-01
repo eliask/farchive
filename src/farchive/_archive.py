@@ -30,7 +30,7 @@ from farchive._compression import (
     repack_blobs,
     train_dict_from_samples,
 )
-from farchive._schema import SCHEMA_VERSION, _now_ms, init_schema
+from farchive._schema import _now_ms, init_schema
 from farchive._types import (
     ArchiveStats,
     CompressionPolicy,
@@ -302,6 +302,18 @@ class Farchive:
                 f"Observations must be in nondecreasing time order per locator."
             )
 
+        # Reject same-timestamp digest changes (would create zero-duration spans)
+        if (
+            current is not None
+            and current["digest"] != digest
+            and now == current["last_confirmed_at"]
+        ):
+            raise ValueError(
+                f"Same-timestamp digest change for {locator!r} at {now}: "
+                f"cannot transition from {current['digest'][:12]}.. to {digest[:12]}.. "
+                f"at the same timestamp. Use a later timestamp for digest changes."
+            )
+
         if current is not None and current["digest"] == digest:
             # Case B: same digest — extend current span
             self._conn.execute(
@@ -348,11 +360,22 @@ class Farchive:
     # ------------------------------------------------------------------
 
     def put_blob(self, data: bytes, *, storage_class: str | None = None) -> str:
-        """Store blob if absent. Returns digest. Idempotent."""
+        """Store blob if absent, using best available compression. Returns digest.
+
+        If a trained dictionary exists for the storage_class, it will be used.
+        Participates in auto-training if the storage_class is eligible.
+        """
         digest = _sha256(data)
+        # Resolve dict for this storage class (any class with a trained dict, not just auto-eligible)
+        dict_id = self._get_latest_dict_id(storage_class) if storage_class else None
         with self._write_lock():
             with self._conn:
-                self._store_blob(digest, data, storage_class)
+                self._store_blob(digest, data, storage_class, dict_id=dict_id)
+        # Auto-train if eligible and no dict yet
+        if storage_class and dict_id is None:
+            eligible = set(self._policy.auto_train_thresholds)
+            if storage_class in eligible:
+                self._check_auto_train(storage_class)
         return digest
 
     def observe(
@@ -407,21 +430,15 @@ class Farchive:
         storage_class: str | None = None,
         metadata: dict | None = None,
     ) -> str:
-        eligible_classes = set(self._policy.auto_train_thresholds)
-
-        # Resolve best dict for this storage class
-        dict_id = (
-            self._get_latest_dict_id(storage_class)
-            if storage_class in eligible_classes
-            else None
-        )
+        # Use any trained dict for this storage class (not gated by auto-train eligibility)
+        dict_id = self._get_latest_dict_id(storage_class) if storage_class else None
 
         with self._conn:
             self._store_blob(digest, data, storage_class, dict_id=dict_id)
             self._observe_impl(locator, digest, now, metadata=metadata)
 
         # Auto-train if eligible and no dict yet
-        if storage_class in eligible_classes and dict_id is None:
+        if storage_class and dict_id is None:
             self._check_auto_train(storage_class)
 
         return digest
@@ -452,14 +469,9 @@ class Farchive:
         progress: Callable[[int, int], None] | None = None,
     ) -> ImportStats:
         stats = ImportStats()
-        eligible_classes = set(self._policy.auto_train_thresholds)
 
-        # Pre-resolve dict for this storage class
-        dict_id = (
-            self._get_latest_dict_id(storage_class)
-            if storage_class is not None and storage_class in eligible_classes
-            else None
-        )
+        # Use any trained dict for this storage class (not gated by auto-train eligibility)
+        dict_id = self._get_latest_dict_id(storage_class) if storage_class else None
 
         with self._conn:
             for i, (locator, data) in enumerate(items):
@@ -498,7 +510,7 @@ class Farchive:
                     progress(i + 1, len(items))
 
         # Auto-train check after batch
-        if storage_class is not None and storage_class in eligible_classes and dict_id is None:
+        if storage_class and dict_id is None:
             self._check_auto_train(storage_class)
 
         return stats
@@ -704,12 +716,14 @@ class Farchive:
         batch_size: int = 1000,
     ) -> RepackStats:
         if dict_id is None:
+            if storage_class is None:
+                raise ValueError(
+                    "repack() requires storage_class or dict_id to avoid "
+                    "cross-applying a dictionary to unrelated storage classes"
+                )
             dict_id = self._get_latest_dict_id(storage_class)
             if dict_id is None:
-                raise ValueError(
-                    "No trained dict" +
-                    (f" for storage_class={storage_class!r}" if storage_class else ""),
-                )
+                raise ValueError(f"No trained dict for storage_class={storage_class!r}")
 
         d = self._load_dict(dict_id)
         with self._write_lock():
@@ -721,6 +735,8 @@ class Farchive:
 
     def stats(self) -> ArchiveStats:
         """Non-semantic reporting snapshot."""
+        from farchive._schema import detect_schema_version
+        db_version = detect_schema_version(self._conn)
         loc_count = self._conn.execute(
             "SELECT COUNT(DISTINCT locator) FROM locator_span",
         ).fetchone()[0]
@@ -762,7 +778,7 @@ class Farchive:
             compression_ratio=(totals[0] / totals[1]) if totals[1] else None,
             codec_distribution=codec_dist,
             db_path=str(self._db_path),
-            schema_version=SCHEMA_VERSION,
+            schema_version=db_version,
         )
 
     # ------------------------------------------------------------------

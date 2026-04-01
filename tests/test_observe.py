@@ -164,11 +164,20 @@ def test_out_of_order_observation_raises(archive):
         archive.observe("loc/mono", digest, observed_at=_T0)
 
 
-def test_equal_timestamp_allowed(archive):
+def test_equal_timestamp_same_digest_allowed(archive):
     digest = archive.put_blob(b"equal-time")
     archive.observe("loc/eq", digest, observed_at=_T0)
     span = archive.observe("loc/eq", digest, observed_at=_T0)
     assert span.observation_count == 2
+
+
+def test_equal_timestamp_different_digest_rejected(archive):
+    d_a = archive.put_blob(b"A")
+    d_b = archive.put_blob(b"B")
+    archive.observe("loc/eqd", d_a, observed_at=_T0)
+
+    with pytest.raises(ValueError, match="Same-timestamp digest change"):
+        archive.observe("loc/eqd", d_b, observed_at=_T0)
 
 
 # ---------------------------------------------------------------------------

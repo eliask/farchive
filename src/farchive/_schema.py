@@ -98,6 +98,20 @@ def detect_schema_version(conn: sqlite3.Connection) -> int:
         return 0
 
 
+def _migrate_v1_to_v2(conn: sqlite3.Connection) -> None:
+    """Migrate farchive schema v1 -> v2.
+
+    v2 removes: codec_base_digest from blob, last_status_code from locator_span,
+    status_code/error_text from event. SQLite doesn't support DROP COLUMN on older
+    versions, so we tolerate the extra columns — they just won't be written to.
+    """
+    now = _now_ms()
+    conn.execute(
+        "UPDATE schema_info SET version=?, migrated_at=?, generator=?",
+        (SCHEMA_VERSION, now, _GENERATOR),
+    )
+
+
 def init_schema(conn: sqlite3.Connection, *, enable_events: bool = False) -> None:
     """Create or verify schema. Raises on incompatible future version."""
     version = detect_schema_version(conn)
@@ -115,7 +129,9 @@ def init_schema(conn: sqlite3.Connection, *, enable_events: bool = False) -> Non
             "INSERT OR IGNORE INTO schema_info VALUES (?, ?, NULL, ?)",
             (SCHEMA_VERSION, now, _GENERATOR),
         )
-    # version >= 1: already has tables; event table added on demand below
+    elif version == 1:
+        _migrate_v1_to_v2(conn)
+    # version == 2: already current
     if enable_events:
         tables = {
             r[0]

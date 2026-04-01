@@ -220,3 +220,75 @@ def test_store_idempotent(low_threshold_archive):
 
     blob_count = fa._conn.execute("SELECT COUNT(*) FROM blob").fetchone()[0]
     assert blob_count == 1
+
+
+# ---------------------------------------------------------------------------
+# put_blob uses trained dicts
+# ---------------------------------------------------------------------------
+
+
+def test_put_blob_uses_trained_dict(low_threshold_archive):
+    """put_blob should use a trained dict if one exists for the storage class."""
+    fa = low_threshold_archive
+    # First trigger auto-train via store()
+    for i in range(20):
+        fa.store(f"loc/xml/{i}", _make_xml_blob(i), storage_class="xml")
+
+    dict_id = fa._get_latest_dict_id("xml")
+    assert dict_id is not None
+
+    # Now put_blob with storage_class should use the dict
+    data = _make_xml_blob(99)
+    digest = fa.put_blob(data, storage_class="xml")
+
+    row = fa._conn.execute(
+        "SELECT codec_dict_id FROM blob WHERE digest=?", (digest,),
+    ).fetchone()
+    assert row["codec_dict_id"] == dict_id
+
+
+# ---------------------------------------------------------------------------
+# Manual dict for non-auto class is used
+# ---------------------------------------------------------------------------
+
+
+def test_manual_dict_used_by_non_auto_class(tmp_path):
+    """A manually trained dict for a non-auto class should be used by store()."""
+    db = tmp_path / "manual.farchive"
+    fa = Farchive(db)
+    try:
+        # Store enough json blobs to train (bypassing auto-train since json is not in thresholds)
+        for i in range(20):
+            data = f'{{"id": {i}, "content": "value {i}", "extra": "{("x" * 400)}"}}'.encode()
+            fa.store(f"loc/json/{i}", data, storage_class="json")
+
+        # No auto-trained dict (json not in auto_train_thresholds)
+        assert fa._get_latest_dict_id("json") is None
+
+        # Manually train
+        dict_id = fa.train_dict(storage_class="json")
+        assert dict_id is not None
+
+        # Now store() should use it
+        data = f'{{"id": 99, "content": "manual dict test", "extra": "{("y" * 400)}"}}'.encode()
+        digest = fa.store("loc/json/99", data, storage_class="json")
+
+        row = fa._conn.execute(
+            "SELECT codec_dict_id FROM blob WHERE digest=?", (digest,),
+        ).fetchone()
+        assert row["codec_dict_id"] == dict_id
+    finally:
+        fa.close()
+
+
+# ---------------------------------------------------------------------------
+# repack requires storage_class
+# ---------------------------------------------------------------------------
+
+
+def test_repack_without_storage_class_raises(low_threshold_archive):
+    """repack() without storage_class or dict_id should raise."""
+    import pytest
+    fa = low_threshold_archive
+    with pytest.raises(ValueError, match="requires storage_class"):
+        fa.repack()
