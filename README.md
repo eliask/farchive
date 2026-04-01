@@ -2,7 +2,7 @@
 
 Content-addressed archive with locator-scoped observation history and adaptive zstd compression.
 
-Farchive stores opaque byte payloads and remembers where and when they were observed. It deduplicates by content (SHA-256), tracks state changes at each locator as contiguous spans, and transparently compresses everything with zstd -- including corpus-trained dictionaries that adapt to your data.
+Farchive stores opaque byte payloads and remembers where and when they were observed. It deduplicates by content (SHA-256), tracks state changes at each locator as contiguous spans, and uses transparent zstd compression -- including corpus-trained dictionaries that adapt to your data.
 
 ## Why
 

@@ -1,6 +1,6 @@
-# Farchive 1.0 -- Core Spec and Official SQLite/Zstd Profile
+# Farchive Spec v1 and SQLite/Zstd Profile
 
-Status: implemented (v0.1.0), living spec.
+Status: conformant with v0.2.0 implementation, living spec.
 
 ---
 
@@ -22,7 +22,9 @@ Farchive fills that gap.
 
 ## 1. Design Goal
 
-Farchive is a local archive for opaque byte payloads observed at opaque locators over time.
+Farchive is a local, positive-observation archive for opaque byte payloads observed at opaque locators over time.
+
+"Positive-observation" means: Farchive records what was observed, not what was absent. It does not model first-class tombstones, null-state transitions, or "resource not found" as core state. Absence, fetch failures, and transport-level negative outcomes belong in event metadata or higher-level profiles.
 
 Its job is to provide:
 
@@ -107,7 +109,7 @@ Farchive is not:
 - a domain-specific legal archive format
 - a guarantee that the underlying resource did not change between observations
 
-Farchive stores **what was observed**, not what must have been true in the world between observations.
+Farchive stores **what was observed**, not what must have been true in the world between observations. It preserves what was observed at each locator over time, but does not infer unobserved world state between observations.
 
 ---
 
@@ -143,6 +145,7 @@ A state span has:
 - `observed_until` -- exclusive upper bound, or NULL if current
 - `last_confirmed_at` -- latest observation confirming this span
 - `observation_count`
+- `last_metadata` -- optional caller-provided metadata snapshot
 
 Example:
 
@@ -159,7 +162,7 @@ This yields three spans:
 
 ### 4.5 Event
 
-An event is an optional exact audit record of one archival operation or fetch outcome.
+An event is an optional exact audit record of one archival operation.
 
 Events are append-only. They are distinct from state spans.
 
@@ -169,9 +172,11 @@ Events answer: what happened when the archive looked or wrote?
 
 ### 4.6 Storage Class
 
-A storage class is an implementation hint used for storage optimization, especially compression bucketing. Examples: `xml`, `html`, `pdf`, `text`, `binary`.
+A storage class is an implementation hint used for compression bucketing. Examples: `xml`, `html`, `pdf`, `text`, `binary`.
 
 A storage class is not a normative statement of MIME truth. It is a storage-policy hint.
+
+In the official SQLite profile, `storage_class` is stored on the blob row as an insertion-time compression hint. If an identical digest is later observed with a different suggested storage class, the existing blob row is reused and the original hint remains unchanged.
 
 ---
 
@@ -226,9 +231,9 @@ All byte-returning reads MUST return exact raw bytes.
 
 Every observation has an `observed_at` instant in UTC. The official profile stores time as UTC Unix milliseconds (INTEGER).
 
-### 6.2 Monotone write assumption
+### 6.2 Monotone write requirement
 
-The core archive model assumes observations for a given locator are appended in nondecreasing `observed_at` order.
+The official profile REQUIRES observations for a given locator to be appended in nondecreasing `observed_at` order. An implementation MUST reject out-of-order observations rather than silently corrupt span history.
 
 ### 6.3 Current span
 
@@ -251,7 +256,7 @@ Compute digest over raw bytes. Store blob if absent. Return digest. Idempotent.
 
 ### 7.2 `observe(locator, digest, observed_at) -> StateSpan`
 
-Preconditions: the digest MUST already exist.
+Preconditions: the digest MUST already exist. `observed_at` MUST be >= the locator's current `last_confirmed_at`.
 
 - **Case A (no current span):** create a new open span for `(locator, digest)`.
 - **Case B (current span has same digest):** update `last_confirmed_at`, increment `observation_count`.
@@ -275,7 +280,11 @@ If `at` is None: return the current span for the locator. If `at` is provided: r
 
 Returns all state spans for the locator.
 
-### 7.7 Convenience operations
+### 7.7 `events(locator=None, since=None) -> list[Event]`
+
+Query the event audit log. Returns events newest-first, optionally filtered by locator and/or time. Returns empty list if events are disabled.
+
+### 7.8 Convenience operations
 
 - `get(locator, at=None)` = `read(resolve(locator, at).digest)`
 - `has(locator, max_age_hours=...)` -- freshness check
@@ -300,33 +309,31 @@ Repacking MAY rewrite stored blob payloads and storage metadata. Repacking MUST 
 
 An implementation MAY train and use corpus-specific compression dictionaries. Dictionary usage is storage-only and MUST be invisible to readers.
 
-### 8.4 Reference-blob compression
-
-An implementation MAY compress one blob using another blob as a codec reference. The official profile restricts this to depth 1.
-
 ---
 
 ## 9. Field Taxonomy
 
-### Closed fields (archive-owned semantics)
+### Closed fields
 
-| Field | Values | Python type |
-|-------|--------|-------------|
-| `codec` | `'raw'`, `'zstd'` | `Literal["raw", "zstd"]` |
+Archive-owned enums whose meaning is normative.
 
-### Semi-open fields (recommended values, extensible)
+- `codec`: `'raw' | 'zstd'`
 
-| Field | Examples | Python type |
-|-------|----------|-------------|
-| `storage_class` | `xml`, `html`, `pdf`, `text`, `binary` | `str \| None` |
-| `event.kind` | `fa.observe`, `fa.store`, `fa.fetch.ok` | `str` |
+### Semi-open fields
 
-### Open fields (caller-owned)
+Caller-extensible strings with recommended conventions.
 
-| Field | Python type |
-|-------|-------------|
-| `locator` | `str` |
-| `metadata_json` | `Mapping[str, Any] \| None` |
+- `storage_class`: e.g. `xml`, `html`, `pdf`, `text`, `binary`
+- `event.kind`: namespaced strings such as `fa.observe`, `fa.store`, `fa.fetch.ok`
+
+### Open fields
+
+Caller-owned semantic payloads.
+
+- `locator: str`
+- `metadata: Mapping[str, Any] | None`
+
+In Python APIs these are structured values. In the SQLite profile they are persisted as JSON text in `*_metadata_json` columns.
 
 ---
 
@@ -337,9 +344,11 @@ An implementation MAY compress one blob using another blob as a codec reference.
 - SQLite WAL mode
 - `busy_timeout = 5000`
 - `foreign_keys = ON`
-- File-based write lock for single-writer guarantee
+- Default transaction mode (not autocommit) for atomic `with conn:` blocks
+- POSIX advisory file lock for single-writer coordination across processes
+- Not thread-safe (one instance per thread)
 
-### 10.2 Schema (v1)
+### 10.2 Schema (v2)
 
 ```sql
 CREATE TABLE schema_info (
@@ -365,7 +374,6 @@ CREATE TABLE blob (
     stored_size        INTEGER NOT NULL,
     codec              TEXT NOT NULL CHECK (codec IN ('raw', 'zstd')),
     codec_dict_id      INTEGER REFERENCES dict(dict_id),
-    codec_base_digest  TEXT REFERENCES blob(digest),
     storage_class      TEXT,
     created_at         INTEGER NOT NULL
 );
@@ -378,7 +386,6 @@ CREATE TABLE locator_span (
     observed_until     INTEGER,
     last_confirmed_at  INTEGER NOT NULL,
     observation_count  INTEGER NOT NULL DEFAULT 1,
-    last_status_code   INTEGER,
     last_metadata_json TEXT
 );
 
@@ -388,8 +395,6 @@ CREATE INDEX idx_span_locator
     ON locator_span(locator, observed_from DESC);
 CREATE INDEX idx_span_locator_time
     ON locator_span(locator, observed_from, observed_until);
-CREATE INDEX idx_blob_base
-    ON blob(codec_base_digest);
 
 -- Optional, only when enable_events = True
 CREATE TABLE event (
@@ -398,9 +403,7 @@ CREATE TABLE event (
     locator            TEXT NOT NULL,
     digest             TEXT,
     kind               TEXT NOT NULL,
-    status_code        INTEGER,
-    metadata_json      TEXT,
-    error_text         TEXT
+    metadata_json      TEXT
 );
 
 CREATE INDEX idx_event_locator_time
@@ -413,8 +416,8 @@ CREATE INDEX idx_event_locator_time
 - `codec='raw'` means `payload` is exact raw bytes.
 - `codec='zstd'` means `payload` is zstd-compressed bytes.
 - `codec_dict_id` MAY be set when zstd used a trained dictionary.
-- `codec_base_digest` MAY be set when zstd used another blob as a reference.
 - The meaning of the blob is always the raw bytes identified by `digest`, not the physical `payload`.
+- `storage_class` is an insertion-time compression hint, not semantic MIME truth. First-insert wins for deduped blobs.
 
 ### 10.4 Locator span table notes
 
@@ -422,6 +425,7 @@ CREATE INDEX idx_event_locator_time
 - `observed_until` is exclusive.
 - The current span has `observed_until IS NULL`.
 - There is at most one open current span per locator (enforced by partial unique index).
+- `last_metadata_json` stores caller metadata as JSON text; the Python API deserializes it to `dict | None`.
 
 ---
 
@@ -429,12 +433,11 @@ CREATE INDEX idx_event_locator_time
 
 ### 11.1 Codec families
 
-The official profile supports four compression modes, all represented using `codec` + `codec_dict_id` + `codec_base_digest`:
+The official profile supports three compression modes:
 
 1. **Raw** -- blobs below `raw_threshold` (default 64 bytes)
 2. **Vanilla zstd** -- standard compression, no dictionary
 3. **Dictionary zstd** -- `codec_dict_id` references a trained dictionary
-4. **Reference-blob zstd** -- `codec_base_digest` references another blob used as the zstd dictionary (depth 1 only)
 
 ### 11.2 CompressionPolicy
 
@@ -442,49 +445,42 @@ The official profile supports four compression modes, all represented using `cod
 @dataclass
 class CompressionPolicy:
     raw_threshold: int = 64
-    auto_train_thresholds: dict[str, int] = {"xml": 1000, "pdf": 16}
-    dict_target_sizes: dict[str, int] = {"xml": 112*1024, "pdf": 64*1024}
+    auto_train_thresholds: dict[str, int] = {"xml": 1000, "html": 500, "pdf": 16}
+    dict_target_sizes: dict[str, int] = {"xml": 112*1024, "html": 112*1024, "pdf": 64*1024}
     compression_level: int = 3
-    reference_savings_gate: float = 0.8
 ```
 
-These are policy defaults, not spec law. An implementation MAY choose different defaults.
+These are policy defaults, not spec law. An implementation MAY choose different defaults. Storage classes not listed in `auto_train_thresholds` can still use dictionaries via manual `train_dict()`.
 
 ### 11.3 Auto-training
 
 When enough blobs of an eligible storage class accumulate, the archive auto-trains a zstd dictionary and repacks existing blobs. This is a storage optimization that MUST NOT alter archive semantics.
 
-### 11.4 Reference-blob compression
-
-Uses a previous blob at the same locator as a zstd dictionary. Only used when it beats vanilla compression by the savings gate factor (default 20% smaller). Depth is limited to 1 -- no chains.
-
 ---
 
-## 12. HTTP Observation Profile
+## 12. HTTP Integration Conventions
 
-Farchive core is transport-neutral. HTTP is one source of observations.
+Farchive core is transport-neutral. HTTP is one source of observations. This section documents recommended conventions for callers that integrate HTTP sources.
+
+HTTP fetching is NOT implemented in the farchive library. The caller fetches bytes using their preferred HTTP library and calls `store()`.
 
 ### 12.1 Archived bytes
 
-The official HTTP profile stores **response body bytes** after HTTP framing is removed.
+Store **response body bytes** after HTTP framing is removed.
 
 ### 12.2 Headers and metadata
 
-- Full response headers go in `event.metadata_json["http"]["response_headers"]` as ordered `[name, value]` pairs.
+- Full response headers go in `event metadata["http"]["response_headers"]` as ordered `[name, value]` pairs.
 - Span metadata holds only a small latest summary (e.g. `etag`, `last_modified`, `content_type`).
 - Headers MUST be stored as ordered pairs, not a dict (header names can repeat).
 
 ### 12.3 304 Not Modified
 
-A 304 is an event, not a new blob. The current span gets `last_confirmed_at` updated and `observation_count` incremented. No new blob, no span transition.
+A 304 can be represented by re-observing the current span's digest at the locator. The current span gets `last_confirmed_at` updated and `observation_count` incremented. No new blob, no span transition.
 
 ### 12.4 Errors
 
-Transport errors (timeout, connection failure) are event-only by default -- no synthetic error blobs.
-
-### 12.5 Note
-
-HTTP fetching is NOT implemented in the farchive library. The caller fetches bytes using their preferred HTTP library and calls `store()`. This profile documents conventions for callers that integrate HTTP sources.
+Transport errors (timeout, connection failure) are not represented in core span semantics. Callers may record them in event metadata (if events are enabled) or track them externally.
 
 ---
 
@@ -496,4 +492,4 @@ The official file extension is `.farchive`. Default filename: `archive.farchive`
 
 ## 14. Summary
 
-Farchive is a history-preserving archive for opaque bytes, with immutable content-addressed blobs, locator-scoped contiguous observation spans, optional append-only event logs, and transparent pluggable storage optimization, where adaptive zstd dictionaries are the default optimization profile rather than the core semantic model.
+Farchive is a positive-observation archive for opaque bytes: it preserves what was observed at each locator over time, but does not infer unobserved world state between observations. It provides immutable content-addressed blobs, locator-scoped contiguous observation spans, optional append-only event logs, and transparent pluggable storage optimization, where adaptive zstd dictionaries are the default optimization profile rather than the core semantic model.
