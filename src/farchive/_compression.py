@@ -10,19 +10,9 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from typing import Any
 
-try:
-    import zstandard as zstd
-
-    _ZSTD_AVAILABLE = True
-except ImportError:
-    _ZSTD_AVAILABLE = False
+import zstandard as zstd
 
 from farchive._types import CompressionPolicy, RepackStats
-
-
-def _require_zstd() -> None:
-    if not _ZSTD_AVAILABLE:
-        raise RuntimeError("zstandard>=0.21 required for farchive")
 
 
 # ---------------------------------------------------------------------------
@@ -36,7 +26,6 @@ _vanilla_decompressor: Any = None
 def _get_vanilla_compressor(level: int = 3) -> Any:
     global _vanilla_compressor
     if _vanilla_compressor is None:
-        _require_zstd()
         _vanilla_compressor = zstd.ZstdCompressor(level=level)
     return _vanilla_compressor
 
@@ -44,13 +33,11 @@ def _get_vanilla_compressor(level: int = 3) -> Any:
 def _get_vanilla_decompressor() -> Any:
     global _vanilla_decompressor
     if _vanilla_decompressor is None:
-        _require_zstd()
         _vanilla_decompressor = zstd.ZstdDecompressor()
     return _vanilla_decompressor
 
 
 def _make_compressor(level: int = 3, dict_data: Any = None) -> Any:
-    _require_zstd()
     kwargs: dict = {"level": level}
     if dict_data is not None:
         kwargs["dict_data"] = dict_data
@@ -58,7 +45,6 @@ def _make_compressor(level: int = 3, dict_data: Any = None) -> Any:
 
 
 def _make_decompressor(dict_data: Any = None) -> Any:
-    _require_zstd()
     kwargs: dict = {}
     if dict_data is not None:
         kwargs["dict_data"] = dict_data
@@ -160,7 +146,6 @@ def train_dict_from_samples(
     target_size: int = 112 * 1024,
 ) -> Any:
     """Train a zstd dictionary from raw byte samples. Returns ZstdCompressionDict."""
-    _require_zstd()
     if len(samples) < 10:
         raise ValueError(f"Need at least 10 samples, got {len(samples)}")
     return zstd.train_dictionary(target_size, list(samples))

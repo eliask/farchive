@@ -31,15 +31,7 @@ from farchive._types import (
     StateSpan,
 )
 
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    import zstandard as zstd
-else:
-    try:
-        import zstandard as zstd
-    except ImportError:
-        zstd = None
+import zstandard as zstd
 
 
 def _sha256(data: bytes) -> str:
@@ -73,7 +65,7 @@ class Farchive:
 
     def __init__(
         self,
-        db_path: str | Path = "farchive.db",
+        db_path: str | Path = "archive.farchive",
         *,
         compression: CompressionPolicy | None = None,
         enable_events: bool = False,
@@ -101,7 +93,7 @@ class Farchive:
         self._has_dict_for_class: dict[str, bool | None] = {}
 
         # File-based write lock
-        self._lock_path = self._db_path.with_suffix(".db.writer.lock")
+        self._lock_path = self._db_path.with_suffix(".farchive.lock")
         self._lock_held = False
 
     @contextmanager

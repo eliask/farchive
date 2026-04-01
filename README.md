@@ -17,7 +17,7 @@ Requires Python 3.11+ and `zstandard>=0.21`.
 ```python
 from farchive import Farchive
 
-with Farchive("my_archive.db") as fa:
+with Farchive("my_archive.farchive") as fa:
     # Store content at a locator
     fa.store("https://example.com/page", page_bytes)
 

@@ -7,7 +7,7 @@ import sys
 
 from farchive._archive import Farchive
 
-_DEFAULT_DB = "farchive.db"
+_DEFAULT_DB = "archive.farchive"
 
 
 def _cmd_stats(args: argparse.Namespace) -> None:
