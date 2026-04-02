@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import unittest.mock
 
 from farchive import Farchive, CompressionPolicy
 
@@ -16,12 +17,12 @@ def _make_xml_blob(i: int, size: int = 500) -> bytes:
         f'<?xml version="1.0"?>\n'
         f'<doc xmlns="http://example.com/ns">\n'
         f'  <section id="s{i}">\n'
-        f'    <title>Section {i}</title>\n'
-        f'    <content>Legal text for section {i}. '
-        f'Regulatory provisions regarding item {i}. '
-        f'{"x" * max(0, size - 300)}</content>\n'
-        f'  </section>\n'
-        f'</doc>\n'
+        f"    <title>Section {i}</title>\n"
+        f"    <content>Legal text for section {i}. "
+        f"Regulatory provisions regarding item {i}. "
+        f"{'x' * max(0, size - 300)}</content>\n"
+        f"  </section>\n"
+        f"</doc>\n"
     ).encode()
 
 
@@ -242,7 +243,8 @@ def test_put_blob_uses_trained_dict(low_threshold_archive):
     digest = fa.put_blob(data, storage_class="xml")
 
     row = fa._conn.execute(
-        "SELECT codec_dict_id FROM blob WHERE digest=?", (digest,),
+        "SELECT codec_dict_id FROM blob WHERE digest=?",
+        (digest,),
     ).fetchone()
     assert row["codec_dict_id"] == dict_id
 
@@ -274,7 +276,8 @@ def test_manual_dict_used_by_non_auto_class(tmp_path):
         digest = fa.store("loc/json/99", data, storage_class="json")
 
         row = fa._conn.execute(
-            "SELECT codec_dict_id FROM blob WHERE digest=?", (digest,),
+            "SELECT codec_dict_id FROM blob WHERE digest=?",
+            (digest,),
         ).fetchone()
         assert row["codec_dict_id"] == dict_id
     finally:
@@ -289,6 +292,7 @@ def test_manual_dict_used_by_non_auto_class(tmp_path):
 def test_repack_without_storage_class_raises(low_threshold_archive):
     """repack() without storage_class or dict_id should raise."""
     import pytest
+
     fa = low_threshold_archive
     with pytest.raises(ValueError, match="requires storage_class"):
         fa.repack()
@@ -342,3 +346,63 @@ def test_repack_batch_size_caps_successful_repacks(tmp_path):
         assert stats3.blobs_repacked == 0
     finally:
         fa.close()
+
+
+# ---------------------------------------------------------------------------
+# Auto-train failure must not roll back semantic write
+# ---------------------------------------------------------------------------
+
+
+def test_autotrain_failure_does_not_rollback_put_blob(low_threshold_archive):
+    """If auto-train fails during put_blob(), the blob must still be persisted.
+
+    Auto-train is best-effort; a training failure must never roll back the
+    semantic write (blob insert).
+    """
+    fa = low_threshold_archive
+
+    # Store 19 blobs (one below threshold)
+    for i in range(19):
+        fa.store(f"loc/xml/{i}", _make_xml_blob(i), storage_class="xml")
+
+    # The next store will hit threshold and trigger auto-train.
+    # Sabotage it so training fails.
+    with unittest.mock.patch(
+        "farchive._archive.train_dict_from_samples",
+        side_effect=RuntimeError("deliberate training failure"),
+    ):
+        # Should NOT raise — auto-train failures are swallowed
+        digest = fa.put_blob(_make_xml_blob(99), storage_class="xml")
+
+    # The blob must still exist and be readable
+    assert fa.read(digest) == _make_xml_blob(99), (
+        "Blob must persist even when auto-train fails"
+    )
+
+    # No dict should have been created (training failed)
+    assert fa._get_latest_dict_id("xml") is None
+
+
+def test_autotrain_failure_does_not_rollback_store(tmp_path):
+    """If auto-train fails during store(), both blob and span must persist."""
+    db = tmp_path / "autotrain_fail_store.farchive"
+    policy = CompressionPolicy(auto_train_thresholds={"xml": 5})
+    with Farchive(db, compression=policy) as fa:
+        # Store 4 blobs (one below threshold)
+        for i in range(4):
+            fa.store(f"loc/xml/{i}", _make_xml_blob(i), storage_class="xml")
+
+        # Next store triggers auto-train — sabotage it
+        with unittest.mock.patch(
+            "farchive._archive.train_dict_from_samples",
+            side_effect=RuntimeError("deliberate training failure"),
+        ):
+            digest = fa.store("loc/xml/new", _make_xml_blob(42), storage_class="xml")
+
+        # Blob must exist
+        assert fa.read(digest) == _make_xml_blob(42)
+
+        # Span must exist
+        span = fa.resolve("loc/xml/new")
+        assert span is not None
+        assert span.digest == digest

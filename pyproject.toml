@@ -54,3 +54,8 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[dependency-groups]
+dev = [
+    "hypothesis>=6.151.10",
+]

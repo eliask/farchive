@@ -13,15 +13,15 @@
 - **On-disk schema freeze.** Schema version 1 is final for the 1.x line.
 - **Event model.** Archive-property events: once any session creates the event table, all subsequent sessions append events automatically.
 - **Repack semantics.** Repack targets vanilla-zstd blobs without a dict. Re-dicting older-dict blobs is post-1.0.
-- **Atomicity tests.** Rollback behavior verified for store(), store_batch(), observe(), train_dict(), repack().
+- **Atomicity tests.** Rollback behavior verified for store(), store_batch(), observe(), train_dict(), repack(). Auto-train failure does not roll back semantic writes.
 
 ## Nice before 1.0
 
-- [ ] **Property-based tests.** Hypothesis tests for span invariants (arbitrary observation sequences always produce valid span history).
-- [ ] **Windows smoke coverage.** Import + roundtrip smoke on Windows (single-process, no-lock fallback).
-- [ ] **CLI completeness.** `farchive events` command. `farchive inspect <digest>` for blob metadata.
+- [x] **Property-based tests.** Hypothesis tests for span invariants (arbitrary observation sequences always produce valid span history).
+- [x] **Windows smoke coverage.** Import + roundtrip smoke on Windows (single-process, no-lock fallback).
+- [x] **CLI completeness.** `farchive events` command. `farchive inspect <digest>` for blob metadata.
+- [x] **Frozen fixture DBs.** Pre-built `.farchive` files for forward-compatibility regression testing.
 - [ ] **Richer event kinds.** Emit `fa.store`, `fa.train_dict`, `fa.repack` in addition to `fa.observe`.
-- [ ] **Frozen fixture DBs.** Pre-built `.farchive` files for forward-compatibility regression testing.
 
 ## Explicitly post-1.0
 

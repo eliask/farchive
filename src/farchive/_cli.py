@@ -41,8 +41,7 @@ def _cmd_history(args: argparse.Namespace) -> None:
         return
     print(f"History for: {args.locator} ({len(spans)} spans)")
     print(
-        f"{'span_id':>8}  {'digest[:12]':<14} {'from':<16} "
-        f"{'until':<16} {'count':>6}"
+        f"{'span_id':>8}  {'digest[:12]':<14} {'from':<16} {'until':<16} {'count':>6}"
     )
     print("-" * 74)
     for s in spans:
@@ -91,6 +90,59 @@ def _cmd_repack(args: argparse.Namespace) -> None:
     print(f"Repacked: {stats.blobs_repacked:,}, saved: {stats.bytes_saved:,} bytes")
 
 
+def _cmd_events(args: argparse.Namespace) -> None:
+    with Farchive(args.db) as fa:
+        events = fa.events(
+            locator=args.locator or None,
+            since=args.since or None,
+            limit=args.limit,
+        )
+    if not events:
+        print("No events found.")
+        return
+    print(
+        f"{'event_id':>8}  {'occurred_at':<16} {'locator':<30} {'digest[:12]':<14} {'kind':<12}"
+    )
+    print("-" * 88)
+    for e in events:
+        digest = e.digest[:12] if e.digest else ""
+        print(
+            f"{e.event_id:>8}  {e.occurred_at:<16} {e.locator:<30} {digest:<14} {e.kind:<12}"
+        )
+    print(f"\n{len(events)} events", file=sys.stderr)
+
+
+def _cmd_inspect(args: argparse.Namespace) -> None:
+    with Farchive(args.db) as fa:
+        row = fa._conn.execute(
+            "SELECT digest, raw_size, stored_size, codec, codec_dict_id, "
+            "storage_class, created_at FROM blob WHERE digest=?",
+            (args.digest,),
+        ).fetchone()
+        if row is None:
+            print(f"Digest not found: {args.digest}")
+            sys.exit(1)
+        print(f"Digest:         {row['digest']}")
+        print(f"Raw size:       {row['raw_size']:,} bytes")
+        print(f"Stored size:    {row['stored_size']:,} bytes")
+        print(f"Codec:          {row['codec']}")
+        print(f"Dict ID:        {row['codec_dict_id'] or 'none'}")
+        print(f"Storage class:  {row['storage_class'] or 'none'}")
+        print(f"Created at:     {row['created_at']}")
+        ratio = row["raw_size"] / row["stored_size"] if row["stored_size"] else 0
+        print(f"Compression:    {ratio:.1f}x")
+
+        # Show which locators reference this digest
+        locs = fa._conn.execute(
+            "SELECT DISTINCT locator FROM locator_span WHERE digest=?",
+            (args.digest,),
+        ).fetchall()
+    if locs:
+        print(f"\nReferenced by {len(locs)} locator(s):")
+        for loc in locs:
+            print(f"  {loc[0]}")
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         prog="farchive",
@@ -124,6 +176,20 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--storage-class", default=None, help="Storage class filter")
     p.add_argument("--batch-size", type=int, default=1000, help="Batch size")
 
+    # events
+    p = sub.add_parser("events", help="Query event log")
+    p.add_argument("db", nargs="?", default=_DEFAULT_DB, help="DB path")
+    p.add_argument("--locator", default=None, help="Filter by locator")
+    p.add_argument(
+        "--since", type=int, default=None, help="Filter: occurred_at >= since"
+    )
+    p.add_argument("--limit", type=int, default=1000, help="Max events")
+
+    # inspect
+    p = sub.add_parser("inspect", help="Show blob metadata by digest")
+    p.add_argument("digest", help="SHA-256 digest")
+    p.add_argument("db", nargs="?", default=_DEFAULT_DB, help="DB path")
+
     args = parser.parse_args(argv)
     if args.command is None:
         parser.print_help()
@@ -135,6 +201,8 @@ def main(argv: list[str] | None = None) -> None:
         "locators": _cmd_locators,
         "train-dict": _cmd_train_dict,
         "repack": _cmd_repack,
+        "events": _cmd_events,
+        "inspect": _cmd_inspect,
     }
     cmds[args.command](args)
 

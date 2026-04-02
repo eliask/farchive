@@ -2,7 +2,7 @@
 
 farchive (far archive) — a local, history-preserving archive for opaque bytes observed at named locators.
 
-Farchive stores raw bytes once by SHA-256 digest, preserves each locator's observation history as contiguous spans, and compresses them with corpus-trained zstd dictionaries. One SQLite file, queryable with SQL — efficient corpus packing without sacrificing query performance.
+Farchive stores raw bytes once by SHA-256 digest, preserves each locator's observation history as contiguous spans, and optimizes physical storage with zstd and corpus-trained dictionaries when available. One SQLite file, queryable with SQL — efficient corpus packing while keeping the archive directly queryable.
 
 ## Why
 

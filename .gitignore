@@ -7,3 +7,4 @@ build/
 *.farchive
 *.farchive.writer.lock
 .pytest_cache/
+.hypothesis

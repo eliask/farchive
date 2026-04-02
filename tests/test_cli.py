@@ -145,3 +145,79 @@ def test_no_args_prints_help_and_exits_nonzero(tmp_path):
     assert result.returncode != 0
     # argparse prints help to stdout when no subcommand given
     assert "usage" in result.stdout.lower() or "usage" in result.stderr.lower()
+
+
+# ---------------------------------------------------------------------------
+# events
+# ---------------------------------------------------------------------------
+
+
+def _populated_db_with_events(tmp_path):
+    """Create a DB with events enabled and some observations."""
+    db = tmp_path / "cli_events_test.db"
+    with Farchive(db, enable_events=True) as fa:
+        fa.store("loc/a", b"content A v1", storage_class="xml")
+        fa.store("loc/b", b"content B", storage_class="xml")
+        fa.store("loc/a", b"content A v2", storage_class="xml")
+    return db
+
+
+def test_events_shows_event_table(tmp_path):
+    db = _populated_db_with_events(tmp_path)
+    result = _run(["events", str(db)])
+
+    assert result.returncode == 0, f"stderr: {result.stderr}"
+    assert "event_id" in result.stdout
+    assert "occurred_at" in result.stdout
+    assert "3 events" in result.stderr
+
+
+def test_events_locator_filter(tmp_path):
+    db = _populated_db_with_events(tmp_path)
+    result = _run(["events", str(db), "--locator", "loc/a"])
+
+    assert result.returncode == 0
+    assert "loc/a" in result.stdout
+    # loc/b events should not appear
+    assert "loc/b" not in result.stdout
+
+
+def test_events_empty_when_no_event_table(tmp_path):
+    db = _populated_db(tmp_path)
+    result = _run(["events", str(db)])
+
+    assert result.returncode == 0
+    assert "No events" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# inspect
+# ---------------------------------------------------------------------------
+
+
+def test_inspect_shows_blob_metadata(tmp_path):
+    db = _populated_db(tmp_path)
+    # Get a digest to inspect
+    with Farchive(db) as fa:
+        span = fa.resolve("loc/a")
+        assert span is not None
+        digest = span.digest
+
+    result = _run(["inspect", digest, str(db)])
+
+    assert result.returncode == 0, f"stderr: {result.stderr}"
+    assert "Digest:" in result.stdout
+    assert "Raw size:" in result.stdout
+    assert "Stored size:" in result.stdout
+    assert "Codec:" in result.stdout
+    assert "Compression:" in result.stdout
+    assert "Referenced by" in result.stdout
+    assert "loc/a" in result.stdout
+
+
+def test_inspect_unknown_digest_exits_nonzero(tmp_path):
+    db = _populated_db(tmp_path)
+    result = _run(["inspect", "0" * 64, str(db)])
+
+    assert result.returncode != 0
+    assert "not found" in result.stdout.lower()
