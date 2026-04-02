@@ -367,12 +367,16 @@ def test_autotrain_failure_does_not_rollback_put_blob(low_threshold_archive):
 
     # The next store will hit threshold and trigger auto-train.
     # Sabotage it so training fails.
+    import warnings
+
     with unittest.mock.patch(
         "farchive._archive.train_dict_from_samples",
         side_effect=RuntimeError("deliberate training failure"),
     ):
         # Should NOT raise — auto-train failures are swallowed
-        digest = fa.put_blob(_make_xml_blob(99), storage_class="xml")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            digest = fa.put_blob(_make_xml_blob(99), storage_class="xml")
 
     # The blob must still exist and be readable
     assert fa.read(digest) == _make_xml_blob(99), (
@@ -385,6 +389,8 @@ def test_autotrain_failure_does_not_rollback_put_blob(low_threshold_archive):
 
 def test_autotrain_failure_does_not_rollback_store(tmp_path):
     """If auto-train fails during store(), both blob and span must persist."""
+    import warnings
+
     db = tmp_path / "autotrain_fail_store.farchive"
     policy = CompressionPolicy(auto_train_thresholds={"xml": 5})
     with Farchive(db, compression=policy) as fa:
@@ -397,7 +403,11 @@ def test_autotrain_failure_does_not_rollback_store(tmp_path):
             "farchive._archive.train_dict_from_samples",
             side_effect=RuntimeError("deliberate training failure"),
         ):
-            digest = fa.store("loc/xml/new", _make_xml_blob(42), storage_class="xml")
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                digest = fa.store(
+                    "loc/xml/new", _make_xml_blob(42), storage_class="xml"
+                )
 
         # Blob must exist
         assert fa.read(digest) == _make_xml_blob(42)
