@@ -1,6 +1,6 @@
 [project]
 name = "farchive"
-version = "0.3.0"
+version = "1.0.0"
 description = "Local content-addressed archive with locator-scoped history for opaque bytes."
 requires-python = ">=3.11"
 dependencies = ["zstandard>=0.21"]
@@ -36,8 +36,8 @@ Repository = "https://github.com/eliask/farchive"
 Issues = "https://github.com/eliask/farchive/issues"
 
 [project.optional-dependencies]
-test = ["pytest>=8.0"]
-dev = ["pytest>=8.0", "ruff>=0.4", "ty>=0.0.1a1"]
+test = ["pytest>=8.0", "hypothesis>=6.151"]
+dev = ["pytest>=8.0", "hypothesis>=6.151", "ruff>=0.4", "ty>=0.0.1a1"]
 
 [project.scripts]
 farchive = "farchive._cli:main"
@@ -54,8 +54,3 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-
-[dependency-groups]
-dev = [
-    "hypothesis>=6.151.10",
-]

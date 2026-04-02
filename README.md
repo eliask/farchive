@@ -70,7 +70,7 @@ with Farchive("my_archive.farchive") as fa:
 - **Blob**: Immutable raw bytes identified by SHA-256 digest. Stored once, deduped by content.
 - **Locator**: Opaque string naming where content was observed (URL, path, any string).
 - **State span**: A contiguous run where one locator resolved to one blob. If the same content returns after an interruption, that's a new span — history is preserved.
-- **Event** (optional): Append-only audit log of individual observations.
+- **Event** (optional): Append-only audit log of archive operations, including observations and maintenance.
 
 ## API
 

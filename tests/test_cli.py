@@ -169,7 +169,8 @@ def test_events_shows_event_table(tmp_path):
     assert result.returncode == 0, f"stderr: {result.stderr}"
     assert "event_id" in result.stdout
     assert "occurred_at" in result.stdout
-    assert "3 events" in result.stderr
+    # 3 stores -> 3 fa.observe + 3 fa.store = 6 events
+    assert "6 events" in result.stderr
 
 
 def test_events_locator_filter(tmp_path):
@@ -180,6 +181,8 @@ def test_events_locator_filter(tmp_path):
     assert "loc/a" in result.stdout
     # loc/b events should not appear
     assert "loc/b" not in result.stdout
+    # 2 stores at loc/a -> 2 fa.observe + 2 fa.store = 4 events
+    assert "4 events" in result.stderr
 
 
 def test_events_empty_when_no_event_table(tmp_path):

@@ -23,7 +23,7 @@ FIXTURES = Path(__file__).parent / "fixtures"
 #   - 3 locators with html storage, 1 xml, 1 binary (raw)
 #   - https://example.com/page1 has 2 spans (content changed)
 #   - https://example.com/alias has same content as page1's latest (dedup)
-#   - Events enabled (5 observations total)
+#   - Events enabled (6 stores -> 12 events: 6 fa.observe + 6 fa.store)
 # ---------------------------------------------------------------------------
 
 
@@ -92,7 +92,8 @@ def test_fixture_roundtrip_all_locators(smoke_archive):
 def test_fixture_events_exist(smoke_archive):
     """Fixture was created with events enabled -> events table must exist."""
     events = smoke_archive.events()
-    assert len(events) == 6, f"Expected 6 events, got {len(events)}"
+    # 6 stores -> 6 fa.observe + 6 fa.store = 12 events
+    assert len(events) == 12, f"Expected 12 events, got {len(events)}"
 
 
 def test_fixture_raw_blob(smoke_archive):

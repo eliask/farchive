@@ -18,10 +18,10 @@
 ## Nice before 1.0
 
 - [x] **Property-based tests.** Hypothesis tests for span invariants (arbitrary observation sequences always produce valid span history).
-- [x] **Windows smoke coverage.** Import + roundtrip smoke on Windows (single-process, no-lock fallback).
+- [x] **No-lock fallback coverage.** Tests verify correct behavior when fcntl is unavailable (Windows single-process path).
 - [x] **CLI completeness.** `farchive events` command. `farchive inspect <digest>` for blob metadata.
 - [x] **Frozen fixture DBs.** Pre-built `.farchive` files for forward-compatibility regression testing.
-- [ ] **Richer event kinds.** Emit `fa.store`, `fa.train_dict`, `fa.repack` in addition to `fa.observe`.
+- [x] **Richer event kinds.** Emit `fa.store`, `fa.store_batch`, `fa.train_dict`, `fa.repack` in addition to `fa.observe`.
 
 ## Explicitly post-1.0
 

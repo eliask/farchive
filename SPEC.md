@@ -1,6 +1,6 @@
 # Farchive Spec v1 and SQLite/Zstd Profile
 
-Status: conformant with v0.3.0 implementation, living spec.
+Status: conformant with v1.0.0 implementation, living spec.
 
 ---
 
@@ -162,15 +162,25 @@ This yields three spans:
 
 ### 4.5 Event
 
-An event is an append-only audit record of an observation write.
+An event is an append-only audit record of an archive operation, including observations and selected maintenance operations.
 
 Event logging is an **archive property**, not a session property. Once any session creates the event table (via `enable_events=True`), all subsequent sessions append events automatically, even if opened without `enable_events`. The `events()` read API works whenever the event table exists.
 
-Currently the implementation emits events of kind `fa.observe` (one per `observe()` / `store()` call). Future versions may emit additional kinds such as `fa.train_dict` or `fa.repack`.
+The implementation emits these event kinds:
+
+| Kind | Emitted by | Notes |
+|------|-----------|-------|
+| `fa.observe` | `observe()` | One per observation write |
+| `fa.store` | `store()` | One per combined put+observe; `fa.observe` is also emitted |
+| `fa.store_batch` | `store_batch()` | One summary event per batch call |
+| `fa.train_dict` | `train_dict()` | One per successful dictionary training |
+| `fa.repack` | `repack()` | One per repack call that repacks at least one blob |
+
+Event metadata payloads (the `metadata` field on `Event`) are informative and not part of the frozen 1.x contract. The event kind strings and their emission conditions are frozen; the shape and keys of metadata may change in future 1.x releases.
 
 State spans answer: what was the archive's best-known state for this locator?
 
-Events answer: what observation writes occurred?
+Events answer: what archive operations occurred?
 
 ### 4.6 Storage Class
 
@@ -345,7 +355,7 @@ Store blob if absent. Return digest. Idempotent.
 | `data` | `bytes` | required | Raw bytes to store |
 | `storage_class` | `str \| None` | `None` | Compression hint; uses trained dict if available |
 
-Returns: SHA-256 hex digest (64 chars). Bounded: O(data size).
+Returns: SHA-256 hex digest (64 chars). Semantic write cost is O(data size); may additionally trigger policy-driven auto-training on threshold crossing.
 
 #### `observe(locator, digest, *, observed_at, metadata) -> StateSpan`
 
@@ -764,7 +774,7 @@ A 1.x writer MUST NOT write a schema version higher than the one it declares. Sc
 
 ### 16.5 Platform
 
-POSIX file locking (fcntl) provides multi-process writer serialization. On platforms without fcntl (Windows), the archive falls back to no file locking — safe for single-process use only. Cross-platform multi-process locking is a post-1.0 goal.
+POSIX file locking (fcntl) provides multi-process writer serialization. On platforms without fcntl (Windows), the archive falls back to no file locking — safe only when the caller ensures a single writer at a time. Cross-platform multi-process locking is a post-1.0 goal.
 
 ---
 

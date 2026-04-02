@@ -27,6 +27,7 @@ import zstandard as zstd
 
 try:
     import fcntl
+
     _HAS_FCNTL = True
 except ImportError:
     _HAS_FCNTL = False
@@ -117,9 +118,12 @@ class Farchive:
         # Event logging is an archive property: once the event table exists
         # (created by any session with enable_events=True), ALL subsequent
         # sessions append events automatically.
-        self._events_enabled = self._conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='event'"
-        ).fetchone() is not None
+        self._events_enabled = (
+            self._conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='event'"
+            ).fetchone()
+            is not None
+        )
 
         # Dict cache: dict_id -> ZstdCompressionDict
         self._dict_cache: dict[int, Any] = {}
@@ -167,7 +171,8 @@ class Farchive:
         if dict_id in self._dict_cache:
             return self._dict_cache[dict_id]
         row = self._conn.execute(
-            "SELECT dict_bytes FROM dict WHERE dict_id=?", (dict_id,),
+            "SELECT dict_bytes FROM dict WHERE dict_id=?",
+            (dict_id,),
         ).fetchone()
         if row is None:
             raise ValueError(f"dict_id {dict_id} not found")
@@ -251,6 +256,7 @@ class Farchive:
             self._check_auto_train(storage_class)
         except Exception as e:
             import warnings
+
             warnings.warn(
                 f"[farchive] Auto-training failed for '{storage_class}': {e}",
                 stacklevel=3,
@@ -285,7 +291,8 @@ class Farchive:
     ) -> None:
         """Store blob with best available compression. Idempotent by digest."""
         existing = self._conn.execute(
-            "SELECT 1 FROM blob WHERE digest=?", (digest,),
+            "SELECT 1 FROM blob WHERE digest=?",
+            (digest,),
         ).fetchone()
         if existing:
             return  # dedup
@@ -302,8 +309,16 @@ class Farchive:
             "INSERT INTO blob (digest, payload, raw_size, stored_size, "
             "codec, codec_dict_id, storage_class, created_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (digest, payload, len(raw), len(payload), codec,
-             used_dict_id, storage_class, _now_ms()),
+            (
+                digest,
+                payload,
+                len(raw),
+                len(payload),
+                codec,
+                used_dict_id,
+                storage_class,
+                _now_ms(),
+            ),
         )
 
     # ------------------------------------------------------------------
@@ -329,9 +344,12 @@ class Farchive:
         """
         # Verify blob exists (clean error instead of SQLite FK violation)
         if not self._conn.execute(
-            "SELECT 1 FROM blob WHERE digest=?", (digest,),
+            "SELECT 1 FROM blob WHERE digest=?",
+            (digest,),
         ).fetchone():
-            raise ValueError(f"Digest {digest[:16]}.. not found — call put_blob() first")
+            raise ValueError(
+                f"Digest {digest[:16]}.. not found — call put_blob() first"
+            )
 
         if metadata is not None:
             if not isinstance(metadata, dict):
@@ -423,9 +441,38 @@ class Farchive:
 
         # Fetch the final span state
         row = self._conn.execute(
-            "SELECT * FROM locator_span WHERE span_id=?", (span_id,),
+            "SELECT * FROM locator_span WHERE span_id=?",
+            (span_id,),
         ).fetchone()
         return _row_to_span(row)
+
+    def _emit_event(
+        self,
+        *,
+        kind: str,
+        locator: str = "",
+        digest: str | None = None,
+        metadata_json: str | None = None,
+        occurred_at: int | None = None,
+    ) -> None:
+        """Append an event record. No-op if event table does not exist."""
+        if not self._events_enabled:
+            has_table = self._conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='event'"
+            ).fetchone()
+            if not has_table:
+                return
+        self._conn.execute(
+            "INSERT INTO event (occurred_at, locator, digest, kind, metadata_json) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                _now_ms() if occurred_at is None else occurred_at,
+                locator,
+                digest,
+                kind,
+                metadata_json,
+            ),
+        )
 
     # ------------------------------------------------------------------
     # Public API — write
@@ -438,12 +485,10 @@ class Farchive:
         Participates in auto-training if the storage_class is eligible.
         """
         digest = _sha256(data)
-        # Resolve dict for this storage class (any class with a trained dict, not just auto-eligible)
-        dict_id = self._get_latest_dict_id(storage_class) if storage_class else None
         with self._write_lock():
+            dict_id = self._get_latest_dict_id(storage_class) if storage_class else None
             with self._conn:
                 self._store_blob(digest, data, storage_class, dict_id=dict_id)
-            # Auto-train under write lock to prevent duplicate training (non-fatal)
             if dict_id is None:
                 self._try_auto_train(storage_class)
         return digest
@@ -471,7 +516,9 @@ class Farchive:
         with self._write_lock():
             with self._conn:
                 return self._observe_impl(
-                    locator, digest, now,
+                    locator,
+                    digest,
+                    now,
                     metadata=metadata,
                     _caller_provided_time=caller_ts,
                 )
@@ -493,7 +540,10 @@ class Farchive:
         digest = _sha256(data)
         with self._write_lock():
             return self._store_impl(
-                locator, data, digest, now,
+                locator,
+                data,
+                digest,
+                now,
                 storage_class=storage_class,
                 metadata=metadata,
                 _caller_provided_time=caller_ts,
@@ -516,9 +566,14 @@ class Farchive:
         with self._conn:
             self._store_blob(digest, data, storage_class, dict_id=dict_id)
             self._observe_impl(
-                locator, digest, now,
+                locator,
+                digest,
+                now,
                 metadata=metadata,
                 _caller_provided_time=_caller_provided_time,
+            )
+            self._emit_event(
+                kind="fa.store", locator=locator, digest=digest, occurred_at=now
             )
 
         # Auto-train if eligible and no dict yet (non-fatal)
@@ -571,12 +626,15 @@ class Farchive:
 
                 # Check dedup
                 existing = self._conn.execute(
-                    "SELECT 1 FROM blob WHERE digest=?", (digest,),
+                    "SELECT 1 FROM blob WHERE digest=?",
+                    (digest,),
                 ).fetchone()
                 if existing:
                     stats.items_deduped += 1
                     self._observe_impl(
-                        locator, digest, now,
+                        locator,
+                        digest,
+                        now,
                         _caller_provided_time=caller_ts,
                     )
                     continue
@@ -591,11 +649,21 @@ class Farchive:
                     "INSERT INTO blob (digest, payload, raw_size, stored_size, "
                     "codec, codec_dict_id, storage_class, created_at) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    (digest, payload, len(data), len(payload), codec,
-                     used_dict, storage_class, now),
+                    (
+                        digest,
+                        payload,
+                        len(data),
+                        len(payload),
+                        codec,
+                        used_dict,
+                        storage_class,
+                        now,
+                    ),
                 )
                 self._observe_impl(
-                    locator, digest, now,
+                    locator,
+                    digest,
+                    now,
                     _caller_provided_time=caller_ts,
                 )
                 stats.items_stored += 1
@@ -604,6 +672,19 @@ class Farchive:
 
                 if progress and (i + 1) % 1000 == 0:
                     progress(i + 1, len(items))
+
+            self._emit_event(
+                kind="fa.store_batch",
+                metadata_json=json.dumps(
+                    {
+                        "items_scanned": stats.items_scanned,
+                        "items_stored": stats.items_stored,
+                        "items_deduped": stats.items_deduped,
+                        "storage_class": storage_class,
+                    }
+                ),
+                occurred_at=batch_ts if caller_ts else None,
+            )
 
         # Auto-train check after batch (non-fatal)
         if dict_id is None:
@@ -789,6 +870,18 @@ class Farchive:
                 dict_id = cursor.lastrowid
                 assert dict_id is not None
 
+                self._emit_event(
+                    kind="fa.train_dict",
+                    metadata_json=json.dumps(
+                        {
+                            "storage_class": storage_class,
+                            "dict_id": dict_id,
+                            "sample_count": len(samples),
+                        }
+                    ),
+                    occurred_at=now,
+                )
+
         self._dict_cache[dict_id] = dict_data
         if storage_class:
             self._has_dict_for_class[storage_class] = True
@@ -827,7 +920,8 @@ class Farchive:
 
         # Resolve dict's storage class — ensure agreement or derive
         dict_row = self._conn.execute(
-            "SELECT storage_class FROM dict WHERE dict_id=?", (dict_id,),
+            "SELECT storage_class FROM dict WHERE dict_id=?",
+            (dict_id,),
         ).fetchone()
         if dict_row is None:
             raise ValueError(f"dict_id {dict_id} not found")
@@ -843,14 +937,32 @@ class Farchive:
         d = self._load_dict(dict_id)
         with self._write_lock():
             with self._conn:
-                return repack_blobs(
-                    self._conn, dict_id, d, self._policy,
-                    storage_class=storage_class, batch_size=batch_size,
+                stats = repack_blobs(
+                    self._conn,
+                    dict_id,
+                    d,
+                    self._policy,
+                    storage_class=storage_class,
+                    batch_size=batch_size,
                 )
+                if stats.blobs_repacked > 0:
+                    self._emit_event(
+                        kind="fa.repack",
+                        metadata_json=json.dumps(
+                            {
+                                "storage_class": storage_class,
+                                "dict_id": dict_id,
+                                "blobs_repacked": stats.blobs_repacked,
+                                "bytes_saved": stats.bytes_saved,
+                            }
+                        ),
+                    )
+        return stats
 
     def stats(self) -> ArchiveStats:
         """Non-semantic reporting snapshot."""
         from farchive._schema import detect_schema_version
+
         db_version = detect_schema_version(self._conn)
         loc_count = self._conn.execute(
             "SELECT COUNT(DISTINCT locator) FROM locator_span",

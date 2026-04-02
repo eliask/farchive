@@ -21,21 +21,20 @@ dependencies = [
 
 [package.optional-dependencies]
 dev = [
+    { name = "hypothesis" },
     { name = "pytest" },
     { name = "ruff" },
     { name = "ty" },
 ]
 test = [
-    { name = "pytest" },
-]
-
-[package.dev-dependencies]
-dev = [
     { name = "hypothesis" },
+    { name = "pytest" },
 ]
 
 [package.metadata]
 requires-dist = [
+    { name = "hypothesis", marker = "extra == 'dev'", specifier = ">=6.151" },
+    { name = "hypothesis", marker = "extra == 'test'", specifier = ">=6.151" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "pytest", marker = "extra == 'test'", specifier = ">=8.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.4" },
@@ -43,9 +42,6 @@ requires-dist = [
     { name = "zstandard", specifier = ">=0.21" },
 ]
 provides-extras = ["test", "dev"]
-
-[package.metadata.requires-dev]
-dev = [{ name = "hypothesis", specifier = ">=6.151.10" }]
 
 [[package]]
 name = "hypothesis"
