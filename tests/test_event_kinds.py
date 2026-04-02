@@ -170,3 +170,51 @@ def test_events_ordered_newest_first(tmp_path):
     assert events[1].locator == "loc/b"
     assert events[2].locator == "loc/a"
     assert events[3].locator == "loc/a"
+
+
+def test_store_event_timestamp_aligns_with_observe_and_span(tmp_path):
+    """fa.store and fa.observe for the same store() call must have the same occurred_at,
+    and it must match the span's last_confirmed_at (effective post-normalization time)."""
+    import unittest.mock
+
+    db = tmp_path / "events.db"
+    with Farchive(db, enable_events=True) as fa:
+        # Force same-millisecond collision to guarantee auto-bump path
+        call_count = 0
+
+        def fake_now():
+            nonlocal call_count
+            call_count += 1
+            return 1_000_000  # same timestamp for every call
+
+        with unittest.mock.patch("farchive._archive._now_ms", fake_now):
+            fa.store("loc/x", b"v1", storage_class="xml")
+            fa.store("loc/x", b"v2", storage_class="xml")
+
+        events = fa.events()
+        # 2 stores * 2 events = 4 total
+        assert len(events) == 4
+
+        # Find the second store's events (newest first, so first two)
+        store_events = [e for e in events if e.kind == "fa.store"]
+        observe_events = [e for e in events if e.kind == "fa.observe"]
+
+        # Both should have 2 events
+        assert len(store_events) == 2
+        assert len(observe_events) == 2
+
+        # For the second store (newest), timestamps must match
+        newest_store = store_events[0]
+        newest_observe = observe_events[0]
+        assert newest_store.occurred_at == newest_observe.occurred_at, (
+            f"fa.store occurred_at={newest_store.occurred_at} != "
+            f"fa.observe occurred_at={newest_observe.occurred_at}"
+        )
+
+        # Must also match the span's last_confirmed_at
+        span = fa.resolve("loc/x")
+        assert span is not None
+        assert newest_store.occurred_at == span.last_confirmed_at, (
+            f"fa.store occurred_at={newest_store.occurred_at} != "
+            f"span.last_confirmed_at={span.last_confirmed_at}"
+        )

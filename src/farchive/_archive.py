@@ -565,7 +565,7 @@ class Farchive:
 
         with self._conn:
             self._store_blob(digest, data, storage_class, dict_id=dict_id)
-            self._observe_impl(
+            span = self._observe_impl(
                 locator,
                 digest,
                 now,
@@ -573,7 +573,10 @@ class Farchive:
                 _caller_provided_time=_caller_provided_time,
             )
             self._emit_event(
-                kind="fa.store", locator=locator, digest=digest, occurred_at=now
+                kind="fa.store",
+                locator=locator,
+                digest=digest,
+                occurred_at=span.last_confirmed_at,
             )
 
         # Auto-train if eligible and no dict yet (non-fatal)

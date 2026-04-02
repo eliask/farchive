@@ -176,6 +176,8 @@ The implementation emits these event kinds:
 | `fa.train_dict` | `train_dict()` | One per successful dictionary training |
 | `fa.repack` | `repack()` | One per repack call that repacks at least one blob |
 
+For locator-scoped events (`fa.observe`, `fa.store`), `locator` is the affected locator and `digest` is the blob digest. For archive-wide maintenance events (`fa.store_batch`, `fa.train_dict`, `fa.repack`), `locator` is the empty string and `digest` is `None` unless relevant to the operation.
+
 Event metadata payloads (the `metadata` field on `Event`) are informative and not part of the frozen 1.x contract. The event kind strings and their emission conditions are frozen; the shape and keys of metadata may change in future 1.x releases.
 
 State spans answer: what was the archive's best-known state for this locator?

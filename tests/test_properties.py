@@ -276,10 +276,13 @@ def test_event_count_matches_successful_observations(observations):
                     pass
 
             events = fa.events()
-            assert len(events) == success_count, (
-                f"Expected {success_count} events, got {len(events)}"
+            # Each successful store() emits both fa.observe and fa.store
+            observe_events = [e for e in events if e.kind == "fa.observe"]
+            store_events = [e for e in events if e.kind == "fa.store"]
+            assert len(observe_events) == success_count, (
+                f"Expected {success_count} fa.observe events, got {len(observe_events)}"
             )
-
-            # All events are fa.observe kind
-            for event in events:
-                assert event.kind == "fa.observe"
+            assert len(store_events) == success_count, (
+                f"Expected {success_count} fa.store events, got {len(store_events)}"
+            )
+            assert len(events) == success_count * 2
