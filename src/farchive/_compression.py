@@ -1,7 +1,7 @@
 """Farchive zstd compression engine.
 
-Handles vanilla zstd and dictionary-based zstd.
-codec is always 'raw' or 'zstd' — dict info is in a separate column.
+Handles vanilla zstd, dictionary-based zstd, and prefix-delta zstd.
+Codec values: 'raw', 'zstd', 'zstd_dict', 'zstd_delta'.
 """
 
 from __future__ import annotations
@@ -63,7 +63,10 @@ def compress_blob(
 ) -> tuple[bytes, str, int | None]:
     """Compress raw bytes. Returns (payload, codec, codec_dict_id).
 
-    codec is always 'raw' or 'zstd'. Dict info is orthogonal.
+    codec values:
+      'raw'       — stored as-is (below raw_threshold)
+      'zstd'      — vanilla zstd compression
+      'zstd_dict' — zstd compression with trained dictionary
     """
     if len(raw) < policy.raw_threshold:
         return raw, "raw", None
@@ -75,7 +78,7 @@ def compress_blob(
                 level=policy.compression_level,
                 dict_data=dict_data,
             ).compress(raw)
-            return compressed, "zstd", dict_id
+            return compressed, "zstd_dict", dict_id
         except Exception:
             pass
 
@@ -90,23 +93,65 @@ def decompress_blob(
     *,
     codec_dict_id: int | None = None,
     load_dict: Callable[[int], Any] | None = None,
+    base_digest: str | None = None,
+    load_base_raw: Callable[[str], bytes | None] | None = None,
 ) -> bytes:
-    """Decompress a stored blob payload back to raw bytes."""
+    """Decompress a stored blob payload back to raw bytes.
+
+    Supported codecs: 'raw', 'zstd', 'zstd_dict', 'zstd_delta'.
+    """
     if codec == "raw":
         return payload
 
-    if codec != "zstd":
-        raise ValueError(f"Unknown codec: {codec}")
+    if codec == "zstd":
+        return _get_vanilla_decompressor().decompress(payload)
 
-    # Dict decompression
-    if codec_dict_id is not None:
+    if codec == "zstd_dict":
+        if codec_dict_id is None:
+            raise ValueError("zstd_dict requires codec_dict_id")
         if load_dict is None:
-            raise ValueError("load_dict required for dict decompression")
+            raise ValueError("load_dict required for zstd_dict decompression")
         d = load_dict(codec_dict_id)
         return _make_decompressor(dict_data=d).decompress(payload)
 
-    # Vanilla zstd
-    return _get_vanilla_decompressor().decompress(payload)
+    if codec == "zstd_delta":
+        raise ValueError(
+            "zstd_delta decompression requires decompress_delta() with base_raw bytes. "
+            "Use _archive._read_raw() which handles delta resolution."
+        )
+
+    raise ValueError(f"Unknown codec: {codec}")
+
+
+# ---------------------------------------------------------------------------
+# Delta compress / decompress (zstd prefix mode)
+# ---------------------------------------------------------------------------
+
+
+def compress_delta(
+    raw: bytes,
+    base_raw: bytes,
+    level: int = 3,
+) -> bytes:
+    """Compress raw bytes using base_raw as zstd prefix dictionary.
+
+    Uses zstd's prefix mode: ZstdCompressionDict(base_raw) creates a
+    prefix-mode dictionary that allows the compressor to reference the
+    base blob's content. Ideal for near-identical revisions.
+    """
+    prefix_dict = zstd.ZstdCompressionDict(base_raw)
+    cctx = zstd.ZstdCompressor(dict_data=prefix_dict, level=level)
+    return cctx.compress(raw)
+
+
+def decompress_delta(
+    payload: bytes,
+    base_raw: bytes,
+) -> bytes:
+    """Decompress a zstd_delta payload using the base blob's raw bytes."""
+    prefix_dict = zstd.ZstdCompressionDict(base_raw)
+    dctx = zstd.ZstdDecompressor(dict_data=prefix_dict)
+    return dctx.decompress(payload)
 
 
 # ---------------------------------------------------------------------------
@@ -177,7 +222,7 @@ def repack_blobs(
 
     if updates:
         conn.executemany(
-            "UPDATE blob SET payload=?, codec_dict_id=?, stored_size=? WHERE digest=?",
+            "UPDATE blob SET payload=?, codec='zstd_dict', codec_dict_id=?, stored_size=? WHERE digest=?",
             updates,
         )
 

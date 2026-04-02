@@ -37,8 +37,8 @@ def smoke_archive():
 
 
 def test_fixture_schema_version(smoke_archive):
-    """Fixture must be schema v1."""
-    assert smoke_archive.stats().schema_version == 1
+    """Fixture was v1, migrated to v2 on open."""
+    assert smoke_archive.stats().schema_version == 2
 
 
 def test_fixture_locator_count(smoke_archive):

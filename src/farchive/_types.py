@@ -32,9 +32,21 @@ class CompressionPolicy:
         default_factory=lambda: {"xml": 1000, "html": 500, "pdf": 16},
     )
     dict_target_sizes: dict[str, int] = field(
-        default_factory=lambda: {"xml": 112 * 1024, "html": 112 * 1024, "pdf": 64 * 1024},
+        default_factory=lambda: {
+            "xml": 112 * 1024,
+            "html": 112 * 1024,
+            "pdf": 64 * 1024,
+        },
     )
     compression_level: int = 3
+
+    delta_enabled: bool = True
+    delta_min_size: int = 4 * 1024
+    delta_candidate_count: int = 4
+    delta_size_ratio_min: float = 0.5
+    delta_size_ratio_max: float = 2.0
+    delta_min_gain_ratio: float = 0.95
+    delta_min_gain_bytes: int = 128
 
 
 @dataclass

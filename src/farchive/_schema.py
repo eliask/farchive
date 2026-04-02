@@ -5,8 +5,8 @@ from __future__ import annotations
 import sqlite3
 from datetime import datetime, timezone
 
-SCHEMA_VERSION = 1
-_GENERATOR = "farchive 1.0.0"
+SCHEMA_VERSION = 2
+_GENERATOR = "farchive 2.0.0"
 
 
 def _now_ms() -> int:
@@ -14,7 +14,7 @@ def _now_ms() -> int:
     return int(datetime.now(timezone.utc).timestamp() * 1000)
 
 
-_SCHEMA_V1 = """
+_SCHEMA_V2 = """
 CREATE TABLE IF NOT EXISTS schema_info (
     version         INTEGER NOT NULL,
     created_at      INTEGER NOT NULL,
@@ -36,8 +36,11 @@ CREATE TABLE IF NOT EXISTS blob (
     payload             BLOB NOT NULL,
     raw_size            INTEGER NOT NULL,
     stored_size         INTEGER NOT NULL,
-    codec               TEXT NOT NULL CHECK (codec IN ('raw', 'zstd')),
+    codec               TEXT NOT NULL CHECK (codec IN (
+                            'raw', 'zstd', 'zstd_dict', 'zstd_delta'
+                        )),
     codec_dict_id       INTEGER REFERENCES dict(dict_id),
+    base_digest         TEXT REFERENCES blob(digest),
     storage_class       TEXT,
     created_at          INTEGER NOT NULL
 );
@@ -59,6 +62,8 @@ CREATE INDEX IF NOT EXISTS idx_span_locator
     ON locator_span(locator, observed_from DESC);
 CREATE INDEX IF NOT EXISTS idx_span_locator_time
     ON locator_span(locator, observed_from, observed_until);
+CREATE INDEX IF NOT EXISTS idx_blob_base
+    ON blob(base_digest);
 """
 
 _EVENT_TABLE = """
@@ -90,6 +95,63 @@ def detect_schema_version(conn: sqlite3.Connection) -> int:
         return 0
 
 
+def _migrate_v1_to_v2(conn: sqlite3.Connection) -> None:
+    """Migrate schema v1 to v2: add zstd_delta support.
+
+    v1: codec IN ('raw', 'zstd'), no base_digest
+    v2: codec IN ('raw', 'zstd', 'zstd_dict', 'zstd_delta'), adds base_digest
+
+    Existing 'zstd' + codec_dict_id rows become 'zstd_dict'.
+    """
+    now = _now_ms()
+
+    # Disable FK checks during table rebuild (locator_span references blob)
+    conn.executescript("""
+        PRAGMA foreign_keys=OFF;
+
+        CREATE TABLE blob_v2 (
+            digest              TEXT PRIMARY KEY,
+            payload             BLOB NOT NULL,
+            raw_size            INTEGER NOT NULL,
+            stored_size         INTEGER NOT NULL,
+            codec               TEXT NOT NULL CHECK (codec IN (
+                                    'raw', 'zstd', 'zstd_dict', 'zstd_delta'
+                                )),
+            codec_dict_id       INTEGER REFERENCES dict(dict_id),
+            base_digest         TEXT REFERENCES blob_v2(digest),
+            storage_class       TEXT,
+            created_at          INTEGER NOT NULL
+        );
+
+        INSERT INTO blob_v2 (digest, payload, raw_size, stored_size, codec,
+                             codec_dict_id, base_digest, storage_class, created_at)
+            SELECT
+                digest, payload, raw_size, stored_size,
+                CASE
+                    WHEN codec = 'raw' THEN 'raw'
+                    WHEN codec = 'zstd' AND codec_dict_id IS NOT NULL THEN 'zstd_dict'
+                    WHEN codec = 'zstd' THEN 'zstd'
+                END,
+                codec_dict_id,
+                NULL,
+                storage_class,
+                created_at
+            FROM blob;
+
+        DROP TABLE blob;
+        ALTER TABLE blob_v2 RENAME TO blob;
+
+        CREATE INDEX IF NOT EXISTS idx_blob_base ON blob(base_digest);
+
+        PRAGMA foreign_keys=ON;
+    """)
+
+    conn.execute(
+        "UPDATE schema_info SET version=?, migrated_at=?, generator=?",
+        (2, now, _GENERATOR),
+    )
+
+
 def init_schema(conn: sqlite3.Connection, *, enable_events: bool = False) -> None:
     """Create or verify schema. Raises on incompatible future version."""
     version = detect_schema_version(conn)
@@ -100,13 +162,15 @@ def init_schema(conn: sqlite3.Connection, *, enable_events: bool = False) -> Non
         )
     if version == 0:
         now = _now_ms()
-        conn.executescript(_SCHEMA_V1)
+        conn.executescript(_SCHEMA_V2)
         if enable_events:
             conn.executescript(_EVENT_TABLE)
         conn.execute(
             "INSERT OR IGNORE INTO schema_info VALUES (?, ?, NULL, ?)",
             (SCHEMA_VERSION, now, _GENERATOR),
         )
+    elif version == 1:
+        _migrate_v1_to_v2(conn)
     # version == SCHEMA_VERSION: already current
     if enable_events:
         tables = {

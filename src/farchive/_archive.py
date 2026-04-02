@@ -34,7 +34,9 @@ except ImportError:
 
 from farchive._compression import (
     compress_blob,
+    compress_delta,
     decompress_blob,
+    decompress_delta,
     repack_blobs,
     train_dict_from_samples,
 )
@@ -263,20 +265,105 @@ class Farchive:
             )
 
     # ------------------------------------------------------------------
+    # Delta candidate selection
+    # ------------------------------------------------------------------
+
+    def _find_delta_candidates(
+        self,
+        locator: str,
+        raw_size: int,
+        storage_class: str | None,
+    ) -> list[str]:
+        """Return up to delta_candidate_count eligible base digests for locator.
+
+        Candidates must be non-delta blobs with raw_size within ratio bounds.
+        """
+        policy = self._policy
+        params: list = [
+            locator,
+            policy.delta_min_size,
+            int(raw_size * policy.delta_size_ratio_min),
+            int(raw_size * policy.delta_size_ratio_max),
+            policy.delta_candidate_count,
+        ]
+        sc_clause = ""
+        if storage_class is not None:
+            sc_clause = " AND b.storage_class = ?"
+            params.insert(4, storage_class)
+
+        rows = self._conn.execute(
+            f"SELECT DISTINCT ls.digest "
+            f"FROM locator_span ls "
+            f"JOIN blob b ON ls.digest = b.digest "
+            f"WHERE ls.locator = ? "
+            f"  AND b.codec != 'zstd_delta' "
+            f"  AND b.raw_size >= ? "
+            f"  AND b.raw_size BETWEEN ? AND ? "
+            f"  {sc_clause}"
+            f"ORDER BY ls.observed_from DESC "
+            f"LIMIT ?",
+            params,
+        ).fetchall()
+        return [r[0] for r in rows]
+
+    def _try_delta(
+        self,
+        raw: bytes,
+        candidates: list[str],
+        best_frame_size: int,
+    ) -> tuple[bytes, str] | None:
+        """Try delta compression against each candidate. Return (payload, base_digest)
+        for the best accepted result, or None."""
+        policy = self._policy
+        best: tuple[bytes, str] | None = None
+        best_size = best_frame_size
+
+        for base_digest in candidates:
+            base_raw = self._read_raw(base_digest)
+            if base_raw is None:
+                continue
+            try:
+                delta_payload = compress_delta(raw, base_raw, level=policy.compression_level)
+            except Exception:
+                continue
+            delta_size = len(delta_payload)
+            # Must satisfy both gain thresholds
+            if delta_size > best_size * policy.delta_min_gain_ratio:
+                continue
+            if (best_size - delta_size) < policy.delta_min_gain_bytes:
+                continue
+            if delta_size < (best_size if best is None else len(best[0])):
+                best = (delta_payload, base_digest)
+                best_size = delta_size
+
+        return best
+
+    # ------------------------------------------------------------------
     # Internal blob storage
     # ------------------------------------------------------------------
 
     def _read_raw(self, digest: str) -> bytes | None:
         """Read and decompress a blob by digest."""
         row = self._conn.execute(
-            "SELECT payload, codec, codec_dict_id FROM blob WHERE digest=?",
+            "SELECT payload, codec, codec_dict_id, base_digest FROM blob WHERE digest=?",
             (digest,),
         ).fetchone()
         if row is None:
             return None
+        codec = row["codec"]
+        if codec == "zstd_delta":
+            base_digest = row["base_digest"]
+            if base_digest is None:
+                raise ValueError(f"zstd_delta blob {digest[:16]}.. has no base_digest")
+            base_raw = self._read_raw(base_digest)
+            if base_raw is None:
+                raise ValueError(
+                    f"Delta base {base_digest[:16]}.. not found for blob {digest[:16]}.."
+                )
+            return decompress_delta(bytes(row["payload"]), base_raw)
         return decompress_blob(
             bytes(row["payload"]),
-            row["codec"],
+            codec,
             codec_dict_id=row["codec_dict_id"],
             load_dict=self._load_dict,
         )
@@ -287,6 +374,7 @@ class Farchive:
         raw: bytes,
         storage_class: str | None,
         *,
+        locator: str | None = None,
         dict_id: int | None = None,
     ) -> None:
         """Store blob with best available compression. Idempotent by digest."""
@@ -299,23 +387,50 @@ class Farchive:
 
         dict_data = self._load_dict(dict_id) if dict_id is not None else None
 
+        # Step 1: best inline frame
         payload, codec, used_dict_id = compress_blob(
             raw,
             self._policy,
             dict_data=dict_data,
             dict_id=dict_id,
         )
+        best_payload = payload
+        best_codec = codec
+        best_dict_id = used_dict_id
+        best_base_digest: str | None = None
+        best_size = len(payload)
+
+        # Step 2: try locator-local delta
+        policy = self._policy
+        if (
+            policy.delta_enabled
+            and len(raw) >= policy.delta_min_size
+            and locator is not None
+        ):
+            candidates = self._find_delta_candidates(locator, len(raw), storage_class)
+            delta_result = self._try_delta(raw, candidates, best_size)
+            if delta_result is not None:
+                delta_payload, base_digest = delta_result
+                delta_size = len(delta_payload)
+                if delta_size < best_size:
+                    best_payload = delta_payload
+                    best_codec = "zstd_delta"
+                    best_dict_id = None
+                    best_base_digest = base_digest
+                    best_size = delta_size
+
         self._conn.execute(
             "INSERT INTO blob (digest, payload, raw_size, stored_size, "
-            "codec, codec_dict_id, storage_class, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "codec, codec_dict_id, base_digest, storage_class, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 digest,
-                payload,
+                best_payload,
                 len(raw),
-                len(payload),
-                codec,
-                used_dict_id,
+                best_size,
+                best_codec,
+                best_dict_id,
+                best_base_digest,
                 storage_class,
                 _now_ms(),
             ),
@@ -564,7 +679,7 @@ class Farchive:
         dict_id = self._get_latest_dict_id(storage_class) if storage_class else None
 
         with self._conn:
-            self._store_blob(digest, data, storage_class, dict_id=dict_id)
+            self._store_blob(digest, data, storage_class, locator=locator, dict_id=dict_id)
             span = self._observe_impl(
                 locator,
                 digest,
@@ -642,27 +757,17 @@ class Farchive:
                     )
                     continue
 
-                payload, codec, used_dict = compress_blob(
+                self._store_blob(
+                    digest,
                     data,
-                    self._policy,
-                    dict_data=self._load_dict(dict_id) if dict_id else None,
+                    storage_class,
+                    locator=locator,
                     dict_id=dict_id,
                 )
-                self._conn.execute(
-                    "INSERT INTO blob (digest, payload, raw_size, stored_size, "
-                    "codec, codec_dict_id, storage_class, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        digest,
-                        payload,
-                        len(data),
-                        len(payload),
-                        codec,
-                        used_dict,
-                        storage_class,
-                        now,
-                    ),
-                )
+                blob_row = self._conn.execute(
+                    "SELECT stored_size FROM blob WHERE digest=?",
+                    (digest,),
+                ).fetchone()
                 self._observe_impl(
                     locator,
                     digest,
@@ -671,7 +776,7 @@ class Farchive:
                 )
                 stats.items_stored += 1
                 stats.bytes_raw += len(data)
-                stats.bytes_stored += len(payload)
+                stats.bytes_stored += blob_row["stored_size"]
 
                 if progress and (i + 1) % 1000 == 0:
                     progress(i + 1, len(items))
@@ -837,7 +942,7 @@ class Farchive:
                 "dictionaries are not supported — train per storage class."
             )
         rows = self._conn.execute(
-            "SELECT payload, codec, codec_dict_id, raw_size "
+            "SELECT digest "
             "FROM blob WHERE storage_class=? ORDER BY RANDOM() LIMIT ?",
             (storage_class, sample_size * 2),
         ).fetchall()
@@ -847,13 +952,8 @@ class Farchive:
             if len(samples) >= sample_size:
                 break
             try:
-                data = decompress_blob(
-                    bytes(row["payload"]),
-                    row["codec"],
-                    codec_dict_id=row["codec_dict_id"],
-                    load_dict=self._load_dict,
-                )
-                if len(data) > 100:
+                data = self._read_raw(row["digest"])
+                if data is not None and len(data) > 100:
                     samples.append(data)
             except Exception:
                 continue
@@ -985,17 +1085,13 @@ class Farchive:
 
         codec_dist: dict[str, dict] = {}
         for row in self._conn.execute(
-            "SELECT codec, "
-            "  CASE WHEN codec_dict_id IS NOT NULL THEN 'dict' "
-            "       ELSE 'plain' END AS variant, "
-            "  COUNT(*), SUM(raw_size), SUM(stored_size) "
-            "FROM blob GROUP BY codec, variant",
+            "SELECT codec, COUNT(*), SUM(raw_size), SUM(stored_size) "
+            "FROM blob GROUP BY codec",
         ).fetchall():
-            key = row[0] if row[1] == "plain" else f"{row[0]}+{row[1]}"
-            codec_dist[key] = {
-                "count": row[2],
-                "raw": row[3],
-                "stored": row[4],
+            codec_dist[row[0]] = {
+                "count": row[1],
+                "raw": row[2],
+                "stored": row[3],
             }
 
         return ArchiveStats(

@@ -116,7 +116,7 @@ def _cmd_inspect(args: argparse.Namespace) -> None:
     with Farchive(args.db) as fa:
         row = fa._conn.execute(
             "SELECT digest, raw_size, stored_size, codec, codec_dict_id, "
-            "storage_class, created_at FROM blob WHERE digest=?",
+            "base_digest, storage_class, created_at FROM blob WHERE digest=?",
             (args.digest,),
         ).fetchone()
         if row is None:
@@ -127,6 +127,8 @@ def _cmd_inspect(args: argparse.Namespace) -> None:
         print(f"Stored size:    {row['stored_size']:,} bytes")
         print(f"Codec:          {row['codec']}")
         print(f"Dict ID:        {row['codec_dict_id'] or 'none'}")
+        if row['base_digest']:
+            print(f"Base digest:    {row['base_digest']}")
         print(f"Storage class:  {row['storage_class'] or 'none'}")
         print(f"Created at:     {row['created_at']}")
         ratio = row["raw_size"] / row["stored_size"] if row["stored_size"] else 0
