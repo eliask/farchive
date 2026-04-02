@@ -1,7 +1,7 @@
 [project]
 name = "farchive"
 version = "0.3.0"
-description = "Content-addressed archive with locator-scoped observation history and adaptive zstd compression."
+description = "Local content-addressed archive with locator-scoped history for opaque bytes."
 requires-python = ">=3.11"
 dependencies = ["zstandard>=0.21"]
 readme = "README.md"

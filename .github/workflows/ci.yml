@@ -59,7 +59,9 @@ jobs:
         run: python -c "from farchive import Farchive, StateSpan, Event; print('import ok')"
 
       - name: CLI smoke test
-        run: farchive --help || farchive 2>&1 | head -5
+        run: |
+          command -v farchive
+          farchive --help > /dev/null
 
       - name: Roundtrip smoke test
         run: |
@@ -75,6 +77,9 @@ jobs:
                   assert len(fa.history('loc/a')) == 3
           print('roundtrip ok')
           "
+
+      - name: Verify py.typed marker in installed package
+        run: python -c "from importlib.resources import files; assert (files('farchive') / 'py.typed').is_file(), 'py.typed missing from installed package'"
 
       - name: Verify twine check
         run: pip install twine && twine check dist/*

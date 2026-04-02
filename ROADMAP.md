@@ -6,19 +6,22 @@
 
 > Farchive is a local, content-addressed, positive-observation archive for opaque bytes, with locator-scoped contiguous history, exact raw-byte retrieval, optional append-only write events, and transparent storage optimization via zstd and corpus-trained dictionaries.
 
-## Must before 1.0
+## Settled (included in 1.0)
 
-- [ ] **On-disk compatibility promise.** State explicitly: "a .farchive written by 1.x will remain readable by later 1.x releases." Define migration policy: either real migrations, or "superset tolerated, readers ignore unknown columns."
-- [ ] **Full test coverage of spec invariants.** Every MUST in SPEC.md backed by a test: A/B/A spans, monotone rejection, same-timestamp digest rejection, dict usage in put_blob/store/store_batch, manual dicts for non-auto classes, repack scoping, event reads across reopen, metadata round-trip, as-of resolution.
-- [ ] **Freeze public API surface.** Lock names, signatures, return types, failure modes for all public methods and dataclasses. Document in SPEC.md section 7.
-- [ ] **Freeze on-disk schema.** No more casual column changes. Schema version 1 is the 1.0 schema.
+- **On-disk compatibility promise.** Schema v1 is the 1.0 schema. A `.farchive` written by 1.x will remain readable by later 1.x releases. Readers tolerate unknown columns.
+- **Public API freeze.** Names, signatures, return types, failure modes for all public methods and dataclasses are frozen and documented in SPEC.md.
+- **On-disk schema freeze.** Schema version 1 is final for the 1.x line.
+- **Event model.** Archive-property events: once any session creates the event table, all subsequent sessions append events automatically.
+- **Repack semantics.** Repack targets vanilla-zstd blobs without a dict. Re-dicting older-dict blobs is post-1.0.
+- **Atomicity tests.** Rollback behavior verified for store(), store_batch(), observe(), train_dict(), repack().
 
 ## Nice before 1.0
 
-- [ ] **Windows file locking.** Replace fcntl with a cross-platform lock (msvcrt or portalocker). Or document POSIX-only as a 1.0 constraint and add Windows in 1.1.
 - [ ] **Property-based tests.** Hypothesis tests for span invariants (arbitrary observation sequences always produce valid span history).
+- [ ] **Windows smoke coverage.** Import + roundtrip smoke on Windows (single-process, no-lock fallback).
 - [ ] **CLI completeness.** `farchive events` command. `farchive inspect <digest>` for blob metadata.
 - [ ] **Richer event kinds.** Emit `fa.store`, `fa.train_dict`, `fa.repack` in addition to `fa.observe`.
+- [ ] **Frozen fixture DBs.** Pre-built `.farchive` files for forward-compatibility regression testing.
 
 ## Explicitly post-1.0
 
@@ -33,3 +36,4 @@
 - Tombstone / null-state transitions
 - Multi-hash support (sha512, blake3)
 - Optional `AsyncFarchive` adapter over the sync core (single worker thread, no separate on-disk format or semantics)
+- Re-dict existing dict-compressed blobs with newer dictionaries

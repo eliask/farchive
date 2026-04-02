@@ -176,7 +176,7 @@ def test_reopen_detects_existing_dict(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_all_blobs_decompress_after_auto_recompression(low_threshold_archive):
+def test_all_blobs_roundtrip_after_auto_train(low_threshold_archive):
     """Every blob stored before and after the threshold should round-trip cleanly."""
     fa = low_threshold_archive
     threshold = 20
@@ -292,3 +292,53 @@ def test_repack_without_storage_class_raises(low_threshold_archive):
     fa = low_threshold_archive
     with pytest.raises(ValueError, match="requires storage_class"):
         fa.repack()
+
+
+# ---------------------------------------------------------------------------
+# repack batch_size means successful repacks, not rows examined
+# ---------------------------------------------------------------------------
+
+
+def test_repack_zero_means_done(tmp_path):
+    """After full repack, blobs_repacked == 0 means nothing repackable remains."""
+    db = tmp_path / "repack_done.farchive"
+    policy = CompressionPolicy(auto_train_thresholds={"xml": 20, "pdf": 16})
+    with Farchive(db, compression=policy) as fa:
+        # Store enough to trigger auto-train
+        for i in range(25):
+            fa.store(f"loc/xml/{i}", _make_xml_blob(i), storage_class="xml")
+
+        # First repack: should repack some blobs
+        fa.repack(storage_class="xml")
+        # Second repack: zero must mean "done" (not "front slice didn't improve")
+        stats2 = fa.repack(storage_class="xml")
+        assert stats2.blobs_repacked == 0, (
+            "Second repack should find nothing left to repack"
+        )
+
+
+def test_repack_batch_size_caps_successful_repacks(tmp_path):
+    """batch_size limits successful repacks, not rows examined."""
+    db = tmp_path / "repack_batch.farchive"
+    fa = Farchive(db)
+    try:
+        # Store many blobs, then manually train a dict
+        for i in range(30):
+            fa.store(f"loc/xml/{i}", _make_xml_blob(i, size=600), storage_class="xml")
+
+        fa.train_dict(storage_class="xml")
+
+        # Repack with small batch_size
+        stats = fa.repack(storage_class="xml", batch_size=5)
+        assert stats.blobs_repacked <= 5, (
+            f"batch_size=5 but repacked {stats.blobs_repacked}"
+        )
+
+        # Should still have more to repack
+        fa.repack(storage_class="xml", batch_size=100)
+
+        # Third call should find nothing
+        stats3 = fa.repack(storage_class="xml")
+        assert stats3.blobs_repacked == 0
+    finally:
+        fa.close()

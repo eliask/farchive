@@ -239,15 +239,6 @@ The official profile REQUIRES observations for a given locator to be appended in
 
 Additionally, a digest transition (Case C) at the exact same timestamp as the current span's `last_confirmed_at` is rejected. This prevents zero-duration spans. Same-timestamp confirmations of the same digest (Case B) are allowed.
 
-### 6.5 Implicit timestamp auto-bump
-
-For calls without explicit `observed_at`, the implementation may internally adjust the generated timestamp to preserve span validity. Specifically:
-
-- Same-digest confirmation: timestamp is bumped to at least `last_confirmed_at`
-- Digest transition: timestamp is bumped to at least `last_confirmed_at + 1`
-
-This ensures the default path (no explicit timestamps) is boring and safe. Callers who provide explicit timestamps get strict enforcement with no auto-adjustment.
-
 ### 6.3 Current span
 
 A span is current iff `observed_until IS NULL`.
@@ -259,50 +250,238 @@ A span is active at instant `t` iff:
 - `observed_from <= t`
 - and either `observed_until IS NULL` or `t < observed_until`
 
+### 6.5 Implicit timestamp auto-bump
+
+For calls without explicit `observed_at`, the implementation may internally adjust the generated timestamp to preserve span validity. Specifically:
+
+- Same-digest confirmation: timestamp is bumped to at least `last_confirmed_at`
+- Digest transition: timestamp is bumped to at least `last_confirmed_at + 1`
+
+This ensures the default path (no explicit timestamps) is boring and safe. Callers who provide explicit timestamps get strict enforcement with no auto-adjustment.
+
 ---
 
-## 7. Core Operations
+## 7. Core Operations (Frozen Public API)
 
-### 7.1 `put_blob(data) -> digest`
+This section is the normative public API contract for farchive 1.x. Method names, parameter names, defaults, return types, and failure modes are frozen.
 
-Compute digest over raw bytes. Store blob if absent. Return digest. Idempotent.
+### 7.1 Public Data Types
 
-### 7.2 `observe(locator, digest, observed_at) -> StateSpan`
+```python
+@dataclass(frozen=True, slots=True)
+class StateSpan:
+    span_id: int
+    locator: str
+    digest: str
+    observed_from: int       # UTC Unix ms, inclusive
+    observed_until: int | None  # UTC Unix ms, exclusive; None = current
+    last_confirmed_at: int   # UTC Unix ms
+    observation_count: int
+    last_metadata: dict[str, Any] | None = None
 
-Preconditions: the digest MUST already exist. `observed_at` MUST be >= the locator's current `last_confirmed_at`.
+@dataclass(frozen=True, slots=True)
+class Event:
+    event_id: int
+    occurred_at: int         # UTC Unix ms
+    locator: str
+    digest: str | None
+    kind: str
+    metadata: dict[str, Any] | None
 
-- **Case A (no current span):** create a new open span for `(locator, digest)`.
-- **Case B (current span has same digest):** update `last_confirmed_at`, increment `observation_count`.
-- **Case C (current span has different digest):** close the current span by setting `observed_until = observed_at`, create a new open span for the new digest.
+@dataclass
+class CompressionPolicy:
+    raw_threshold: int = 64
+    auto_train_thresholds: dict[str, int]  # default: {"xml": 1000, "html": 500, "pdf": 16}
+    dict_target_sizes: dict[str, int]      # default: {"xml": 112*1024, "html": 112*1024, "pdf": 64*1024}
+    compression_level: int = 3
 
-If a previously seen digest returns after an intervening digest, that MUST create a new span (Case C then A).
+@dataclass
+class ImportStats:
+    items_scanned: int = 0
+    items_stored: int = 0
+    items_deduped: int = 0
+    bytes_raw: int = 0
+    bytes_stored: int = 0
 
-### 7.3 `store(locator, data) -> digest`
+@dataclass
+class RepackStats:
+    blobs_repacked: int = 0
+    bytes_saved: int = 0
 
-`put_blob(data)` + `observe(locator, digest)`. The combined operation MUST be atomic.
+@dataclass(frozen=True, slots=True)
+class ArchiveStats:
+    locator_count: int
+    blob_count: int
+    span_count: int
+    dict_count: int
+    total_raw_bytes: int
+    total_stored_bytes: int
+    compression_ratio: float | None
+    codec_distribution: dict[str, dict]
+    db_path: str
+    schema_version: int
+```
 
-### 7.4 `read(digest) -> bytes | None`
+### 7.2 `Farchive(db_path, *, compression, enable_events)`
 
-Returns exact raw bytes for a digest, or None if absent.
+Constructor.
 
-### 7.5 `resolve(locator, at=None) -> StateSpan | None`
+| Parameter | Type | Default | Notes |
+|---|---|---|---|
+| `db_path` | `str \| Path` | `"archive.farchive"` | Created if absent; parent dirs created automatically |
+| `compression` | `CompressionPolicy \| None` | `None` (= default policy) | Storage optimization policy |
+| `enable_events` | `bool` | `False` | Creates event table if absent; once created, all sessions append |
 
-If `at` is None: return the current span for the locator. If `at` is provided: return the unique active span at that time.
+Context manager: `with Farchive(...) as fa:` ensures `close()` on exit.
 
-### 7.6 `history(locator) -> list[StateSpan]`
+### 7.3 Write Operations
 
-Returns all state spans for the locator.
+#### `put_blob(data, *, storage_class) -> str`
 
-### 7.7 `events(locator=None, since=None) -> list[Event]`
+Store blob if absent. Return digest. Idempotent.
 
-Query the event audit log. Returns events newest-first, optionally filtered by locator and/or time. Returns empty list if events are disabled.
+| Parameter | Type | Default | Notes |
+|---|---|---|---|
+| `data` | `bytes` | required | Raw bytes to store |
+| `storage_class` | `str \| None` | `None` | Compression hint; uses trained dict if available |
 
-### 7.8 Convenience operations
+Returns: SHA-256 hex digest (64 chars). Bounded: O(data size).
 
-- `get(locator, at=None)` = `read(resolve(locator, at).digest)`
-- `has(locator, max_age_hours=...)` -- freshness check
-- `locators(pattern=...)` -- LIKE pattern search
-- `store_batch(items, ...)` -- bulk import
+#### `observe(locator, digest, *, observed_at, metadata) -> StateSpan`
+
+Record an observation. Digest MUST already exist (call `put_blob` first).
+
+| Parameter | Type | Default | Notes |
+|---|---|---|---|
+| `locator` | `str` | required | Opaque external key |
+| `digest` | `str` | required | Must reference existing blob |
+| `observed_at` | `int \| None` | `None` (= now) | UTC Unix ms; explicit values get strict monotone enforcement |
+| `metadata` | `dict \| None` | `None` | `None` = no-update (preserves existing); `{}` = valid empty dict |
+
+Returns: the resulting `StateSpan` (created or extended).
+
+Semantics:
+- **Case A (no current span):** create new open span
+- **Case B (same digest):** extend current span (`last_confirmed_at` updated, `observation_count` incremented)
+- **Case C (different digest):** close current span, create new open span
+
+Timestamp behavior:
+- Explicit `observed_at`: strict monotone enforcement, raises on violation
+- Implicit (None): auto-bumps to maintain monotonicity (6.5)
+
+Failures: see section 8.
+
+#### `store(locator, data, *, observed_at, storage_class, metadata) -> str`
+
+`put_blob(data)` + `observe(locator, digest)`. Atomic: if either part fails, neither persists.
+
+| Parameter | Type | Default | Notes |
+|---|---|---|---|
+| `locator` | `str` | required | |
+| `data` | `bytes` | required | |
+| `observed_at` | `int \| None` | `None` | Forwarded to `observe()` |
+| `storage_class` | `str \| None` | `None` | Forwarded to `put_blob()` |
+| `metadata` | `dict \| None` | `None` | Forwarded to `observe()` |
+
+Returns: SHA-256 hex digest.
+
+#### `store_batch(items, *, observed_at, storage_class, progress) -> ImportStats`
+
+Bulk store. Atomic: entire batch rolls back on failure.
+
+| Parameter | Type | Default | Notes |
+|---|---|---|---|
+| `items` | `list[tuple[str, bytes]]` | required | `(locator, data)` tuples |
+| `observed_at` | `int \| None` | `None` | Shared timestamp for all items; `None` = per-item now |
+| `storage_class` | `str \| None` | `None` | Applied to all items |
+| `progress` | `Callable[[int, int], None] \| None` | `None` | Called every 1000 items with (current, total) |
+
+Returns: `ImportStats`. Maintenance: triggers auto-train check after batch (non-fatal).
+
+### 7.4 Read Operations
+
+#### `read(digest) -> bytes | None`
+
+Returns exact raw bytes for a digest, or `None` if absent. Bounded: O(blob size).
+
+#### `resolve(locator, *, at) -> StateSpan | None`
+
+| Parameter | Type | Default | Notes |
+|---|---|---|---|
+| `locator` | `str` | required | |
+| `at` | `int \| None` | `None` | `None` = current span; otherwise point-in-time (6.4) |
+
+Returns: `StateSpan` or `None` if no matching span.
+
+#### `get(locator, *, at) -> bytes | None`
+
+Convenience: `resolve(locator, at=at)` then `read(span.digest)`. Returns `None` if no span or blob missing.
+
+#### `history(locator) -> list[StateSpan]`
+
+All spans for a locator, newest first (`observed_from DESC`). Empty list if locator unknown.
+
+#### `has(locator, *, max_age_hours) -> bool`
+
+| Parameter | Type | Default | Notes |
+|---|---|---|---|
+| `locator` | `str` | required | |
+| `max_age_hours` | `float` | `inf` | Freshness check against `last_confirmed_at` |
+
+Returns `True` if locator has an open span within the freshness window.
+
+#### `locators(pattern) -> list[str]`
+
+| Parameter | Type | Default | Notes |
+|---|---|---|---|
+| `pattern` | `str` | `"%"` | SQL LIKE pattern |
+
+Returns distinct locators matching the pattern, sorted alphabetically.
+
+#### `events(locator, *, since, limit) -> list[Event]`
+
+| Parameter | Type | Default | Notes |
+|---|---|---|---|
+| `locator` | `str \| None` | `None` | Filter by locator; `None` = all |
+| `since` | `int \| None` | `None` | Filter: `occurred_at >= since` |
+| `limit` | `int` | `1000` | Maximum events returned |
+
+Returns events newest-first. Returns empty list if the archive has no event table (i.e. no session has ever created it via `enable_events=True`). Once the event table exists, all sessions can read the full event history.
+
+### 7.5 Maintenance Operations
+
+Maintenance operations are explicit, bounded, and do not alter archive semantics.
+
+#### `train_dict(*, storage_class, sample_size) -> int`
+
+| Parameter | Type | Default | Notes |
+|---|---|---|---|
+| `storage_class` | `str` | required | Global dicts not supported |
+| `sample_size` | `int` | `500` | Max samples to use for training |
+
+Returns: `dict_id`. New blobs of that storage class use the dict immediately. Does NOT auto-repack existing blobs.
+
+Failures: `ValueError` if `storage_class` not provided or fewer than 10 eligible samples.
+
+#### `repack(*, dict_id, storage_class, batch_size) -> RepackStats`
+
+| Parameter | Type | Default | Notes |
+|---|---|---|---|
+| `dict_id` | `int \| None` | `None` | Explicit dict; if `None`, uses latest for `storage_class` |
+| `storage_class` | `str \| None` | `None` | Required if `dict_id` is `None` |
+| `batch_size` | `int` | `1000` | Max *successful repacks* per call (not rows examined) |
+
+Targets only vanilla-zstd blobs without a dictionary. Does NOT re-dict blobs already compressed with an older dictionary. `batch_size` caps successful repacks, not rows examined — `blobs_repacked == 0` reliably means "nothing repackable remains." Call repeatedly until `blobs_repacked == 0` for full repack.
+
+Failures: `ValueError` if neither `storage_class` nor `dict_id` provided, if dict not found, or if storage class mismatches dict.
+
+#### `stats() -> ArchiveStats`
+
+Non-semantic reporting snapshot. Read-only, bounded.
+
+#### `close() -> None`
+
+Close the database connection. Idempotent. Called automatically when using the context manager (`with Farchive(...) as fa:`).
 
 ---
 
@@ -319,6 +498,7 @@ The following error behaviors are part of the public contract:
 | Non-JSON-serializable metadata | `TypeError` | "metadata must be JSON-serializable" |
 | `repack()` without scoping | `ValueError` | "requires storage_class or dict_id" |
 | `repack()` with mismatched dict/class | `ValueError` | "does not match dict" |
+| `repack()` with unknown `dict_id` | `ValueError` | "dict_id {id} not found" |
 | `train_dict()` without storage_class | `ValueError` | "requires storage_class" |
 | `train_dict()` with <10 samples | `ValueError` | "Need at least 10 samples" |
 | DB version newer than library | `RuntimeError` | "Upgrade farchive" |
@@ -362,6 +542,8 @@ Any compression strategy MUST satisfy: exact reversibility, raw-byte round-trip,
 Repacking MAY rewrite stored blob payloads and storage metadata. Repacking MUST preserve: digest, raw bytes, spans, events, query semantics.
 
 The official profile requires `storage_class` or an explicit `dict_id` for repack operations to prevent cross-applying a dictionary trained on one storage class to blobs of another.
+
+**Scope of repack in v1:** `repack()` targets only **vanilla-zstd blobs without a dictionary** (`codec='zstd' AND codec_dict_id IS NULL`). It does **not** upgrade blobs already compressed with an older dictionary to a newer dictionary. If a better dictionary is trained later, only new blobs use it automatically; re-dicting existing dict-compressed blobs is a post-1.0 feature.
 
 ### 10.3 Dictionaries
 

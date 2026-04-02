@@ -123,8 +123,9 @@ class Farchive:
 
         # Dict cache: dict_id -> ZstdCompressionDict
         self._dict_cache: dict[int, Any] = {}
-        # Per-storage-class auto-train flag: True/False after first check, None = unchecked
-        self._has_dict_for_class: dict[str, bool | None] = {}
+        # Per-storage-class auto-train flag: only caches True (dict exists).
+        # Never caches False — another process may have trained a dict.
+        self._has_dict_for_class: dict[str, bool] = {}
 
         # File-based write lock (POSIX only)
         self._lock_path = self._db_path.with_name(self._db_path.name + ".writer.lock")
@@ -175,15 +176,19 @@ class Farchive:
         return d
 
     def _get_latest_dict_id(self, storage_class: str | None = None) -> int | None:
-        """Most recently trained dict, optionally filtered by storage_class."""
+        """Most recently trained dict, optionally filtered by storage_class.
+
+        Uses dict_id DESC as tiebreak for deterministic ordering when
+        multiple dicts share the same trained_at timestamp.
+        """
         if storage_class is None:
             row = self._conn.execute(
-                "SELECT dict_id FROM dict ORDER BY trained_at DESC LIMIT 1",
+                "SELECT dict_id FROM dict ORDER BY trained_at DESC, dict_id DESC LIMIT 1",
             ).fetchone()
         else:
             row = self._conn.execute(
                 "SELECT dict_id FROM dict WHERE storage_class=? "
-                "ORDER BY trained_at DESC LIMIT 1",
+                "ORDER BY trained_at DESC, dict_id DESC LIMIT 1",
                 (storage_class,),
             ).fetchone()
         return row[0] if row else None
@@ -191,22 +196,24 @@ class Farchive:
     def _check_auto_train(self, storage_class: str) -> None:
         """Auto-train a zstd dict if threshold reached and no dict exists yet.
 
-        Called after storing an eligible blob. Must be called inside write lock.
+        Called after storing an eligible blob. Must be called inside write lock
+        to prevent duplicate training across processes.
         """
         thresholds = self._policy.auto_train_thresholds
         if storage_class not in thresholds:
             return
 
         threshold = thresholds[storage_class]
-        has_dict = self._has_dict_for_class.get(storage_class)
-        if has_dict is True:
+
+        # Positive cache is safe (dict exists = always true once created).
+        # We never cache "no dict" — another process may have trained one.
+        if self._has_dict_for_class.get(storage_class) is True:
             return
 
-        if has_dict is None:
-            has_dict = self._get_latest_dict_id(storage_class) is not None
-            self._has_dict_for_class[storage_class] = has_dict
-            if has_dict:
-                return
+        # Always re-check DB under lock (another process may have trained)
+        if self._get_latest_dict_id(storage_class) is not None:
+            self._has_dict_for_class[storage_class] = True
+            return
 
         count = self._conn.execute(
             "SELECT COUNT(*) FROM blob WHERE storage_class = ?",
@@ -436,9 +443,9 @@ class Farchive:
         with self._write_lock():
             with self._conn:
                 self._store_blob(digest, data, storage_class, dict_id=dict_id)
-        # Auto-train if eligible and no dict yet (non-fatal)
-        if dict_id is None:
-            self._try_auto_train(storage_class)
+            # Auto-train under write lock to prevent duplicate training (non-fatal)
+            if dict_id is None:
+                self._try_auto_train(storage_class)
         return digest
 
     def observe(

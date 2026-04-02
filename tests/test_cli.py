@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import subprocess
+import sys
 
 
 from farchive import Farchive
@@ -14,9 +15,9 @@ from farchive import Farchive
 
 
 def _run(args: list[str], *, cwd=None) -> subprocess.CompletedProcess:
-    """Run `uv run farchive <args>` and return the completed process."""
+    """Run `farchive <args>` via the current Python interpreter."""
     return subprocess.run(
-        ["uv", "run", "farchive", *args],
+        [sys.executable, "-m", "farchive._cli", *args],
         capture_output=True,
         text=True,
         cwd=cwd,

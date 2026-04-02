@@ -72,7 +72,8 @@ def compress_blob(
     if dict_data is not None and dict_id is not None:
         try:
             compressed = _make_compressor(
-                level=policy.compression_level, dict_data=dict_data,
+                level=policy.compression_level,
+                dict_data=dict_data,
             ).compress(raw)
             return compressed, "zstd", dict_id
         except Exception:
@@ -138,7 +139,9 @@ def repack_blobs(
 ) -> RepackStats:
     """Recompress vanilla-zstd blobs with a trained dictionary.
 
-    Only recompresses blobs that have no dict.
+    Only recompresses blobs that have no dict (codec_dict_id IS NULL).
+    batch_size caps *successful repacks*, not rows examined — so
+    blobs_repacked == 0 reliably means "nothing repackable remains."
     """
     compressor = _make_compressor(level=policy.compression_level, dict_data=dict_data)
     decompressor = _get_vanilla_decompressor()
@@ -151,15 +154,15 @@ def repack_blobs(
     if storage_class is not None:
         query += " AND storage_class = ?"
         params.append(storage_class)
-    query += " LIMIT ?"
-    params.append(batch_size)
 
-    rows = conn.execute(query, params).fetchall()
+    cursor = conn.execute(query, params)
 
     stats = RepackStats()
     updates: list[tuple] = []
 
-    for row in rows:
+    for row in cursor:
+        if stats.blobs_repacked >= batch_size:
+            break
         try:
             raw = decompressor.decompress(bytes(row["payload"]))
             new_payload = compressor.compress(raw)
@@ -174,8 +177,7 @@ def repack_blobs(
 
     if updates:
         conn.executemany(
-            "UPDATE blob SET payload=?, codec_dict_id=?, stored_size=? "
-            "WHERE digest=?",
+            "UPDATE blob SET payload=?, codec_dict_id=?, stored_size=? WHERE digest=?",
             updates,
         )
 
