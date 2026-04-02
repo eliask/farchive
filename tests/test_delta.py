@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import os
 
-import pytest
-
 from farchive import CompressionPolicy, Farchive
 
 
@@ -13,9 +11,11 @@ from farchive import CompressionPolicy, Farchive
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _make_blob(size: int = 8 * 1024, seed: int = 0) -> bytes:
     """Generate a blob with moderate entropy — compressible but not trivially so."""
     import struct
+
     rng = bytearray(os.urandom(size))
     # Mix in a pattern so blobs from different seeds share structure
     pattern = struct.pack(">I", seed)
@@ -126,14 +126,11 @@ class TestDeltaSelection:
             b = _make_similar(a, changes=2)
             c = _make_similar(b, changes=2)
 
-            da = fa.store("loc/p", a, storage_class="html")
-            db_ = fa.store("loc/p", b, storage_class="html")
+            fa.store("loc/p", a, storage_class="html")
+            fa.store("loc/p", b, storage_class="html")
             dc = fa.store("loc/p", c, storage_class="html")
 
             # B may be delta of A
-            row_b = fa._conn.execute(
-                "SELECT codec, base_digest FROM blob WHERE digest=?", (db_,)
-            ).fetchone()
 
             # C should not use B as base if B is delta
             row_c = fa._conn.execute(
@@ -177,7 +174,7 @@ class TestDeltaPutBlob:
             base = _make_blob(8192)
             rev = _make_similar(base, changes=2)
 
-            d1 = fa.put_blob(base, storage_class="html")
+            fa.put_blob(base, storage_class="html")
             d2 = fa.put_blob(rev, storage_class="html")
 
             row = fa._conn.execute(
@@ -277,12 +274,16 @@ class TestDeltaGet:
 
             d1 = fa.store("loc/p", v1, storage_class="html")
             import time
+
             time.sleep(0.01)
             d2 = fa.store("loc/p", v2, storage_class="html")
 
             spans = fa.history("loc/p")
-            span2 = spans[0]  # newest first
             span1 = spans[1]  # older
 
-            assert fa.resolve("loc/p", at=span1.observed_from).digest == d1
-            assert fa.resolve("loc/p").digest == d2
+            span_old = fa.resolve("loc/p", at=span1.observed_from)
+            assert span_old is not None
+            assert span_old.digest == d1
+            span_cur = fa.resolve("loc/p")
+            assert span_cur is not None
+            assert span_cur.digest == d2

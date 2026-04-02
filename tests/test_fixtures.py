@@ -28,17 +28,20 @@ FIXTURES = Path(__file__).parent / "fixtures"
 
 
 @pytest.fixture(scope="module")
-def smoke_archive():
-    """Read-only access to the v1_smoke fixture."""
-    db = FIXTURES / "v1_smoke.farchive"
-    assert db.exists(), f"Fixture missing: {db}"
+def smoke_archive(tmp_path_factory):
+    """Open a copy of the v1_smoke fixture (never mutates the checked-in original)."""
+    src = FIXTURES / "v1_smoke.farchive"
+    assert src.exists(), f"Fixture missing: {src}"
+    import shutil
+    db = tmp_path_factory.mktemp("fixtures") / "v1_smoke.farchive"
+    shutil.copy2(src, db)
     with Farchive(db) as fa:
         yield fa
 
 
 def test_fixture_schema_version(smoke_archive):
-    """Fixture was v1, migrated to v2 on open."""
-    assert smoke_archive.stats().schema_version == 2
+    """Fixture was v1, migrated to v3 on open."""
+    assert smoke_archive.stats().schema_version == 3
 
 
 def test_fixture_locator_count(smoke_archive):

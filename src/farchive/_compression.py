@@ -192,7 +192,7 @@ def repack_blobs(
     decompressor = _get_vanilla_decompressor()
 
     query = (
-        "SELECT digest, payload, raw_size, stored_size FROM blob "
+        "SELECT digest, payload, raw_size, stored_self_size FROM blob "
         "WHERE codec = 'zstd' AND codec_dict_id IS NULL"
     )
     params: list = []
@@ -211,7 +211,7 @@ def repack_blobs(
         try:
             raw = decompressor.decompress(bytes(row["payload"]))
             new_payload = compressor.compress(raw)
-            old_stored = row["stored_size"]
+            old_stored = row["stored_self_size"]
             new_stored = len(new_payload)
             if new_stored < old_stored:
                 updates.append((new_payload, dict_id, new_stored, row["digest"]))
@@ -222,7 +222,7 @@ def repack_blobs(
 
     if updates:
         conn.executemany(
-            "UPDATE blob SET payload=?, codec='zstd_dict', codec_dict_id=?, stored_size=? WHERE digest=?",
+            "UPDATE blob SET payload=?, codec='zstd_dict', codec_dict_id=?, stored_self_size=? WHERE digest=?",
             updates,
         )
 

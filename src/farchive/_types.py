@@ -42,11 +42,21 @@ class CompressionPolicy:
 
     delta_enabled: bool = True
     delta_min_size: int = 4 * 1024
+    delta_max_size: int = 8 * 1024 * 1024  # 8 MiB
     delta_candidate_count: int = 4
     delta_size_ratio_min: float = 0.5
     delta_size_ratio_max: float = 2.0
     delta_min_gain_ratio: float = 0.95
     delta_min_gain_bytes: int = 128
+
+    # Chunking (content-defined dedupe for large blobs)
+    chunk_enabled: bool = True
+    chunk_min_blob_size: int = 1 * 1024 * 1024  # 1 MiB
+    chunk_avg_size: int = 256 * 1024
+    chunk_min_size: int = 64 * 1024
+    chunk_max_size: int = 1 * 1024 * 1024
+    chunk_min_gain_ratio: float = 0.95
+    chunk_min_gain_bytes: int = 4096
 
 
 @dataclass
@@ -65,6 +75,15 @@ class RepackStats:
     """Results from a repack operation."""
 
     blobs_repacked: int = 0
+    bytes_saved: int = 0
+
+
+@dataclass
+class RechunkStats:
+    """Results from a rechunk operation."""
+
+    blobs_rewritten: int = 0
+    chunks_added: int = 0
     bytes_saved: int = 0
 
 
@@ -94,3 +113,5 @@ class ArchiveStats:
     codec_distribution: dict[str, dict]
     db_path: str
     schema_version: int
+    chunk_count: int
+    db_file_bytes: int

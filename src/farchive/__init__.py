@@ -7,6 +7,7 @@ from farchive._types import (
     Event,
     ImportStats,
     RepackStats,
+    RechunkStats,
     StateSpan,
 )
 
@@ -16,7 +17,8 @@ __all__ = [
     "Event",
     "Farchive",
     "ImportStats",
+    "RechunkStats",
     "RepackStats",
     "StateSpan",
 ]
-__version__ = "1.0.0"
+__version__ = "2.0.0"

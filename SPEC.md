@@ -1,151 +1,75 @@
-# Farchive Spec v1 and SQLite/Zstd Profile
+# Farchive Spec v2 and SQLite Single-File Profile v3
 
-Status: conformant with v1.0.0 implementation, living spec.
+Status: proposed v2 contract, intended to be practical to implement and stable enough to freeze.
 
 ---
 
 ## 0. Motivation
 
-Many programs need to fetch, store, and re-read opaque byte payloads from external sources -- web pages, API responses, regulatory documents, configuration snapshots. The common requirements are:
+Many programs need to fetch, store, and re-read opaque byte payloads from external sources — web pages, API responses, regulatory documents, configuration snapshots, binary artifacts, and dataset shards. The common requirements are:
 
-1. **Don't re-fetch what hasn't changed.** Content-addressed dedup and freshness checks.
-2. **Know what changed and when.** Not just the latest version, but when each distinct version was first and last observed.
-3. **Don't lose history.** If content reverts to an earlier version, that's a distinct event -- not something to silently collapse.
-4. **Store it compactly.** Thousands of structurally similar documents (XML statutes, HTML pages, JSON API responses) should benefit from corpus-level compression, not just per-file.
-5. **Keep it boring.** One local file. No server. No configuration. Queryable with SQL if needed.
+1. **Do not re-store exact duplicates.** Identical raw bytes should collapse to one blob.
+2. **Preserve observation history.** A locator going `A → B → A` is three distinct historical runs, not one merged record.
+3. **Support cheap hot queries.** Latest-by-locator, point-in-time resolution, exact read-by-digest, and freshness checks should stay boring.
+4. **Keep storage small.** Repetitive corpora should benefit from zstd, trained dictionaries, locator-local deltas, and large-blob chunk deduplication.
+5. **Stay local and queryable.** One SQLite file, no daemon, no server, and SQL-friendly layout.
 
-Adjacent tools each cover a subset: SQLar (single-file SQLite archive, Deflate only), WARC (web archival format, not queryable), Fossil (DVCS with delta compression, repository model not observation model), `sqlite-zstd` (zstd inside SQLite, no observation semantics). None combines content-addressed dedup, locator-scoped temporal history, and adaptive corpus compression in a single queryable local store.
-
-Farchive fills that gap.
+Farchive is a **positive-observation archive** for opaque bytes. It records what was observed at a locator and when. It does not model first-class tombstones, negative existence, or inferred world state between observations.
 
 ---
 
 ## 1. Design Goal
 
-Farchive is a local, positive-observation archive for opaque byte payloads observed at opaque locators over time.
+Farchive provides:
 
-"Positive-observation" means: Farchive records what was observed, not what was absent. It does not model first-class tombstones, null-state transitions, or "resource not found" as core state. Absence, fetch failures, and transport-level negative outcomes belong in event metadata or higher-level profiles.
+- exact raw-byte storage
+- content identity by SHA-256 over raw bytes
+- locator-scoped span history
+- optional append-only event audit
+- transparent storage optimization under a stable semantic model
 
-Its job is to provide:
+Its design separates:
 
-- exact byte storage
-- content identity by digest
-- locator-scoped state history
-- fast latest and as-of lookup
-- transparent storage optimization
+- **semantics**: blobs, locators, state spans, observation time
+- **physical representation**: raw frames, zstd, zstd with dictionaries, locator-local deltas, and chunked large-blob storage
 
-Farchive is **not** a crawler, a semantic normalizer, a DVCS, or a distributed content system.
-
-The defining idea is:
-
-- **semantics** are about blobs, locators, and observed state history
-- **compression** is a storage profile layered underneath those semantics
+Compression is subordinate to correctness. No storage optimization may change user-visible bytes, digests, span history, or resolution results.
 
 ---
 
-## 2. Desiderata
+## 2. Terminology
 
-### 2.1 Exactness
-
-Stored bytes must round-trip exactly.
-Compression, repacking, and maintenance must never alter user-visible bytes.
-
-### 2.2 Stable content identity
-
-Blob identity is derived from raw bytes, not from compression format, metadata, or locator.
-
-### 2.3 Correct locator history
-
-The archive must preserve distinct historical runs of the same content at the same locator.
-A locator returning to an earlier blob after an intervening change must produce a new historical span.
-
-### 2.4 Cheap hot queries
-
-The archive should make the common queries cheap and boring:
-
-- latest known bytes for a locator
-- exact bytes by digest
-- state history for a locator
-- as-of resolution by locator and time
-
-### 2.5 Transparent storage policy
-
-Compression strategy is an implementation detail.
-Consumers always operate on raw bytes and logical history.
-
-### 2.6 Transactional safety
-
-User-visible writes must be atomic.
-
-### 2.7 Domain neutrality
-
-Locators are opaque strings.
-The archive does not impose URL semantics, canonicalization rules, or domain-specific provenance models.
-
-### 2.8 Small operational surface
-
-The semantic core should be small enough to reimplement cleanly.
-
-### 2.9 Evolvability
-
-Hashing, codecs, dictionary strategies, and metadata storage should be able to evolve without changing archive meaning.
-
-### 2.10 Practical density
-
-Storage optimization matters.
-Corpus-adaptive zstd dictionary compression is a first-class optimization profile, but it remains subordinate to correctness.
-
----
-
-## 3. Non-Goals
-
-Farchive is not:
-
-- a crawler or fetch scheduler
-- a semantic diff engine
-- a document normalization framework
-- a DVCS or commit graph
-- a peer-to-peer content network
-- a domain-specific legal archive format
-- a guarantee that the underlying resource did not change between observations
-
-Farchive stores **what was observed**, not what must have been true in the world between observations. It preserves what was observed at each locator over time, but does not infer unobserved world state between observations.
-
----
-
-## 4. Terminology
-
-### 4.1 Blob
+### 2.1 Blob
 
 A blob is an immutable raw byte string with content-derived identity.
 
-### 4.2 Digest
+### 2.2 Digest
 
-A digest is the archive's identifier for a blob. Computed over raw uncompressed bytes.
+A digest is the archive identifier for a blob. The official profile uses bare SHA-256 hex:
 
-The official profile uses bare SHA-256 hex: `<64-hex-chars>`.
+`<64 lowercase hex chars>`
 
-### 4.3 Locator
+Digest identity is computed over the **raw uncompressed bytes**.
 
-A locator is an opaque external key naming where content was observed.
+### 2.3 Locator
 
-Examples: HTTP URLs, S3 keys, application-specific schemes, filesystem paths.
+A locator is an opaque external key naming where bytes were observed.
+
+Examples: HTTP URLs, S3 keys, filesystem paths, application-specific keys.
 
 The archive does not interpret locator structure.
 
-### 4.4 State Span
+### 2.4 State Span
 
-A state span is a locator-scoped historical run during which the archive's best-known state for that locator was one blob.
+A state span is one contiguous locator-scoped run during which the archive’s best-known state for a locator was one blob.
 
-A span is not just `(locator, digest)` aggregated forever. It is one contiguous run in observation order.
+A span has:
 
-A state span has:
-
-- `observed_from` -- inclusive lower bound
-- `observed_until` -- exclusive upper bound, or NULL if current
-- `last_confirmed_at` -- latest observation confirming this span
+- `observed_from` — inclusive lower bound
+- `observed_until` — exclusive upper bound, or `NULL` if current
+- `last_confirmed_at` — latest confirming observation
 - `observation_count`
-- `last_metadata` -- optional caller-provided metadata snapshot
+- `last_metadata` — optional caller metadata snapshot
 
 Example:
 
@@ -160,124 +84,276 @@ This yields three spans:
 2. `B` from `t3` until `t4`, last confirmed at `t3`
 3. `A` from `t4` until open-ended, last confirmed at `t4`
 
-### 4.5 Event
+### 2.5 Event
 
-An event is an append-only audit record of an archive operation, including observations and selected maintenance operations.
+An event is an append-only audit record of an archive operation.
 
-Event logging is an **archive property**, not a session property. Once any session creates the event table (via `enable_events=True`), all subsequent sessions append events automatically, even if opened without `enable_events`. The `events()` read API works whenever the event table exists.
+Event logging is an **archive property**, not a session property. Once any session creates the event table (via `enable_events=True`), all later sessions append and can read events automatically.
 
-The implementation emits these event kinds:
+The official v2 profile emits these kinds:
 
-| Kind | Emitted by | Notes |
-|------|-----------|-------|
-| `fa.observe` | `observe()` | One per observation write |
-| `fa.store` | `store()` | One per combined put+observe; `fa.observe` is also emitted |
-| `fa.store_batch` | `store_batch()` | One summary event per batch call |
-| `fa.train_dict` | `train_dict()` | One per successful dictionary training |
-| `fa.repack` | `repack()` | One per repack call that repacks at least one blob |
+| Kind | Emitted by | Scope |
+|---|---|---|
+| `fa.observe` | successful observation writes | locator-scoped |
+| `fa.store` | `store()` | locator-scoped |
+| `fa.store_batch` | `store_batch()` | archive-wide |
+| `fa.train_dict` | `train_dict()` | archive-wide |
+| `fa.repack` | `repack()` when at least one blob is rewritten | archive-wide |
+| `fa.rechunk` | `rechunk()` when at least one blob is rewritten | archive-wide |
 
-For locator-scoped events (`fa.observe`, `fa.store`), `locator` is the affected locator and `digest` is the blob digest. For archive-wide maintenance events (`fa.store_batch`, `fa.train_dict`, `fa.repack`), `locator` is the empty string and `digest` is `None` unless relevant to the operation.
+For locator-scoped events (`fa.observe`, `fa.store`), `locator` is the affected locator and `digest` is the affected blob digest.
 
-Event metadata payloads (the `metadata` field on `Event`) are informative and not part of the frozen 1.x contract. The event kind strings and their emission conditions are frozen; the shape and keys of metadata may change in future 1.x releases.
+For archive-wide maintenance events (`fa.store_batch`, `fa.train_dict`, `fa.repack`, `fa.rechunk`), `locator` is the empty string and `digest` is `None` unless some future operation gives them a more specific meaning.
 
-State spans answer: what was the archive's best-known state for this locator?
+`Event.metadata` is **informative and semi-open**. Event kind strings and emission conditions are stable; metadata keys are not frozen.
 
-Events answer: what archive operations occurred?
+### 2.6 Storage Class
 
-### 4.6 Storage Class
+A storage class is a caller-provided compression hint such as `xml`, `html`, `pdf`, `text`, `binary`, `json`.
 
-A storage class is an implementation hint used for compression bucketing. Examples: `xml`, `html`, `pdf`, `text`, `binary`.
+Storage class is not normative MIME truth. It is an optimization bucket used for dictionary training and similar policy decisions.
 
-A storage class is not a normative statement of MIME truth. It is a storage-policy hint.
+### 2.7 Inline Representation
 
-In the official SQLite profile, `storage_class` is stored on the blob row as an insertion-time compression hint. If an identical digest is later observed with a different suggested storage class, the existing blob row is reused and the original hint remains unchanged.
+An inline representation is a blob stored directly in the `blob.payload` column, with one of these codecs:
+
+- `raw`
+- `zstd`
+- `zstd_dict`
+- `zstd_delta`
+
+### 2.8 Delta Representation
+
+A delta representation stores a blob as `zstd_delta` against one older base blob from the same locator.
+
+Delta is:
+
+- locator-local
+- depth-1 only
+- optional and policy-driven
+- invisible to readers
+
+At **selection time**, delta bases are drawn only from inline non-delta blobs (`raw`, `zstd`, `zstd_dict`).
+
+After later maintenance, a blob serving as the historical base of an existing delta **may** be physically rewritten to another non-delta representation such as `chunked`, as long as its raw bytes remain readable. Delta decompression depends on the base blob’s raw bytes, not on its original inline storage form.
+
+### 2.9 Chunked Representation
+
+A chunked representation stores a large blob as an ordered manifest of content-defined chunks.
+
+Chunks are stored in a separate `chunk` table and deduplicated archive-wide by their own SHA-256 digest. A chunked blob has:
+
+- one row in `blob` with `codec='chunked'`
+- `payload=NULL`
+- `stored_self_size=0`
+- one or more rows in `blob_chunk`
+
+Chunking is an **explicit maintenance optimization** in v2. It is applied by `rechunk()`, not by `store()` or `put_blob()`.
+
+### 2.10 Chunk
+
+A chunk is an immutable raw byte substring identified by SHA-256 of its raw bytes and stored independently in the `chunk` table.
 
 ---
 
-## 5. Core Semantic Invariants
+## 3. Core Semantic Invariants
 
-### 5.1 Digest over raw bytes
+### 3.1 Digest over raw bytes
 
 Blob identity MUST be computed over raw uncompressed bytes.
 
-### 5.2 Blob immutability
+### 3.2 Blob immutability
 
 Once a digest exists, the raw bytes associated with that digest MUST NOT change.
 
-### 5.3 Storage transparency
+### 3.3 Storage transparency
 
-Compression, repacking, dictionary retraining, and storage rewriting MUST NOT change:
+Physical representation changes MUST NOT change:
 
 - digest
 - raw bytes
 - locator history
-- query results
+- point-in-time resolution
+- event history already written
 
-### 5.4 Distinct historical runs stay distinct
+### 3.4 Distinct historical runs stay distinct
 
-The archive MUST NOT collapse two non-contiguous runs of the same digest at one locator into one span.
+Two non-contiguous runs of the same digest at one locator MUST remain two spans.
 
-### 5.5 At most one current span per locator
+### 3.5 At most one current span per locator
 
 At any instant, a locator has at most one open current span.
 
-### 5.6 History-preserving writes
+### 3.6 Exact dedup takes precedence
 
-Blob writes are immutable inserts. Event writes, if enabled, are append-only. Span history is preserving: a current span may be extended or closed, but past closed spans are not merged away.
+If raw bytes already exist in the archive, writing the same bytes again reuses the existing blob digest. Exact dedup happens before any delta decision.
 
-### 5.7 Transactional visibility
+### 3.7 Delta depth is one
 
-A user-visible write MUST be atomic with respect to:
+A delta blob MUST NOT reference another delta blob as its base.
 
-- blob insertion if needed
-- span mutation or insertion
-- optional event insertion
+### 3.8 Chunked blobs are semantically identical to inline blobs
 
-### 5.8 Exact read semantics
+Chunking is only a storage optimization. A chunked blob is still one logical blob with one digest and one raw byte string.
 
-All byte-returning reads MUST return exact raw bytes.
+### 3.9 Event log is append-only
+
+Once written, events are not rewritten or deleted by normal archive operations.
+
+### 3.10 Maintenance preserves meaning
+
+`train_dict()`, `repack()`, and `rechunk()` may change physical storage but MUST preserve raw bytes, digests, spans, and query results.
 
 ---
 
-## 6. Time Model
+## 4. Time Model
 
-### 6.1 Observation time
+### 4.1 Observation time
 
-Every observation has an `observed_at` instant in UTC. The official profile stores time as UTC Unix milliseconds (INTEGER).
+Every observation has an `observed_at` instant in UTC, stored as Unix milliseconds (`INTEGER`) in the official profile.
 
-### 6.2 Monotone write requirement
+### 4.2 Monotone write requirement
 
-The official profile REQUIRES observations for a given locator to be appended in nondecreasing `observed_at` order. An implementation MUST reject out-of-order observations rather than silently corrupt span history.
+Observations for a given locator MUST be appended in nondecreasing `observed_at` order.
 
-Additionally, a digest transition (Case C) at the exact same timestamp as the current span's `last_confirmed_at` is rejected. This prevents zero-duration spans. Same-timestamp confirmations of the same digest (Case B) are allowed.
+Out-of-order writes are rejected.
 
-### 6.3 Current span
+### 4.3 Same-timestamp digest transition rejection
+
+A digest transition at exactly the current span’s `last_confirmed_at` is rejected to prevent zero-duration spans.
+
+Same-timestamp confirmations of the same digest are allowed.
+
+### 4.4 Current span
 
 A span is current iff `observed_until IS NULL`.
 
-### 6.4 As-of resolution
+### 4.5 As-of resolution
 
 A span is active at instant `t` iff:
 
 - `observed_from <= t`
 - and either `observed_until IS NULL` or `t < observed_until`
 
-### 6.5 Implicit timestamp auto-bump
+### 4.6 Implicit timestamp auto-bump
 
-For calls without explicit `observed_at`, the implementation may internally adjust the generated timestamp to preserve span validity. Specifically:
+For calls without explicit `observed_at`, implementations may normalize generated times to keep span history valid:
 
-- Same-digest confirmation: timestamp is bumped to at least `last_confirmed_at`
-- Digest transition: timestamp is bumped to at least `last_confirmed_at + 1`
+- same-digest confirmation: bump to at least current `last_confirmed_at`
+- digest transition: bump to at least current `last_confirmed_at + 1`
 
-This ensures the default path (no explicit timestamps) is boring and safe. Callers who provide explicit timestamps get strict enforcement with no auto-adjustment.
+This normalization affects the effective observation time and therefore the `fa.observe` and `fa.store` event timestamps for that write.
 
 ---
 
-## 7. Core Operations (Frozen Public API)
+## 5. Physical Representation Semantics
 
-This section is the normative public API contract for farchive 1.x. Method names, parameter names, defaults, return types, and failure modes are frozen.
+### 5.1 Supported blob codecs
 
-### 7.1 Public Data Types
+The official v2 profile supports these blob codecs:
+
+- `raw`
+- `zstd`
+- `zstd_dict`
+- `zstd_delta`
+- `chunked`
+
+### 5.2 `raw`
+
+`payload` contains exact raw bytes.
+
+### 5.3 `zstd`
+
+`payload` contains vanilla zstd-compressed bytes.
+
+### 5.4 `zstd_dict`
+
+`payload` contains zstd-compressed bytes using a trained dictionary referenced by `codec_dict_id`.
+
+### 5.5 `zstd_delta`
+
+`payload` contains zstd-compressed bytes using prefix-delta mode against `base_digest`.
+
+`base_digest` references another blob whose raw bytes are used as the prefix base at decompression time.
+
+### 5.6 `chunked`
+
+`payload` is `NULL`. Raw bytes are reconstructed by concatenating chunk payloads in `blob_chunk.ordinal` order after decoding each referenced `chunk`.
+
+`blob_chunk.raw_offset` is preserved as manifest metadata and integrity aid, but reconstruction order is authoritative by `ordinal` in the official v2 profile.
+
+### 5.7 `stored_self_size`
+
+For a blob row, `stored_self_size` means:
+
+- inline codecs: physical size of the inline payload stored on that blob row
+- chunked: `0`
+
+Chunk payload bytes live in `chunk.stored_size`, not in `blob.stored_self_size`.
+
+### 5.8 Archive storage accounting
+
+`ArchiveStats.total_stored_bytes` SHOULD count archive-owned physical bytes:
+
+- sum of `blob.stored_self_size`
+- plus sum of unique chunk payload bytes in `chunk`
+- plus dictionary bytes in `dict`
+
+This is a whole-archive metric, not a per-blob attribution metric.
+
+### 5.9 Logical codec accounting for chunked blobs
+
+Because chunked blobs store `stored_self_size=0`, codec-level reporting for `chunked` blobs MAY expose an auxiliary informative metric such as `logical_stored`, representing archive-wide unique chunk bytes referenced by chunked blobs.
+
+This metric is informative only and is not a per-blob cost attribution.
+
+### 5.10 Live file footprint
+
+`ArchiveStats.db_file_bytes` is an informative live-footprint metric. It MAY include:
+
+- main database file bytes
+- WAL sidecar bytes
+- SHM sidecar bytes
+
+if such sidecars exist at measurement time.
+
+---
+
+## 6. Compression Policy
+
+`CompressionPolicy` is a policy object, not an archive semantic identity.
+
+```python
+@dataclass
+class CompressionPolicy:
+    raw_threshold: int = 64
+    auto_train_thresholds: dict[str, int] = {"xml": 1000, "html": 500, "pdf": 16}
+    dict_target_sizes: dict[str, int] = {"xml": 112*1024, "html": 112*1024, "pdf": 64*1024}
+    compression_level: int = 3
+
+    delta_enabled: bool = True
+    delta_min_size: int = 4 * 1024
+    delta_max_size: int = 8 * 1024 * 1024
+    delta_candidate_count: int = 4
+    delta_size_ratio_min: float = 0.5
+    delta_size_ratio_max: float = 2.0
+    delta_min_gain_ratio: float = 0.95
+    delta_min_gain_bytes: int = 128
+
+    chunk_enabled: bool = True
+    chunk_min_blob_size: int = 1 * 1024 * 1024
+    chunk_avg_size: int = 256 * 1024
+    chunk_min_size: int = 64 * 1024
+    chunk_max_size: int = 1 * 1024 * 1024
+    chunk_min_gain_ratio: float = 0.95
+    chunk_min_gain_bytes: int = 4096
+```
+
+The official profile uses the above defaults.
+
+---
+
+## 7. Public Data Types
 
 ```python
 @dataclass(frozen=True, slots=True)
@@ -285,27 +361,27 @@ class StateSpan:
     span_id: int
     locator: str
     digest: str
-    observed_from: int       # UTC Unix ms, inclusive
-    observed_until: int | None  # UTC Unix ms, exclusive; None = current
-    last_confirmed_at: int   # UTC Unix ms
+    observed_from: int
+    observed_until: int | None
+    last_confirmed_at: int
     observation_count: int
     last_metadata: dict[str, Any] | None = None
+
 
 @dataclass(frozen=True, slots=True)
 class Event:
     event_id: int
-    occurred_at: int         # UTC Unix ms
+    occurred_at: int
     locator: str
     digest: str | None
     kind: str
     metadata: dict[str, Any] | None
 
+
 @dataclass
 class CompressionPolicy:
-    raw_threshold: int = 64
-    auto_train_thresholds: dict[str, int]  # default: {"xml": 1000, "html": 500, "pdf": 16}
-    dict_target_sizes: dict[str, int]      # default: {"xml": 112*1024, "html": 112*1024, "pdf": 64*1024}
-    compression_level: int = 3
+    ...
+
 
 @dataclass
 class ImportStats:
@@ -315,10 +391,19 @@ class ImportStats:
     bytes_raw: int = 0
     bytes_stored: int = 0
 
+
 @dataclass
 class RepackStats:
     blobs_repacked: int = 0
     bytes_saved: int = 0
+
+
+@dataclass
+class RechunkStats:
+    blobs_rewritten: int = 0
+    chunks_added: int = 0
+    bytes_saved: int = 0
+
 
 @dataclass(frozen=True, slots=True)
 class ArchiveStats:
@@ -332,188 +417,152 @@ class ArchiveStats:
     codec_distribution: dict[str, dict]
     db_path: str
     schema_version: int
+    chunk_count: int
+    db_file_bytes: int
 ```
 
-### 7.2 `Farchive(db_path, *, compression, enable_events)`
-
-Constructor.
-
-| Parameter | Type | Default | Notes |
-|---|---|---|---|
-| `db_path` | `str \| Path` | `"archive.farchive"` | Created if absent; parent dirs created automatically |
-| `compression` | `CompressionPolicy \| None` | `None` (= default policy) | Storage optimization policy |
-| `enable_events` | `bool` | `False` | Creates event table if absent; once created, all sessions append |
-
-Context manager: `with Farchive(...) as fa:` ensures `close()` on exit.
-
-### 7.3 Write Operations
-
-#### `put_blob(data, *, storage_class) -> str`
-
-Store blob if absent. Return digest. Idempotent.
-
-| Parameter | Type | Default | Notes |
-|---|---|---|---|
-| `data` | `bytes` | required | Raw bytes to store |
-| `storage_class` | `str \| None` | `None` | Compression hint; uses trained dict if available |
-
-Returns: SHA-256 hex digest (64 chars). Semantic write cost is O(data size); may additionally trigger policy-driven auto-training on threshold crossing.
-
-#### `observe(locator, digest, *, observed_at, metadata) -> StateSpan`
-
-Record an observation. Digest MUST already exist (call `put_blob` first).
-
-| Parameter | Type | Default | Notes |
-|---|---|---|---|
-| `locator` | `str` | required | Opaque external key |
-| `digest` | `str` | required | Must reference existing blob |
-| `observed_at` | `int \| None` | `None` (= now) | UTC Unix ms; explicit values get strict monotone enforcement |
-| `metadata` | `dict \| None` | `None` | `None` = no-update (preserves existing); `{}` = valid empty dict |
-
-Returns: the resulting `StateSpan` (created or extended).
-
-Semantics:
-- **Case A (no current span):** create new open span
-- **Case B (same digest):** extend current span (`last_confirmed_at` updated, `observation_count` incremented)
-- **Case C (different digest):** close current span, create new open span
-
-Timestamp behavior:
-- Explicit `observed_at`: strict monotone enforcement, raises on violation
-- Implicit (None): auto-bumps to maintain monotonicity (6.5)
-
-Failures: see section 8.
-
-#### `store(locator, data, *, observed_at, storage_class, metadata) -> str`
-
-`put_blob(data)` + `observe(locator, digest)`. Atomic: if either part fails, neither persists.
-
-| Parameter | Type | Default | Notes |
-|---|---|---|---|
-| `locator` | `str` | required | |
-| `data` | `bytes` | required | |
-| `observed_at` | `int \| None` | `None` | Forwarded to `observe()` |
-| `storage_class` | `str \| None` | `None` | Forwarded to `put_blob()` |
-| `metadata` | `dict \| None` | `None` | Forwarded to `observe()` |
-
-Returns: SHA-256 hex digest.
-
-#### `store_batch(items, *, observed_at, storage_class, progress) -> ImportStats`
-
-Bulk store. Atomic: entire batch rolls back on failure.
-
-| Parameter | Type | Default | Notes |
-|---|---|---|---|
-| `items` | `list[tuple[str, bytes]]` | required | `(locator, data)` tuples |
-| `observed_at` | `int \| None` | `None` | Shared timestamp for all items; `None` = per-item now |
-| `storage_class` | `str \| None` | `None` | Applied to all items |
-| `progress` | `Callable[[int, int], None] \| None` | `None` | Called every 1000 items with (current, total) |
-
-Returns: `ImportStats`. Maintenance: triggers auto-train check after batch (non-fatal).
-
-### 7.4 Read Operations
-
-#### `read(digest) -> bytes | None`
-
-Returns exact raw bytes for a digest, or `None` if absent. Bounded: O(blob size).
-
-#### `resolve(locator, *, at) -> StateSpan | None`
-
-| Parameter | Type | Default | Notes |
-|---|---|---|---|
-| `locator` | `str` | required | |
-| `at` | `int \| None` | `None` | `None` = current span; otherwise point-in-time (6.4) |
-
-Returns: `StateSpan` or `None` if no matching span.
-
-#### `get(locator, *, at) -> bytes | None`
-
-Convenience: `resolve(locator, at=at)` then `read(span.digest)`. Returns `None` if no span or blob missing.
-
-#### `history(locator) -> list[StateSpan]`
-
-All spans for a locator, newest first (`observed_from DESC`). Empty list if locator unknown.
-
-#### `has(locator, *, max_age_hours) -> bool`
-
-| Parameter | Type | Default | Notes |
-|---|---|---|---|
-| `locator` | `str` | required | |
-| `max_age_hours` | `float` | `inf` | Freshness check against `last_confirmed_at` |
-
-Returns `True` if locator has an open span within the freshness window.
-
-#### `locators(pattern) -> list[str]`
-
-| Parameter | Type | Default | Notes |
-|---|---|---|---|
-| `pattern` | `str` | `"%"` | SQL LIKE pattern |
-
-Returns distinct locators matching the pattern, sorted alphabetically.
-
-#### `events(locator, *, since, limit) -> list[Event]`
-
-| Parameter | Type | Default | Notes |
-|---|---|---|---|
-| `locator` | `str \| None` | `None` | Filter by locator; `None` = all |
-| `since` | `int \| None` | `None` | Filter: `occurred_at >= since` |
-| `limit` | `int` | `1000` | Maximum events returned |
-
-Returns events newest-first. Returns empty list if the archive has no event table (i.e. no session has ever created it via `enable_events=True`). Once the event table exists, all sessions can read the full event history.
-
-### 7.5 Maintenance Operations
-
-Maintenance operations are explicit, bounded, and do not alter archive semantics.
-
-#### `train_dict(*, storage_class, sample_size) -> int`
-
-| Parameter | Type | Default | Notes |
-|---|---|---|---|
-| `storage_class` | `str` | required | Global dicts not supported |
-| `sample_size` | `int` | `500` | Max samples to use for training |
-
-Returns: `dict_id`. New blobs of that storage class use the dict immediately. Does NOT auto-repack existing blobs.
-
-Failures: `ValueError` if `storage_class` not provided or fewer than 10 eligible samples.
-
-#### `repack(*, dict_id, storage_class, batch_size) -> RepackStats`
-
-| Parameter | Type | Default | Notes |
-|---|---|---|---|
-| `dict_id` | `int \| None` | `None` | Explicit dict; if `None`, uses latest for `storage_class` |
-| `storage_class` | `str \| None` | `None` | Required if `dict_id` is `None` |
-| `batch_size` | `int` | `1000` | Max *successful repacks* per call (not rows examined) |
-
-Targets only vanilla-zstd blobs without a dictionary. Does NOT re-dict blobs already compressed with an older dictionary. `batch_size` caps successful repacks, not rows examined — `blobs_repacked == 0` reliably means "nothing repackable remains." Call repeatedly until `blobs_repacked == 0` for full repack.
-
-Failures: `ValueError` if neither `storage_class` nor `dict_id` provided, if dict not found, or if storage class mismatches dict.
-
-#### `stats() -> ArchiveStats`
-
-Non-semantic reporting snapshot. Read-only, bounded.
-
-#### `close() -> None`
-
-Close the database connection. Idempotent. Called automatically when using the context manager (`with Farchive(...) as fa:`).
+`codec_distribution` is informative. Implementations SHOULD expose at least `count`, `raw`, and `stored`-style counters, and MAY add codec-specific keys such as `logical_stored`.
 
 ---
 
-## 8. Failure Modes
+## 8. Core Operations
 
-The following error behaviors are part of the public contract:
+### 8.1 Constructor
 
-| Condition | Exception | Message pattern |
-|---|---|---|
-| `observe(locator, missing_digest)` | `ValueError` | "not found — call put_blob() first" |
-| Out-of-order observation | `ValueError` | "Out-of-order observation" |
-| Same-timestamp digest change | `ValueError` | "Same-timestamp digest change" |
-| Non-dict metadata (e.g. list) | `TypeError` | "metadata must be a dict or None" |
-| Non-JSON-serializable metadata | `TypeError` | "metadata must be JSON-serializable" |
-| `repack()` without scoping | `ValueError` | "requires storage_class or dict_id" |
-| `repack()` with mismatched dict/class | `ValueError` | "does not match dict" |
-| `repack()` with unknown `dict_id` | `ValueError` | "dict_id {id} not found" |
-| `train_dict()` without storage_class | `ValueError` | "requires storage_class" |
-| `train_dict()` with <10 samples | `ValueError` | "Need at least 10 samples" |
-| DB version newer than library | `RuntimeError` | "Upgrade farchive" |
+#### `Farchive(db_path="archive.farchive", *, compression=None, enable_events=False)`
+
+Creates or opens an archive.
+
+- `db_path`: SQLite file path
+- `compression`: `CompressionPolicy | None`
+- `enable_events`: creates the event table if absent
+
+Context manager use (`with Farchive(...) as fa:`) closes the connection automatically.
+
+### 8.2 `put_blob(data, *, storage_class=None) -> str`
+
+Stores a blob if absent and returns its digest.
+
+Semantics:
+
+- exact dedup only
+- may use trained dictionaries
+- does **not** use delta (no locator context)
+- does **not** use chunking in v2
+- may trigger best-effort auto-training after a successful semantic write
+
+### 8.3 `observe(locator, digest, *, observed_at=None, metadata=None) -> StateSpan`
+
+Records an observation of an existing digest at a locator.
+
+Cases:
+
+- no current span → create new span
+- same digest → extend current span
+- different digest → close old span and create new span
+
+### 8.4 `store(locator, data, *, observed_at=None, storage_class=None, metadata=None) -> str`
+
+Atomic `put_blob(data)` + `observe(locator, digest)`.
+
+Semantics:
+
+- exact dedup first
+- may use trained dictionaries
+- may use locator-local delta if beneficial
+- does **not** use chunking automatically in v2
+- emits `fa.observe` and `fa.store` when event history exists
+
+### 8.5 `store_batch(items, *, observed_at=None, storage_class=None, progress=None) -> ImportStats`
+
+Stores `(locator, data)` items in one atomic batch.
+
+Semantics:
+
+- all-or-nothing for the batch
+- each item still follows exact dedup and optional delta rules
+- items later in the same batch may observe state written earlier in the same batch
+- may emit many `fa.observe` events and one `fa.store_batch` summary event
+
+`progress(current, total)` MAY be called every 1000 scanned items.
+
+### 8.6 `read(digest) -> bytes | None`
+
+Returns exact raw bytes for a digest, regardless of physical representation.
+
+### 8.7 `resolve(locator, *, at=None) -> StateSpan | None`
+
+Returns:
+
+- current span if `at is None`
+- unique active span at time `at` otherwise
+
+### 8.8 `get(locator, *, at=None) -> bytes | None`
+
+Convenience: `resolve()` followed by `read()`.
+
+### 8.9 `history(locator) -> list[StateSpan]`
+
+All spans for a locator, newest first.
+
+### 8.10 `has(locator, *, max_age_hours=float("inf")) -> bool`
+
+Returns `True` iff locator has a current span and, when a finite freshness window is supplied, that span is fresh enough.
+
+### 8.11 `locators(pattern="%") -> list[str]`
+
+Returns distinct locators matching a SQL `LIKE` pattern, sorted lexicographically.
+
+### 8.12 `events(locator=None, *, since=None, limit=1000) -> list[Event]`
+
+Returns newest-first events filtered by locator and/or lower time bound.
+
+Returns empty list if the archive has no event table.
+
+### 8.13 `train_dict(*, storage_class, sample_size=500) -> int`
+
+Trains a zstd dictionary from sampled raw bytes in one storage class and returns `dict_id`.
+
+Semantics:
+
+- storage-class scoped only
+- new blobs of that class use it immediately
+- existing blobs are unchanged until `repack()`
+- sampling operates over raw bytes, regardless of whether the sampled blobs are inline, delta, or chunked
+
+### 8.14 `repack(*, dict_id=None, storage_class=None, batch_size=1000) -> RepackStats`
+
+Recompresses eligible vanilla-zstd inline blobs to `zstd_dict`.
+
+Semantics:
+
+- targets only blobs with `codec='zstd'` and no dictionary
+- does not touch `raw`, `zstd_delta`, or `chunked`
+- `batch_size` caps **successful repacks**, not rows examined
+- one call is atomic
+
+### 8.15 `rechunk(*, storage_class=None, batch_size=100, min_blob_size=None) -> RechunkStats`
+
+Converts eligible inline or delta blobs to `chunked` representation when beneficial.
+
+Semantics:
+
+- explicit maintenance operation
+- requires chunking capability (`pyfastcdc` or equivalent)
+- respects `chunk_enabled`
+- candidates are non-chunked blobs with `raw_size >= min_blob_size`
+- may rewrite `raw`, `zstd`, `zstd_dict`, or `zstd_delta` blobs
+- `batch_size` caps **blobs rewritten per call**
+- each blob rewrite is atomic; the whole call is not required to be all-or-nothing
+- emits one `fa.rechunk` event if at least one blob is rewritten
+
+### 8.16 `stats() -> ArchiveStats`
+
+Returns an informative archive snapshot.
+
+### 8.17 `close() -> None`
+
+Closes the database connection. Using the instance afterward is invalid except via reopening a new instance.
 
 ---
 
@@ -521,273 +570,406 @@ The following error behaviors are part of the public contract:
 
 ### 9.1 Type contract
 
-Metadata MUST be a JSON object (`dict[str, Any]` where values are JSON-serializable) or `None`. The runtime enforces this — non-serializable values raise `TypeError`.
+Span metadata MUST be a JSON object (`dict[str, Any]` where values are JSON-serializable) or `None`.
 
-### 9.2 Metadata on span confirmation
+### 9.2 Confirmation behavior
 
-When `observe()` is called with the same digest (Case B, extending a span):
+On same-digest confirmation:
 
-- `metadata={"key": "val"}` — replaces span's `last_metadata`
-- `metadata=None` — preserves existing metadata (no-op, not "clear")
+- `metadata={"k": "v"}` replaces `last_metadata`
+- `metadata=None` preserves existing metadata
+- `{}` is a valid empty metadata object
 
-This means callers can confirm a span without losing its metadata.
+### 9.3 Event metadata
 
-### 9.3 Python vs SQLite representation
-
-- **Python API:** `dict[str, Any] | None` (structured)
-- **SQLite storage:** `last_metadata_json TEXT` (JSON text)
-
-The library handles serialization/deserialization transparently.
+`Event.metadata` is semi-open and informative. It is not part of the frozen semantic core.
 
 ---
 
-## 10. Compression Semantics
+## 10. Delta Encoding Semantics
 
-Compression is a storage concern, not an archive-identity concern.
+### 10.1 Scope
 
-### 10.1 Required properties
+Delta encoding is only considered by `store()` and `store_batch()`, because both know the locator being updated.
 
-Any compression strategy MUST satisfy: exact reversibility, raw-byte round-trip, no digest change, no history change.
+### 10.2 Candidate pool
 
-### 10.2 Repacking
+Candidate bases are drawn from recent unique digests previously observed at the same locator, filtered by policy:
 
-Repacking MAY rewrite stored blob payloads and storage metadata. Repacking MUST preserve: digest, raw bytes, spans, events, query semantics.
+- count cap: `delta_candidate_count`
+- raw size lower bound: `delta_min_size`
+- raw size ratio bounds: `delta_size_ratio_min` / `delta_size_ratio_max`
 
-The official profile requires `storage_class` or an explicit `dict_id` for repack operations to prevent cross-applying a dictionary trained on one storage class to blobs of another.
+### 10.3 Base selection eligibility
 
-**Scope of repack in v1:** `repack()` targets only **vanilla-zstd blobs without a dictionary** (`codec='zstd' AND codec_dict_id IS NULL`). It does **not** upgrade blobs already compressed with an older dictionary to a newer dictionary. If a better dictionary is trained later, only new blobs use it automatically; re-dicting existing dict-compressed blobs is a post-1.0 feature.
+At selection time, a base blob MUST be inline and non-delta (`raw`, `zstd`, or `zstd_dict`).
 
-### 10.3 Dictionaries
+Chunked blobs are not selected as delta bases in the official v2 profile.
 
-An implementation MAY train and use corpus-specific compression dictionaries. Dictionary usage is storage-only and MUST be invisible to readers.
+### 10.4 Selection rule
 
----
+Delta is used only when it beats the best inline frame by both thresholds:
 
-## 11. Field Taxonomy
+- relative gain: `delta_min_gain_ratio`
+- absolute gain: `delta_min_gain_bytes`
 
-### Closed fields
+Thresholds are evaluated against the best inline frame, not against other delta candidates.
 
-Archive-owned enums whose meaning is normative.
+### 10.5 Depth
 
-- `codec`: `'raw' | 'zstd'`
+Delta depth is exactly one. Implementations MUST NOT build chains of deltas.
 
-### Semi-open fields
+### 10.6 Exact dedup precedence
 
-Caller-extensible strings with recommended conventions.
-
-- `storage_class`: e.g. `xml`, `html`, `pdf`, `text`, `binary`
-- `event.kind`: namespaced strings such as `fa.observe`, `fa.store`, `fa.fetch.ok`
-
-### Open fields
-
-Caller-owned semantic payloads.
-
-- `locator: str`
-- `metadata: Mapping[str, Any] | None`
-
-In Python APIs these are structured values. In the SQLite profile they are persisted as JSON text in `*_metadata_json` columns.
+If the new raw bytes already exist as a digest, that exact digest is reused and no delta blob is created.
 
 ---
 
-## 12. Official SQLite Single-File Profile
+## 11. Chunking Semantics
 
-### 12.1 Configuration
+### 11.1 Scope
+
+Chunking is a maintenance transformation in v2. `store()` and `put_blob()` do not produce `chunked` blobs automatically.
+
+### 11.2 Capability requirement
+
+The official profile uses FastCDC-style content-defined chunking. If the chunking implementation is unavailable, all non-chunking archive operations still work, but `rechunk()` MUST fail cleanly.
+
+### 11.3 Benefit rule
+
+`rechunk()` rewrites a blob only if chunking reduces incremental archive-owned bytes enough to beat both thresholds:
+
+- `chunk_min_gain_ratio`
+- `chunk_min_gain_bytes`
+
+The comparison baseline is the blob’s current inline `stored_self_size`.
+
+### 11.4 Manifest structure
+
+Each chunked blob has ordered `blob_chunk` rows keyed by:
+
+- `blob_digest`
+- `ordinal`
+- `raw_offset`
+- `chunk_digest`
+
+`ordinal` is authoritative for reconstruction order in the official v2 profile.
+
+### 11.5 Repeated chunks
+
+A blob may reference the same chunk digest multiple times at different ordinals and offsets.
+
+### 11.6 Integrity expectations
+
+Readers SHOULD validate that a chunked manifest is structurally sane. At minimum:
+
+- at least one chunk row exists
+- ordinals are contiguous from `0`
+- reconstructed byte length matches `blob.raw_size`
+
+### 11.7 Archive-wide chunk dedup
+
+Chunks are deduplicated across the whole archive, not per locator or per storage class.
+
+---
+
+## 12. Event Semantics
+
+### 12.1 `fa.observe`
+
+One event per successful observation write. `occurred_at` is the effective observation time after any implicit timestamp normalization.
+
+### 12.2 `fa.store`
+
+One event per successful `store()` call. For a given store, its `fa.store.occurred_at` SHOULD equal the corresponding `fa.observe.occurred_at`.
+
+### 12.3 `fa.store_batch`
+
+One summary event per successful batch call.
+
+### 12.4 `fa.train_dict`
+
+One event per successful dictionary training.
+
+### 12.5 `fa.repack`
+
+One event per successful repack call that rewrites at least one blob.
+
+### 12.6 `fa.rechunk`
+
+One event per successful rechunk call that rewrites at least one blob.
+
+---
+
+## 13. Failure Modes
+
+The following behaviors are part of the public contract:
+
+| Condition | Exception | Message pattern |
+|---|---|---|
+| `observe(locator, missing_digest)` | `ValueError` | `not found — call put_blob() first` |
+| Out-of-order observation | `ValueError` | `Out-of-order observation` |
+| Same-timestamp digest change | `ValueError` | `Same-timestamp digest change` |
+| Non-dict metadata | `TypeError` | `metadata must be a dict or None` |
+| Non-JSON-serializable metadata | `TypeError` | `metadata must be JSON-serializable` |
+| `repack()` without scoping | `ValueError` | `requires storage_class or dict_id` |
+| `repack()` with mismatched dict/class | `ValueError` | `does not match` |
+| `repack()` with unknown `dict_id` | `ValueError` | `dict_id ... not found` |
+| `train_dict()` without storage class | `ValueError` | `requires storage_class` |
+| `train_dict()` with too few samples | `ValueError` | `Need at least 10 samples` |
+| `rechunk()` without chunking capability | `ValueError` | `requires pyfastcdc` or equivalent |
+| `rechunk()` when chunking policy disabled | `ValueError` | `chunking not enabled` |
+| DB version newer than library | `RuntimeError` | `Upgrade farchive` |
+
+Corruption of delta or chunk manifests is not considered a normal caller error. Implementations MAY raise `ValueError`, `RuntimeError`, or codec-specific exceptions on corrupted archives.
+
+---
+
+## 14. Transactionality
+
+### 14.1 `store()`
+
+Atomic with respect to:
+
+- blob insertion if needed
+- span update/insert
+- `fa.observe`
+- `fa.store`
+
+### 14.2 `observe()`
+
+Atomic with respect to:
+
+- span update/insert
+- `fa.observe`
+
+### 14.3 `store_batch()`
+
+All-or-nothing for the whole batch.
+
+### 14.4 `train_dict()`
+
+Atomic per call.
+
+### 14.5 `repack()`
+
+Atomic per call.
+
+### 14.6 `rechunk()`
+
+Atomic per rewritten blob. A call may partially complete across multiple blobs and return aggregate stats for the successful rewrites.
+
+---
+
+## 15. Official SQLite Single-File Profile v3
+
+### 15.1 Configuration
 
 - SQLite WAL mode
 - `busy_timeout = 5000`
 - `foreign_keys = ON`
-- Default transaction mode (not autocommit) for atomic `with conn:` blocks
-- POSIX advisory file lock for single-writer coordination across processes
-- Not thread-safe (one instance per thread)
+- default transaction mode for atomic `with conn:` blocks
+- POSIX advisory file lock for single-writer coordination
+- no thread sharing of one `sqlite3` connection
 
-### 12.2 Schema (v1)
+### 15.2 Schema
 
 ```sql
 CREATE TABLE schema_info (
-    version            INTEGER NOT NULL,
-    created_at         INTEGER NOT NULL,
-    migrated_at        INTEGER,
-    generator          TEXT
+    version             INTEGER NOT NULL,
+    created_at          INTEGER NOT NULL,
+    migrated_at         INTEGER,
+    generator           TEXT
 );
 
 CREATE TABLE dict (
-    dict_id            INTEGER PRIMARY KEY,
-    storage_class      TEXT NOT NULL DEFAULT '',
-    trained_at         INTEGER NOT NULL,
-    sample_count       INTEGER NOT NULL,
-    dict_bytes         BLOB NOT NULL,
-    dict_size          INTEGER NOT NULL
+    dict_id             INTEGER PRIMARY KEY,
+    storage_class       TEXT NOT NULL DEFAULT '',
+    trained_at          INTEGER NOT NULL,
+    sample_count        INTEGER NOT NULL,
+    dict_bytes          BLOB NOT NULL,
+    dict_size           INTEGER NOT NULL
 );
 
 CREATE TABLE blob (
-    digest             TEXT PRIMARY KEY,
-    payload            BLOB NOT NULL,
-    raw_size           INTEGER NOT NULL,
-    stored_size        INTEGER NOT NULL,
-    codec              TEXT NOT NULL CHECK (codec IN ('raw', 'zstd')),
-    codec_dict_id      INTEGER REFERENCES dict(dict_id),
-    storage_class      TEXT,
-    created_at         INTEGER NOT NULL
+    digest              TEXT PRIMARY KEY,
+    payload             BLOB,
+    raw_size            INTEGER NOT NULL,
+    stored_self_size    INTEGER NOT NULL,
+    codec               TEXT NOT NULL CHECK (
+                            codec IN ('raw', 'zstd', 'zstd_dict', 'zstd_delta', 'chunked')
+                        ),
+    codec_dict_id       INTEGER REFERENCES dict(dict_id),
+    base_digest         TEXT REFERENCES blob(digest),
+    storage_class       TEXT,
+    created_at          INTEGER NOT NULL,
+    CHECK (
+        (codec = 'chunked' AND payload IS NULL)
+        OR
+        (codec <> 'chunked' AND payload IS NOT NULL)
+    ),
+    CHECK (
+        (codec = 'zstd_dict' AND codec_dict_id IS NOT NULL)
+        OR
+        (codec <> 'zstd_dict')
+    ),
+    CHECK (
+        (codec = 'zstd_delta' AND base_digest IS NOT NULL)
+        OR
+        (codec <> 'zstd_delta' AND base_digest IS NULL)
+    )
+);
+
+CREATE TABLE chunk (
+    chunk_digest        TEXT PRIMARY KEY,
+    payload             BLOB NOT NULL,
+    raw_size            INTEGER NOT NULL,
+    stored_size         INTEGER NOT NULL,
+    codec               TEXT NOT NULL CHECK (
+                            codec IN ('raw', 'zstd', 'zstd_dict')
+                        ),
+    codec_dict_id       INTEGER REFERENCES dict(dict_id),
+    created_at          INTEGER NOT NULL,
+    CHECK (
+        (codec = 'zstd_dict' AND codec_dict_id IS NOT NULL)
+        OR
+        (codec <> 'zstd_dict')
+    )
+);
+
+CREATE TABLE blob_chunk (
+    blob_digest         TEXT NOT NULL REFERENCES blob(digest),
+    ordinal             INTEGER NOT NULL,
+    raw_offset          INTEGER NOT NULL,
+    chunk_digest        TEXT NOT NULL REFERENCES chunk(chunk_digest),
+    PRIMARY KEY (blob_digest, ordinal)
 );
 
 CREATE TABLE locator_span (
-    span_id            INTEGER PRIMARY KEY,
-    locator            TEXT NOT NULL,
-    digest             TEXT NOT NULL REFERENCES blob(digest),
-    observed_from      INTEGER NOT NULL,
-    observed_until     INTEGER,
-    last_confirmed_at  INTEGER NOT NULL,
-    observation_count  INTEGER NOT NULL DEFAULT 1,
-    last_metadata_json TEXT
+    span_id             INTEGER PRIMARY KEY,
+    locator             TEXT NOT NULL,
+    digest              TEXT NOT NULL REFERENCES blob(digest),
+    observed_from       INTEGER NOT NULL,
+    observed_until      INTEGER,
+    last_confirmed_at   INTEGER NOT NULL,
+    observation_count   INTEGER NOT NULL DEFAULT 1,
+    last_metadata_json  TEXT
 );
 
 CREATE UNIQUE INDEX idx_span_one_open
     ON locator_span(locator) WHERE observed_until IS NULL;
+
 CREATE INDEX idx_span_locator
     ON locator_span(locator, observed_from DESC);
+
 CREATE INDEX idx_span_locator_time
     ON locator_span(locator, observed_from, observed_until);
 
--- Optional, only when enable_events = True
+CREATE INDEX idx_blob_base
+    ON blob(base_digest);
+
+CREATE INDEX idx_blob_chunk_ref
+    ON blob_chunk(chunk_digest);
+
+-- optional
 CREATE TABLE event (
-    event_id           INTEGER PRIMARY KEY,
-    occurred_at        INTEGER NOT NULL,
-    locator            TEXT NOT NULL,
-    digest             TEXT,
-    kind               TEXT NOT NULL,
-    metadata_json      TEXT
+    event_id            INTEGER PRIMARY KEY,
+    occurred_at         INTEGER NOT NULL,
+    locator             TEXT NOT NULL,
+    digest              TEXT,
+    kind                TEXT NOT NULL,
+    metadata_json       TEXT
 );
 
 CREATE INDEX idx_event_locator_time
     ON event(locator, occurred_at DESC);
 ```
 
-### 12.3 Blob table notes
+### 15.3 Chunk table notes
 
-- `payload` stores the physical bytes as encoded by `codec`.
-- `codec='raw'` means `payload` is exact raw bytes.
-- `codec='zstd'` means `payload` is zstd-compressed bytes.
-- `codec_dict_id` MAY be set when zstd used a trained dictionary.
-- The meaning of the blob is always the raw bytes identified by `digest`, not the physical `payload`.
-- `storage_class` is an insertion-time compression hint, not semantic MIME truth. First-insert wins for deduped blobs.
+Chunk rows are shared across blobs. A chunk row’s meaning is its raw bytes, not its physical payload encoding.
 
-### 12.4 Locator span table notes
+### 15.4 Blob table notes
 
-- `observed_from` is inclusive.
-- `observed_until` is exclusive.
-- The current span has `observed_until IS NULL`.
-- There is at most one open current span per locator (enforced by partial unique index).
-- `last_metadata_json` stores caller metadata as JSON text; the Python API deserializes it to `dict | None`.
+- inline blob codecs use `payload`
+- chunked blobs use `payload=NULL`
+- `stored_self_size` excludes chunk bytes
+- `base_digest` is only valid for `zstd_delta`
 
 ---
 
-## 13. Official Zstd Adaptive Compression Profile
+## 16. Migration and Compatibility
 
-### 13.1 Codec families
+### 16.1 Schema versions
 
-The official profile supports three compression modes:
+- schema 1: legacy profile without delta or chunking
+- schema 2: legacy profile with delta, without chunking
+- schema 3: v2 profile with delta and chunking support
 
-1. **Raw** -- blobs below `raw_threshold` (default 64 bytes)
-2. **Vanilla zstd** -- standard compression, no dictionary
-3. **Dictionary zstd** -- `codec_dict_id` references a trained dictionary
+### 16.2 Current write format
 
-### 13.2 CompressionPolicy
+A v2 writer writes schema version 3.
 
-```python
-@dataclass
-class CompressionPolicy:
-    raw_threshold: int = 64
-    auto_train_thresholds: dict[str, int] = {"xml": 1000, "html": 500, "pdf": 16}
-    dict_target_sizes: dict[str, int] = {"xml": 112*1024, "html": 112*1024, "pdf": 64*1024}
-    compression_level: int = 3
-```
+### 16.3 Supported upgrades
 
-These are policy defaults, not spec law. An implementation MAY choose different defaults.
+The official implementation may migrate schema 1 and 2 archives in place to schema 3 on open.
 
-### 13.3 Dictionary usage vs auto-training
+### 16.4 Compatibility promise
 
-Dictionary **usage** and **auto-training** are decoupled:
+A `.farchive` written by a 2.x writer in schema 3 MUST remain readable by later 2.x releases.
 
-- Any storage class with a trained dictionary will use it for new blob writes, regardless of whether that class is in `auto_train_thresholds`.
-- `auto_train_thresholds` only governs **automatic** training. Storage classes not listed can still have dictionaries trained manually via `train_dict()`, and those dictionaries will be used.
-- `put_blob()`, `store()`, and `store_batch()` all resolve and use the latest trained dictionary for the given storage class.
+### 16.5 Future versions
 
-### 13.4 Auto-training
-
-When enough blobs of a storage class listed in `auto_train_thresholds` accumulate, the archive auto-trains a zstd dictionary. New blobs of that class immediately use the trained dictionary.
-
-Recompression of older blobs is **not automatic** -- it requires an explicit `repack()` call. This keeps write latency predictable and separates semantic operations (store/observe) from maintenance operations (repack).
-
-Auto-training is **best-effort and non-fatal**. If training fails (insufficient samples, internal error), the semantic write that triggered it has already succeeded. Failures are reported via `warnings.warn`, not exceptions. Manual `train_dict()` and `repack()` are the strict maintenance APIs.
-
-Auto-training MUST NOT alter archive semantics.
+If a database schema version is newer than the library supports, opening MUST fail clearly rather than risk silent corruption.
 
 ---
 
-## 14. HTTP Integration Conventions
+## 17. Platform and Concurrency
 
-Farchive core is transport-neutral. HTTP is one source of observations. This section documents recommended conventions for callers that integrate HTTP sources.
+### 17.1 Threading
 
-HTTP fetching is NOT implemented in the farchive library. The caller fetches bytes using their preferred HTTP library and calls `store()`.
+One `Farchive` instance is not thread-safe and must not be used concurrently across threads without external synchronization.
 
-### 14.1 Archived bytes
+### 17.2 Multi-process writes
 
-Store **response body bytes** after HTTP framing is removed.
+On POSIX platforms, file locking serializes writers across processes.
 
-### 14.2 Headers and metadata
+### 17.3 No-lock fallback
 
-- Full response headers go in `event metadata["http"]["response_headers"]` as ordered `[name, value]` pairs.
-- Span metadata holds only a small latest summary (e.g. `etag`, `last_modified`, `content_type`).
-- Headers MUST be stored as ordered pairs, not a dict (header names can repeat).
+On platforms without `fcntl`, the archive falls back to no file lock. This is safe only when the caller ensures a single writer at a time.
 
-### 14.3 304 Not Modified
+### 17.4 Async adapters
 
-A 304 can be represented by re-observing the current span's digest at the locator. The current span gets `last_confirmed_at` updated and `observation_count` incremented. No new blob, no span transition.
-
-### 14.4 Errors
-
-Transport errors (timeout, connection failure) are not represented in core span semantics. Callers may record them in event metadata (if events are enabled) or track them externally.
+Any future async API is an adapter over the same semantic model and on-disk format.
 
 ---
 
-## 15. File Extension
+## 18. Non-Goals
 
-The official file extension is `.farchive`. Default filename: `archive.farchive`. Lock file: `<name>.writer.lock`.
+Farchive is not:
 
----
+- a crawler
+- a fetch scheduler
+- a semantic diff engine
+- a DVCS commit graph
+- a generalized rsync transport
+- a distributed sync engine
+- a domain-specific archival standard
 
-## 16. Compatibility Promise
-
-### 16.1 On-disk format
-
-A `.farchive` file written by farchive 1.x MUST remain readable by later farchive 1.x releases. Schema version 1 is the 1.0 schema.
-
-### 16.2 Unknown columns
-
-Readers MUST tolerate unknown columns in existing tables (ignore them). This allows forward-compatible schema extensions without breaking older readers.
-
-### 16.3 Pre-1.0 databases
-
-Pre-1.0 databases (v0.x) are not guaranteed to be compatible. Users should recreate archives from source data when upgrading to 1.0.
-
-### 16.4 Writer version
-
-A 1.x writer MUST NOT write a schema version higher than the one it declares. Schema bumps require a new minor version at minimum.
-
-### 16.5 Platform
-
-POSIX file locking (fcntl) provides multi-process writer serialization. On platforms without fcntl (Windows), the archive falls back to no file locking — safe only when the caller ensures a single writer at a time. Cross-platform multi-process locking is a post-1.0 goal.
+It stores **what was observed**, not all possible inferences about what was true between observations.
 
 ---
 
-## 17. Concurrency Model
+## 19. Summary
 
-The Farchive core API is synchronous. Both the underlying storage engine (Python's `sqlite3`) and the compression library (`python-zstandard`) are synchronous, thread-affine interfaces. The core enforces this with `check_same_thread=True`.
+Farchive v2 is a local, content-addressed, history-preserving archive for opaque bytes observed at locators over time. It combines:
 
-Any future async API is an adapter over the same archive semantics and on-disk format. It does not introduce different history, timing, compression, or compatibility semantics.
+- exact raw-byte identity by SHA-256
+- locator-scoped contiguous span history
+- optional append-only event audit
+- transparent inline compression
+- storage-class dictionaries
+- locator-local depth-1 deltas
+- explicit maintenance chunking for large-blob dedup
 
----
-
-## 18. Summary
-
-Farchive is a positive-observation archive for opaque bytes: it preserves what was observed at each locator over time, but does not infer unobserved world state between observations. It provides immutable content-addressed blobs, locator-scoped contiguous observation spans, optional append-only event logs, and transparent pluggable storage optimization, where adaptive zstd dictionaries are the default optimization profile rather than the core semantic model.
+while keeping the semantic core small, queryable, and stable.

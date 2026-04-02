@@ -1,9 +1,11 @@
 [project]
 name = "farchive"
-version = "1.0.0"
+version = "2.0.0"
 description = "Local content-addressed archive with locator-scoped history for opaque bytes."
 requires-python = ">=3.11"
-dependencies = ["zstandard>=0.21"]
+dependencies = [
+    "zstandard>=0.21",
+]
 readme = "README.md"
 license = "MIT"
 authors = [
@@ -25,6 +27,7 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Database",
     "Topic :: System :: Archiving",
     "Typing :: Typed",
@@ -36,8 +39,9 @@ Repository = "https://github.com/eliask/farchive"
 Issues = "https://github.com/eliask/farchive/issues"
 
 [project.optional-dependencies]
-test = ["pytest>=8.0", "hypothesis>=6.151"]
-dev = ["pytest>=8.0", "hypothesis>=6.151", "ruff>=0.4", "ty>=0.0.1a1"]
+chunking = ["pyfastcdc==0.2.1"]
+test = ["pytest>=8.0", "hypothesis>=6.151", "pyfastcdc==0.2.1"]
+dev = ["pytest>=8.0", "hypothesis>=6.151", "ruff>=0.4", "ty>=0.0.1a1", "pyfastcdc==0.2.1"]
 
 [project.scripts]
 farchive = "farchive._cli:main"

@@ -8,6 +8,7 @@ SPEC.md section 5.7 (Transactional visibility).
 from __future__ import annotations
 
 import pytest
+from typing import cast
 
 from farchive import Farchive
 
@@ -47,9 +48,9 @@ def test_store_bad_metadata_rolls_back_span(archive):
             metadata=[1, 2, 3],  # type: ignore[arg-type]
         )
 
-    span_count = archive._conn.execute(
-        "SELECT COUNT(*) FROM locator_span"
-    ).fetchone()[0]
+    span_count = archive._conn.execute("SELECT COUNT(*) FROM locator_span").fetchone()[
+        0
+    ]
     assert span_count == 0, "Span was inserted despite failed store()"
 
 
@@ -62,12 +63,10 @@ def test_store_bad_metadata_rolls_back_event(tmp_path):
                 "loc/rollback",
                 b"should not persist",
                 observed_at=_T0,
-                metadata=[1, 2, 3],  # type: ignore[arg-type]
+                metadata=cast(dict, [1, 2, 3]),
             )
 
-        event_count = fa._conn.execute(
-            "SELECT COUNT(*) FROM event"
-        ).fetchone()[0]
+        event_count = fa._conn.execute("SELECT COUNT(*) FROM event").fetchone()[0]
         assert event_count == 0, "Event was recorded despite failed store()"
 
 
@@ -82,9 +81,9 @@ def test_store_non_serializable_metadata_rolls_back(archive):
         )
 
     blob_count = archive._conn.execute("SELECT COUNT(*) FROM blob").fetchone()[0]
-    span_count = archive._conn.execute(
-        "SELECT COUNT(*) FROM locator_span"
-    ).fetchone()[0]
+    span_count = archive._conn.execute("SELECT COUNT(*) FROM locator_span").fetchone()[
+        0
+    ]
     assert blob_count == 0
     assert span_count == 0
 
@@ -141,9 +140,9 @@ def test_store_batch_rolls_back_on_bad_item(archive):
 
     # Nothing from the batch should persist
     blob_count = archive._conn.execute("SELECT COUNT(*) FROM blob").fetchone()[0]
-    span_count = archive._conn.execute(
-        "SELECT COUNT(*) FROM locator_span"
-    ).fetchone()[0]
+    span_count = archive._conn.execute("SELECT COUNT(*) FROM locator_span").fetchone()[
+        0
+    ]
     assert blob_count == 0, f"Expected 0 blobs after rollback, got {blob_count}"
     assert span_count == 0, f"Expected 0 spans after rollback, got {span_count}"
 
@@ -189,7 +188,9 @@ def test_observe_bad_metadata_no_partial_span(archive):
     d2 = archive.put_blob(b"new content")
     with pytest.raises(TypeError, match="must be a dict"):
         archive.observe(
-            "loc/partial", d2, observed_at=_T1,
+            "loc/partial",
+            d2,
+            observed_at=_T1,
             metadata="string not dict",  # type: ignore[arg-type]
         )
 

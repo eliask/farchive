@@ -32,6 +32,8 @@ try:
 except ImportError:
     _HAS_FCNTL = False
 
+from farchive._chunking import chunk_data as _cdc_chunk
+from farchive._chunking import _CHUNKING_AVAILABLE
 from farchive._compression import (
     compress_blob,
     compress_delta,
@@ -47,6 +49,7 @@ from farchive._types import (
     Event,
     ImportStats,
     RepackStats,
+    RechunkStats,
     StateSpan,
 )
 
@@ -292,15 +295,18 @@ class Farchive:
             params.insert(4, storage_class)
 
         rows = self._conn.execute(
-            f"SELECT DISTINCT ls.digest "
+            f"SELECT ls.digest "
             f"FROM locator_span ls "
             f"JOIN blob b ON ls.digest = b.digest "
             f"WHERE ls.locator = ? "
-            f"  AND b.codec != 'zstd_delta' "
+            # Chunked blobs excluded as delta bases: maintains clean separation
+            # between delta path (inline-to-inline) and chunking path (maintenance).
+            f"  AND b.codec IN ('raw', 'zstd', 'zstd_dict') "
             f"  AND b.raw_size >= ? "
             f"  AND b.raw_size BETWEEN ? AND ? "
             f"  {sc_clause}"
-            f"ORDER BY ls.observed_from DESC "
+            f"GROUP BY ls.digest "
+            f"ORDER BY MAX(ls.observed_from) DESC, ls.digest DESC "
             f"LIMIT ?",
             params,
         ).fetchall()
@@ -313,30 +319,120 @@ class Farchive:
         best_frame_size: int,
     ) -> tuple[bytes, str] | None:
         """Try delta compression against each candidate. Return (payload, base_digest)
-        for the best accepted result, or None."""
+        for the best accepted result, or None.
+
+        Gain thresholds are always evaluated against the frame baseline, not
+        against the current best delta.  Among accepted deltas, the smallest wins.
+        """
         policy = self._policy
-        best: tuple[bytes, str] | None = None
-        best_size = best_frame_size
+        accepted: list[tuple[bytes, str]] = []
 
         for base_digest in candidates:
             base_raw = self._read_raw(base_digest)
             if base_raw is None:
                 continue
             try:
-                delta_payload = compress_delta(raw, base_raw, level=policy.compression_level)
+                delta_payload = compress_delta(
+                    raw, base_raw, level=policy.compression_level
+                )
             except Exception:
                 continue
             delta_size = len(delta_payload)
-            # Must satisfy both gain thresholds
-            if delta_size > best_size * policy.delta_min_gain_ratio:
+            # Thresholds are ALWAYS against the frame baseline
+            if delta_size > best_frame_size * policy.delta_min_gain_ratio:
                 continue
-            if (best_size - delta_size) < policy.delta_min_gain_bytes:
+            if (best_frame_size - delta_size) < policy.delta_min_gain_bytes:
                 continue
-            if delta_size < (best_size if best is None else len(best[0])):
-                best = (delta_payload, base_digest)
-                best_size = delta_size
+            accepted.append((delta_payload, base_digest))
 
-        return best
+        if not accepted:
+            return None
+        return min(accepted, key=lambda t: len(t[0]))
+
+    # ------------------------------------------------------------------
+    # Chunked representation
+    # ------------------------------------------------------------------
+
+    def _try_chunked(
+        self,
+        raw: bytes,
+        best_frame_size: int,
+    ) -> tuple[list[dict], int] | None:
+        """Try content-defined chunking (for optimize() use).
+
+        Returns (entries, incremental_cost) or None if not beneficial.
+        Accounts for intra-blob chunk dedup and manifest overhead.
+        Requires pyfastcdc (optional dependency).
+        """
+        if not _CHUNKING_AVAILABLE:
+            return None
+        policy = self._policy
+        chunks = _cdc_chunk(
+            raw,
+            avg_size=policy.chunk_avg_size,
+            min_size=policy.chunk_min_size,
+            max_size=policy.chunk_max_size,
+        )
+
+        if len(chunks) < 2:
+            return None
+
+        _MANIFEST_COST_PER_CHUNK = 50  # blob_chunk row + index overhead estimate
+
+        entries: list[dict] = []
+        incremental_cost = len(chunks) * _MANIFEST_COST_PER_CHUNK
+        seen_in_blob: dict[str, dict] = {}
+
+        for c in chunks:
+            if c.digest in seen_in_blob:
+                entry = {
+                    "digest": c.digest,
+                    "offset": c.offset,
+                    "length": c.length,
+                    "new": False,
+                    "stored_size": seen_in_blob[c.digest]["stored_size"],
+                }
+                entries.append(entry)
+                continue
+
+            existing = self._conn.execute(
+                "SELECT stored_size FROM chunk WHERE chunk_digest=?",
+                (c.digest,),
+            ).fetchone()
+            if existing:
+                entry = {
+                    "digest": c.digest,
+                    "offset": c.offset,
+                    "length": c.length,
+                    "new": False,
+                    "stored_size": existing["stored_size"],
+                }
+            else:
+                payload, codec, used_dict_id = compress_blob(c.data, policy)
+                stored = len(payload)
+                entry = {
+                    "digest": c.digest,
+                    "offset": c.offset,
+                    "length": c.length,
+                    "data": c.data,
+                    "new": True,
+                    "payload": payload,
+                    "codec": codec,
+                    "dict_id": used_dict_id,
+                    "stored_size": stored,
+                }
+                incremental_cost += stored
+
+            seen_in_blob[c.digest] = entry
+            entries.append(entry)
+
+        # Check gain thresholds against incremental cost
+        if incremental_cost > best_frame_size * policy.chunk_min_gain_ratio:
+            return None
+        if (best_frame_size - incremental_cost) < policy.chunk_min_gain_bytes:
+            return None
+
+        return (entries, incremental_cost)
 
     # ------------------------------------------------------------------
     # Internal blob storage
@@ -361,6 +457,45 @@ class Farchive:
                     f"Delta base {base_digest[:16]}.. not found for blob {digest[:16]}.."
                 )
             return decompress_delta(bytes(row["payload"]), base_raw)
+        if codec == "chunked":
+            rows = self._conn.execute(
+                "SELECT bc.ordinal, c.payload, c.codec, c.codec_dict_id "
+                "FROM blob_chunk bc JOIN chunk c ON bc.chunk_digest = c.chunk_digest "
+                "WHERE bc.blob_digest = ? ORDER BY bc.ordinal",
+                (digest,),
+            ).fetchall()
+            if not rows:
+                raise ValueError(
+                    f"chunked blob {digest[:16]}.. has no chunk rows — "
+                    f"chunk manifest is missing or corrupted"
+                )
+            for i, r in enumerate(rows):
+                if r["ordinal"] != i:
+                    raise ValueError(
+                        f"chunked blob {digest[:16]}.. has gap in chunk ordinals "
+                        f"(expected {i}, got {r['ordinal']}) — manifest corrupted"
+                    )
+            parts: list[bytes] = []
+            for r in rows:
+                parts.append(
+                    decompress_blob(
+                        bytes(r["payload"]),
+                        r["codec"],
+                        codec_dict_id=r["codec_dict_id"],
+                        load_dict=self._load_dict,
+                    )
+                )
+            reconstructed = b"".join(parts)
+            blob_row = self._conn.execute(
+                "SELECT raw_size FROM blob WHERE digest=?", (digest,)
+            ).fetchone()
+            if blob_row is None or len(reconstructed) != blob_row["raw_size"]:
+                raise ValueError(
+                    f"chunked blob {digest[:16]}.. size mismatch: "
+                    f"expected {blob_row['raw_size'] if blob_row else 'unknown'}, "
+                    f"got {len(reconstructed)}"
+                )
+            return reconstructed
         return decompress_blob(
             bytes(row["payload"]),
             codec,
@@ -405,6 +540,7 @@ class Farchive:
         if (
             policy.delta_enabled
             and len(raw) >= policy.delta_min_size
+            and len(raw) <= policy.delta_max_size
             and locator is not None
         ):
             candidates = self._find_delta_candidates(locator, len(raw), storage_class)
@@ -419,8 +555,11 @@ class Farchive:
                     best_base_digest = base_digest
                     best_size = delta_size
 
+        now_ms = _now_ms()
+
+        # Inline blob (raw, zstd, zstd_dict, or zstd_delta)
         self._conn.execute(
-            "INSERT INTO blob (digest, payload, raw_size, stored_size, "
+            "INSERT INTO blob (digest, payload, raw_size, stored_self_size, "
             "codec, codec_dict_id, base_digest, storage_class, created_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
@@ -432,7 +571,7 @@ class Farchive:
                 best_dict_id,
                 best_base_digest,
                 storage_class,
-                _now_ms(),
+                now_ms,
             ),
         )
 
@@ -679,7 +818,9 @@ class Farchive:
         dict_id = self._get_latest_dict_id(storage_class) if storage_class else None
 
         with self._conn:
-            self._store_blob(digest, data, storage_class, locator=locator, dict_id=dict_id)
+            self._store_blob(
+                digest, data, storage_class, locator=locator, dict_id=dict_id
+            )
             span = self._observe_impl(
                 locator,
                 digest,
@@ -765,7 +906,7 @@ class Farchive:
                     dict_id=dict_id,
                 )
                 blob_row = self._conn.execute(
-                    "SELECT stored_size FROM blob WHERE digest=?",
+                    "SELECT stored_self_size FROM blob WHERE digest=?",
                     (digest,),
                 ).fetchone()
                 self._observe_impl(
@@ -776,7 +917,7 @@ class Farchive:
                 )
                 stats.items_stored += 1
                 stats.bytes_raw += len(data)
-                stats.bytes_stored += blob_row["stored_size"]
+                stats.bytes_stored += blob_row["stored_self_size"]
 
                 if progress and (i + 1) % 1000 == 0:
                     progress(i + 1, len(items))
@@ -942,8 +1083,7 @@ class Farchive:
                 "dictionaries are not supported — train per storage class."
             )
         rows = self._conn.execute(
-            "SELECT digest "
-            "FROM blob WHERE storage_class=? ORDER BY RANDOM() LIMIT ?",
+            "SELECT digest FROM blob WHERE storage_class=? ORDER BY RANDOM() LIMIT ?",
             (storage_class, sample_size * 2),
         ).fetchall()
 
@@ -1062,6 +1202,124 @@ class Farchive:
                     )
         return stats
 
+    def rechunk(
+        self,
+        *,
+        storage_class: str | None = None,
+        batch_size: int = 100,
+        min_blob_size: int | None = None,
+    ) -> RechunkStats:
+        """Convert eligible inline blobs to chunked representation.
+
+        Rewrites up to *batch_size* blobs per call.  Returns RechunkStats
+        with counts of blobs rewritten, chunks added, and bytes saved.
+        """
+        if not _CHUNKING_AVAILABLE:
+            raise ValueError(
+                "rechunk() requires pyfastcdc. "
+                "Install with: pip install farchive[chunking]"
+            )
+        if not self._policy.chunk_enabled:
+            raise ValueError("chunking not enabled")
+
+        if min_blob_size is None:
+            min_blob_size = self._policy.chunk_min_blob_size
+
+        stats = RechunkStats()
+
+        with self._write_lock():
+            params: list = [min_blob_size]
+            sc_clause = ""
+            if storage_class is not None:
+                sc_clause = " AND storage_class = ?"
+                params.append(storage_class)
+
+            rows = self._conn.execute(
+                f"SELECT digest, stored_self_size FROM blob "
+                f"WHERE codec != 'chunked' AND raw_size >= ?{sc_clause} "
+                f"ORDER BY raw_size DESC",
+                params,
+            ).fetchall()
+
+            for row in rows:
+                if stats.blobs_rewritten >= batch_size:
+                    break
+
+                digest = row["digest"]
+                old_stored = row["stored_self_size"]
+
+                raw = self._read_raw(digest)
+                if raw is None:
+                    continue
+
+                result = self._try_chunked(raw, old_stored)
+                if result is None:
+                    continue
+
+                entries, new_cost = result
+                chunks_added_this = sum(1 for e in entries if e["new"])
+                now_ms = _now_ms()
+
+                new_chunks: list[tuple] = []
+                for e in entries:
+                    if e["new"]:
+                        new_chunks.append(
+                            (
+                                e["digest"],
+                                e["payload"],
+                                e["length"],
+                                e["stored_size"],
+                                e["codec"],
+                                e["dict_id"],
+                                now_ms,
+                            )
+                        )
+
+                with self._conn:
+                    if new_chunks:
+                        self._conn.executemany(
+                            "INSERT OR IGNORE INTO chunk (chunk_digest, payload, raw_size, "
+                            "stored_size, codec, codec_dict_id, created_at) "
+                            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                            new_chunks,
+                        )
+
+                    blob_chunk_rows = [
+                        (digest, i, e["offset"], e["digest"])
+                        for i, e in enumerate(entries)
+                    ]
+                    self._conn.executemany(
+                        "INSERT OR IGNORE INTO blob_chunk (blob_digest, ordinal, raw_offset, chunk_digest) "
+                        "VALUES (?, ?, ?, ?)",
+                        blob_chunk_rows,
+                    )
+
+                    self._conn.execute(
+                        "UPDATE blob SET payload=NULL, stored_self_size=0, codec='chunked', "
+                        "codec_dict_id=NULL, base_digest=NULL WHERE digest=?",
+                        (digest,),
+                    )
+
+                stats.blobs_rewritten += 1
+                stats.chunks_added += chunks_added_this
+                stats.bytes_saved += old_stored - new_cost
+
+            if stats.blobs_rewritten > 0:
+                with self._conn:
+                    self._emit_event(
+                        kind="fa.rechunk",
+                        metadata_json=json.dumps(
+                            {
+                                "storage_class": storage_class,
+                                "blobs_rewritten": stats.blobs_rewritten,
+                                "chunks_added": stats.chunks_added,
+                                "bytes_saved": stats.bytes_saved,
+                            }
+                        ),
+                    )
+
+        return stats
+
     def stats(self) -> ArchiveStats:
         """Non-semantic reporting snapshot."""
         from farchive._schema import detect_schema_version
@@ -1080,19 +1338,46 @@ class Farchive:
             "SELECT COUNT(*) FROM dict",
         ).fetchone()[0]
         totals = self._conn.execute(
-            "SELECT COALESCE(SUM(raw_size),0), COALESCE(SUM(stored_size),0) FROM blob",
+            "SELECT COALESCE(SUM(raw_size),0), COALESCE(SUM(stored_self_size),0) FROM blob",
         ).fetchone()
+        # Chunked blobs store payload=NULL, stored_self_size=0; count chunk bytes once
+        chunk_stored = self._conn.execute(
+            "SELECT COALESCE(SUM(stored_size),0) FROM chunk",
+        ).fetchone()[0]
+        chunk_count = self._conn.execute(
+            "SELECT COUNT(*) FROM chunk",
+        ).fetchone()[0]
+        dict_bytes = self._conn.execute(
+            "SELECT COALESCE(SUM(dict_size),0) FROM dict",
+        ).fetchone()[0]
+        total_stored = totals[1] + chunk_stored + dict_bytes
+        db_file_bytes = os.path.getsize(str(self._db_path))
+        for ext in ("-wal", "-shm"):
+            p = self._db_path.with_name(self._db_path.name + ext)
+            if p.exists():
+                db_file_bytes += os.path.getsize(str(p))
 
         codec_dist: dict[str, dict] = {}
         for row in self._conn.execute(
-            "SELECT codec, COUNT(*), SUM(raw_size), SUM(stored_size) "
+            "SELECT codec, COUNT(*), SUM(raw_size), SUM(stored_self_size) "
             "FROM blob GROUP BY codec",
         ).fetchall():
-            codec_dist[row[0]] = {
+            entry = {
                 "count": row[1],
                 "raw": row[2],
                 "stored": row[3],
             }
+            if row[0] == "chunked":
+                logical = self._conn.execute(
+                    "SELECT COALESCE(SUM(c.stored_size),0) FROM chunk c "
+                    "WHERE c.chunk_digest IN ("
+                    "  SELECT DISTINCT bc.chunk_digest FROM blob_chunk bc "
+                    "  JOIN blob b ON bc.blob_digest = b.digest "
+                    "  WHERE b.codec = 'chunked'"
+                    ")"
+                ).fetchone()[0]
+                entry["logical_stored"] = logical
+            codec_dist[row[0]] = entry
 
         return ArchiveStats(
             locator_count=loc_count,
@@ -1100,11 +1385,13 @@ class Farchive:
             span_count=span_count,
             dict_count=dict_count,
             total_raw_bytes=totals[0],
-            total_stored_bytes=totals[1],
-            compression_ratio=(totals[0] / totals[1]) if totals[1] else None,
+            total_stored_bytes=total_stored,
+            compression_ratio=(totals[0] / total_stored) if total_stored else None,
             codec_distribution=codec_dist,
             db_path=str(self._db_path),
             schema_version=db_version,
+            chunk_count=chunk_count,
+            db_file_bytes=db_file_bytes,
         )
 
     # ------------------------------------------------------------------

@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
+import os
 import subprocess
 import sys
 
 
-from farchive import Farchive
+from farchive import CompressionPolicy, Farchive
 
 
 # ---------------------------------------------------------------------------
@@ -224,3 +226,69 @@ def test_inspect_unknown_digest_exits_nonzero(tmp_path):
 
     assert result.returncode != 0
     assert "not found" in result.stdout.lower()
+
+
+def test_inspect_shows_chunked_blob_info(tmp_path):
+    from farchive._chunking import chunk_data as _cdc_chunk
+    from farchive._compression import compress_blob
+    from farchive._schema import _now_ms
+
+    db = tmp_path / "chunked_inspect.db"
+    policy = CompressionPolicy(
+        chunk_min_blob_size=8 * 1024,
+        chunk_avg_size=4 * 1024,
+        chunk_min_size=1 * 1024,
+        chunk_max_size=4 * 1024,
+        chunk_min_gain_ratio=0.95,
+        chunk_min_gain_bytes=64,
+        raw_threshold=32,
+        compression_level=1,
+        delta_enabled=False,
+    )
+    data = os.urandom(32 * 1024)
+    with Farchive(db, compression=policy) as fa:
+        digest = hashlib.sha256(data).hexdigest()
+        chunks = _cdc_chunk(
+            data,
+            avg_size=policy.chunk_avg_size,
+            min_size=policy.chunk_min_size,
+            max_size=policy.chunk_max_size,
+        )
+        now = _now_ms()
+
+        fa._conn.execute(
+            "INSERT INTO blob (digest, payload, raw_size, stored_self_size, "
+            "codec, codec_dict_id, base_digest, storage_class, created_at) "
+            "VALUES (?, NULL, ?, 0, 'chunked', NULL, NULL, 'bin', ?)",
+            (digest, len(data), now),
+        )
+
+        for i, c in enumerate(chunks):
+            payload, codec, dict_id = compress_blob(c.data, policy)
+            fa._conn.execute(
+                "INSERT INTO chunk (chunk_digest, payload, raw_size, "
+                "stored_size, codec, codec_dict_id, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (c.digest, payload, c.length, len(payload), codec, dict_id, now),
+            )
+            fa._conn.execute(
+                "INSERT INTO blob_chunk (blob_digest, ordinal, raw_offset, chunk_digest) "
+                "VALUES (?, ?, ?, ?)",
+                (digest, i, c.offset, c.digest),
+            )
+
+        fa._conn.execute(
+            "INSERT INTO locator_span (locator, digest, observed_from, "
+            "observed_until, last_confirmed_at, observation_count) "
+            "VALUES (?, ?, ?, NULL, ?, 1)",
+            ("loc/chunked", digest, now, now),
+        )
+        fa._conn.commit()
+
+    result = _run(["inspect", digest, str(db)])
+    assert result.returncode == 0, f"stderr: {result.stderr}"
+    assert "Codec:          chunked" in result.stdout
+    assert "Chunk refs:" in result.stdout
+    assert "Unique stored:" in result.stdout
+    assert "shared chunk bytes not attributed" in result.stdout
+    assert "Compression:" in result.stdout

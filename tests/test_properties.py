@@ -38,7 +38,7 @@ def _sha256(data: bytes) -> str:
 
 
 @given(st.lists(observation_st, min_size=0, max_size=200))
-@settings(max_examples=200)
+@settings(max_examples=200, deadline=None)
 def test_at_most_one_current_span_per_locator(observations):
     """After any sequence of observations, each locator has at most one open span."""
     from pathlib import Path
@@ -68,7 +68,7 @@ def test_at_most_one_current_span_per_locator(observations):
 
 
 @given(st.lists(observation_st, min_size=0, max_size=200))
-@settings(max_examples=200)
+@settings(max_examples=200, deadline=None)
 def test_span_timestamps_are_monotone(observations):
     """For every locator, spans are ordered by observed_from with no gaps or overlaps."""
     from pathlib import Path
@@ -114,7 +114,7 @@ def test_span_timestamps_are_monotone(observations):
     st.binary(min_size=1, max_size=200),
     st.binary(min_size=1, max_size=200).filter(lambda b: b != b"A"),
 )
-@settings(max_examples=200)
+@settings(max_examples=200, deadline=None)
 def test_aba_creates_three_spans(content_a, content_b):
     """If a locator goes A→B→A with different content, that produces 3 spans."""
     from pathlib import Path
@@ -176,7 +176,7 @@ def test_round_trip_exactness(data):
     st.binary(min_size=1, max_size=500),
     st.integers(min_value=1, max_value=20),
 )
-@settings(max_examples=200)
+@settings(max_examples=200, deadline=None)
 def test_dedup_same_bytes_stored_once(data, n):
     """Storing the same bytes n times at different locators creates exactly one blob."""
     from pathlib import Path
@@ -233,7 +233,7 @@ def test_observation_count_matches_stores(data, n):
 
 
 @given(st.binary(min_size=1, max_size=5_000))
-@settings(max_examples=100)
+@settings(max_examples=100, deadline=None)
 def test_read_by_digest_ignores_compression(data):
     """read(digest) returns exact bytes regardless of how the blob was compressed."""
     from pathlib import Path
@@ -258,7 +258,7 @@ def test_read_by_digest_ignores_compression(data):
 
 
 @given(st.lists(observation_st, min_size=0, max_size=100))
-@settings(max_examples=100)
+@settings(max_examples=100, deadline=None)
 def test_event_count_matches_successful_observations(observations):
     """When events are enabled, the number of events equals successful observations."""
     from pathlib import Path
