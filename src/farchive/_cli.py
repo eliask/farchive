@@ -323,6 +323,387 @@ def _cmd_has(args: argparse.Namespace) -> None:
     sys.exit(0 if result else 1)
 
 
+# ---------------------------------------------------------------------------
+# Phase 2: du, ls
+# ---------------------------------------------------------------------------
+
+
+def _cmd_du(args: argparse.Namespace) -> None:
+    """Storage accounting: where are the bytes going?"""
+    with Farchive(args.db) as fa:
+        if args.by == "storage-class":
+            rows = fa._conn.execute(
+                "SELECT COALESCE(storage_class, '(none)') as sc, "
+                "COUNT(*) as cnt, SUM(raw_size) as raw, "
+                "SUM(stored_self_size) as stored "
+                "FROM blob GROUP BY sc ORDER BY stored DESC"
+            ).fetchall()
+            if not args.json:
+                print(f"{'storage_class':<16} {'blobs':>8} {'raw':>12} {'stored':>12}")
+                print("-" * 52)
+                for r in rows[: args.top]:
+                    print(
+                        f"{r['sc']:<16} {r['cnt']:>8,} {r['raw']:>12,} {r['stored']:>12,}"
+                    )
+                if args.top and len(rows) > args.top:
+                    print(f"  ... and {len(rows) - args.top} more")
+            else:
+                items = [
+                    {
+                        "storage_class": r["sc"],
+                        "blobs": r["cnt"],
+                        "raw": r["raw"],
+                        "stored": r["stored"],
+                    }
+                    for r in rows
+                ]
+                print(json.dumps(items, indent=2))
+
+        elif args.by == "codec":
+            rows = fa._conn.execute(
+                "SELECT codec, COUNT(*) as cnt, SUM(raw_size) as raw, "
+                "SUM(stored_self_size) as stored "
+                "FROM blob GROUP BY codec ORDER BY stored DESC"
+            ).fetchall()
+            if not args.json:
+                print(f"{'codec':<16} {'blobs':>8} {'raw':>12} {'stored':>12}")
+                print("-" * 52)
+                for r in rows:
+                    print(
+                        f"{r['codec']:<16} {r['cnt']:>8,} {r['raw']:>12,} {r['stored']:>12,}"
+                    )
+            else:
+                items = [
+                    {
+                        "codec": r["codec"],
+                        "blobs": r["cnt"],
+                        "raw": r["raw"],
+                        "stored": r["stored"],
+                    }
+                    for r in rows
+                ]
+                print(json.dumps(items, indent=2))
+
+        elif args.by == "locator":
+            rows = fa._conn.execute(
+                "SELECT ls.locator, COUNT(DISTINCT ls.digest) as blobs, "
+                "SUM(DISTINCT b.raw_size) as raw, "
+                "SUM(DISTINCT b.stored_self_size) as stored "
+                "FROM locator_span ls JOIN blob b ON ls.digest = b.digest "
+                "GROUP BY ls.locator ORDER BY stored DESC"
+            ).fetchall()
+            if not args.json:
+                print(f"{'locator':<40} {'blobs':>6} {'raw':>12} {'stored':>12}")
+                print("-" * 76)
+                for r in rows[: args.top]:
+                    print(
+                        f"{r['locator']:<40} {r['blobs']:>6,} {r['raw']:>12,} {r['stored']:>12,}"
+                    )
+                if args.top and len(rows) > args.top:
+                    print(f"  ... and {len(rows) - args.top} more")
+            else:
+                items = [
+                    {
+                        "locator": r["locator"],
+                        "blobs": r["blobs"],
+                        "raw": r["raw"],
+                        "stored": r["stored"],
+                    }
+                    for r in rows
+                ]
+                print(json.dumps(items, indent=2))
+
+        elif args.locator:
+            rows = fa._conn.execute(
+                "SELECT b.codec, b.raw_size, b.stored_self_size, "
+                "b.storage_class, ls.observed_from, ls.observed_until "
+                "FROM locator_span ls JOIN blob b ON ls.digest = b.digest "
+                "WHERE ls.locator = ? ORDER BY ls.observed_from DESC",
+                (args.locator,),
+            ).fetchall()
+            if not rows:
+                print(f"No spans found for locator: {args.locator}", file=sys.stderr)
+                sys.exit(1)
+            if not args.json:
+                print(f"Storage for: {args.locator}")
+                print(
+                    f"{'codec':<14} {'raw_size':>12} {'stored':>12} {'class':<10} {'from':<16} {'until':<16}"
+                )
+                print("-" * 84)
+                for r in rows:
+                    until = (
+                        str(r["observed_until"]) if r["observed_until"] else "current"
+                    )
+                    print(
+                        f"{r['codec']:<14} {r['raw_size']:>12,} {r['stored_self_size']:>12,} "
+                        f"{(r['storage_class'] or ''):<10} {r['observed_from']:<16} {until:<16}"
+                    )
+            else:
+                items = []
+                for r in rows:
+                    items.append(
+                        {
+                            "codec": r["codec"],
+                            "raw_size": r["raw_size"],
+                            "stored_self_size": r["stored_self_size"],
+                            "storage_class": r["storage_class"],
+                            "observed_from": r["observed_from"],
+                            "observed_until": r["observed_until"],
+                        }
+                    )
+                print(json.dumps(items, indent=2))
+        else:
+            print(
+                "Error: --by (locator|storage-class|codec) or --locator is required",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+
+def _cmd_ls(args: argparse.Namespace) -> None:
+    """List archive entities: locators, spans, blobs, events, dicts, chunks."""
+    subcmd = args.ls_type
+
+    with Farchive(args.db) as fa:
+        if subcmd == "locators":
+            rows = fa._conn.execute(
+                "SELECT DISTINCT locator FROM locator_span ORDER BY locator"
+            ).fetchall()
+            if args.json:
+                print(json.dumps([r["locator"] for r in rows], indent=2))
+            else:
+                for r in rows:
+                    print(r["locator"])
+                print(f"\n{len(rows)} locators", file=sys.stderr)
+
+        elif subcmd == "spans":
+            query = "SELECT * FROM locator_span WHERE 1=1"
+            params: list = []
+            if args.locator:
+                query += " AND locator = ?"
+                params.append(args.locator)
+            if args.since:
+                query += " AND observed_from >= ?"
+                params.append(args.since)
+            if args.until:
+                query += " AND observed_until <= ?"
+                params.append(args.until)
+            query += " ORDER BY observed_from DESC"
+            if args.limit:
+                query += " LIMIT ?"
+                params.append(args.limit)
+
+            rows = fa._conn.execute(query, params).fetchall()
+            if args.json:
+                items = []
+                for r in rows:
+                    items.append(
+                        {
+                            "span_id": r["span_id"],
+                            "locator": r["locator"],
+                            "digest": r["digest"],
+                            "observed_from": r["observed_from"],
+                            "observed_until": r["observed_until"],
+                            "last_confirmed_at": r["last_confirmed_at"],
+                            "observation_count": r["observation_count"],
+                        }
+                    )
+                print(json.dumps(items, indent=2))
+            else:
+                if not rows:
+                    print("No spans found.")
+                    return
+                print(
+                    f"{'span_id':>8}  {'locator':<30} {'digest[:12]':<14} "
+                    f"{'from':<16} {'until':<16} {'count':>6}"
+                )
+                print("-" * 94)
+                for r in rows:
+                    until = (
+                        str(r["observed_until"]) if r["observed_until"] else "current"
+                    )
+                    print(
+                        f"{r['span_id']:>8}  {r['locator']:<30} {r['digest'][:12]:<14} "
+                        f"{r['observed_from']:<16} {until:<16} {r['observation_count']:>6}"
+                    )
+
+        elif subcmd == "blobs":
+            query = "SELECT digest, raw_size, stored_self_size, codec, storage_class, created_at FROM blob WHERE 1=1"
+            params = []
+            if args.codec:
+                query += " AND codec = ?"
+                params.append(args.codec)
+            if args.storage_class:
+                query += " AND storage_class = ?"
+                params.append(args.storage_class)
+            if args.digest:
+                query += " AND digest = ?"
+                params.append(args.digest)
+            query += " ORDER BY created_at DESC"
+            if args.limit:
+                query += " LIMIT ?"
+                params.append(args.limit)
+
+            rows = fa._conn.execute(query, params).fetchall()
+            if args.json:
+                items = []
+                for r in rows:
+                    items.append(
+                        {
+                            "digest": r["digest"],
+                            "raw_size": r["raw_size"],
+                            "stored_self_size": r["stored_self_size"],
+                            "codec": r["codec"],
+                            "storage_class": r["storage_class"],
+                            "created_at": r["created_at"],
+                        }
+                    )
+                print(json.dumps(items, indent=2))
+            else:
+                if not rows:
+                    print("No blobs found.")
+                    return
+                print(
+                    f"{'digest[:12]':<14} {'raw_size':>12} {'stored':>12} "
+                    f"{'codec':<14} {'class':<10} {'created_at':<16}"
+                )
+                print("-" * 82)
+                for r in rows:
+                    print(
+                        f"{r['digest'][:12]:<14} {r['raw_size']:>12,} {r['stored_self_size']:>12,} "
+                        f"{r['codec']:<14} {(r['storage_class'] or ''):<10} {r['created_at']:<16}"
+                    )
+
+        elif subcmd == "events":
+            query = "SELECT * FROM event WHERE 1=1"
+            params = []
+            if args.locator:
+                query += " AND locator = ?"
+                params.append(args.locator)
+            if args.kind:
+                query += " AND kind = ?"
+                params.append(args.kind)
+            if args.since:
+                query += " AND occurred_at >= ?"
+                params.append(args.since)
+            if args.until:
+                query += " AND occurred_at <= ?"
+                params.append(args.until)
+            query += " ORDER BY occurred_at DESC"
+            if args.limit:
+                query += " LIMIT ?"
+                params.append(args.limit)
+
+            rows = fa._conn.execute(query, params).fetchall()
+            if args.json:
+                items = []
+                for r in rows:
+                    items.append(
+                        {
+                            "event_id": r["event_id"],
+                            "occurred_at": r["occurred_at"],
+                            "locator": r["locator"],
+                            "digest": r["digest"],
+                            "kind": r["kind"],
+                            "metadata": json.loads(r["metadata_json"])
+                            if r["metadata_json"]
+                            else None,
+                        }
+                    )
+                print(json.dumps(items, indent=2))
+            else:
+                if not rows:
+                    print("No events found.")
+                    return
+                print(
+                    f"{'event_id':>8}  {'occurred_at':<16} {'locator':<30} "
+                    f"{'digest[:12]':<14} {'kind':<12}"
+                )
+                print("-" * 88)
+                for r in rows:
+                    digest = r["digest"][:12] if r["digest"] else ""
+                    print(
+                        f"{r['event_id']:>8}  {r['occurred_at']:<16} {r['locator']:<30} "
+                        f"{digest:<14} {r['kind']:<12}"
+                    )
+
+        elif subcmd == "dicts":
+            rows = fa._conn.execute(
+                "SELECT dict_id, storage_class, trained_at, sample_count, dict_size "
+                "FROM dict ORDER BY trained_at DESC"
+            ).fetchall()
+            if args.json:
+                items = []
+                for r in rows:
+                    items.append(
+                        {
+                            "dict_id": r["dict_id"],
+                            "storage_class": r["storage_class"],
+                            "trained_at": r["trained_at"],
+                            "sample_count": r["sample_count"],
+                            "dict_size": r["dict_size"],
+                        }
+                    )
+                print(json.dumps(items, indent=2))
+            else:
+                if not rows:
+                    print("No dictionaries found.")
+                    return
+                print(
+                    f"{'dict_id':>8}  {'storage_class':<14} {'trained_at':<16} "
+                    f"{'samples':>8} {'size':>12}"
+                )
+                print("-" * 66)
+                for r in rows:
+                    print(
+                        f"{r['dict_id']:>8}  {r['storage_class']:<14} {r['trained_at']:<16} "
+                        f"{r['sample_count']:>8,} {r['dict_size']:>12,}"
+                    )
+
+        elif subcmd == "chunks":
+            query = "SELECT chunk_digest, raw_size, stored_size, codec, created_at FROM chunk WHERE 1=1"
+            params = []
+            if args.digest:
+                query += " AND chunk_digest = ?"
+                params.append(args.digest)
+            query += " ORDER BY created_at DESC"
+            if args.limit:
+                query += " LIMIT ?"
+                params.append(args.limit)
+
+            rows = fa._conn.execute(query, params).fetchall()
+            if args.json:
+                items = []
+                for r in rows:
+                    items.append(
+                        {
+                            "chunk_digest": r["chunk_digest"],
+                            "raw_size": r["raw_size"],
+                            "stored_size": r["stored_size"],
+                            "codec": r["codec"],
+                            "created_at": r["created_at"],
+                        }
+                    )
+                print(json.dumps(items, indent=2))
+            else:
+                if not rows:
+                    print("No chunks found.")
+                    return
+                print(
+                    f"{'chunk_digest[:12]':<14} {'raw_size':>12} {'stored':>12} "
+                    f"{'codec':<14} {'created_at':<16}"
+                )
+                print("-" * 72)
+                for r in rows:
+                    print(
+                        f"{r['chunk_digest'][:12]:<14} {r['raw_size']:>12,} {r['stored_size']:>12,} "
+                        f"{r['codec']:<14} {r['created_at']:<16}"
+                    )
+        else:
+            print(f"Unknown ls subcommand: {subcmd}", file=sys.stderr)
+            sys.exit(1)
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         prog="farchive",
@@ -412,6 +793,36 @@ def main(argv: list[str] | None = None) -> None:
     )
     p.add_argument("db", nargs="?", default=_DEFAULT_DB, help="DB path")
 
+    # du
+    p = sub.add_parser("du", help="Storage accounting: where are the bytes going?")
+    p.add_argument(
+        "--by", choices=["locator", "storage-class", "codec"], help="Group by"
+    )
+    p.add_argument("--locator", default=None, help="Show storage for specific locator")
+    p.add_argument("--top", type=int, default=20, help="Top N results (default 20)")
+    p.add_argument("--json", action="store_true", help="Output as JSON")
+    p.add_argument("db", nargs="?", default=_DEFAULT_DB, help="DB path")
+
+    # ls
+    p = sub.add_parser("ls", help="List archive entities")
+    p.add_argument(
+        "--type",
+        dest="ls_type",
+        default="locators",
+        choices=["locators", "spans", "blobs", "events", "dicts", "chunks"],
+        help="What to list (default: locators)",
+    )
+    p.add_argument("--locator", default=None, help="Filter by locator")
+    p.add_argument("--digest", default=None, help="Filter by digest")
+    p.add_argument("--codec", default=None, help="Filter by codec")
+    p.add_argument("--storage-class", default=None, help="Filter by storage class")
+    p.add_argument("--kind", default=None, help="Filter events by kind")
+    p.add_argument("--since", type=int, default=None, help="Filter: timestamp >= since")
+    p.add_argument("--until", type=int, default=None, help="Filter: timestamp <= until")
+    p.add_argument("--limit", type=int, default=100, help="Max results")
+    p.add_argument("--json", action="store_true", help="Output as JSON")
+    p.add_argument("db", nargs="?", default=_DEFAULT_DB, help="DB path")
+
     args = parser.parse_args(argv)
     if args.command is None:
         parser.print_help()
@@ -430,6 +841,8 @@ def main(argv: list[str] | None = None) -> None:
         "store": _cmd_store,
         "resolve": _cmd_resolve,
         "has": _cmd_has,
+        "du": _cmd_du,
+        "ls": _cmd_ls,
     }
     cmds[args.command](args)
 
