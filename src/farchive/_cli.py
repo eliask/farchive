@@ -6,8 +6,13 @@ import argparse
 import json
 import os
 import sys
+import fnmatch
+from pathlib import Path
+
+from typing import Any
 
 from farchive._archive import Farchive
+from farchive._archive import _sha256
 
 _DEFAULT_DB = "archive.farchive"
 
@@ -704,6 +709,257 @@ def _cmd_ls(args: argparse.Namespace) -> None:
             sys.exit(1)
 
 
+# ---------------------------------------------------------------------------
+# Phase 3: put-blob, observe, import-files, import-manifest
+# ---------------------------------------------------------------------------
+
+
+def _cmd_put_blob(args: argparse.Namespace) -> None:
+    """Store a blob without creating a locator observation. Returns digest."""
+    if args.path == "-":
+        data = sys.stdin.buffer.read()
+    else:
+        if not os.path.isfile(args.path):
+            print(f"File not found: {args.path}", file=sys.stderr)
+            sys.exit(1)
+        with open(args.path, "rb") as f:
+            data = f.read()
+
+    with Farchive(args.db) as fa:
+        digest = fa.put_blob(data, storage_class=args.storage_class)
+
+    if args.json:
+        print(json.dumps({"digest": digest}))
+    else:
+        print(digest)
+
+
+def _cmd_observe(args: argparse.Namespace) -> None:
+    """Record an observation of an existing digest at a locator."""
+    metadata = None
+    if args.metadata_json:
+        try:
+            metadata = json.loads(args.metadata_json)
+        except json.JSONDecodeError as e:
+            print(f"Invalid JSON in --metadata-json: {e}", file=sys.stderr)
+            sys.exit(1)
+
+    with Farchive(args.db) as fa:
+        span = fa.observe(
+            args.locator,
+            args.digest,
+            observed_at=args.observed_at,
+            metadata=metadata,
+        )
+
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "span_id": span.span_id,
+                    "locator": span.locator,
+                    "digest": span.digest,
+                    "observed_from": span.observed_from,
+                    "observed_until": span.observed_until,
+                    "observation_count": span.observation_count,
+                }
+            )
+        )
+    else:
+        print(f"Span {span.span_id}: {span.locator} -> {span.digest[:16]}..")
+
+
+def _cmd_import_files(args: argparse.Namespace) -> None:
+    """Import files from a directory into the archive."""
+    root = Path(args.root).resolve()
+    if not root.is_dir():
+        print(f"Not a directory: {args.root}", file=sys.stderr)
+        sys.exit(1)
+
+    # Build file list
+    if args.from_stdin:
+        raw_paths = sys.stdin.read().split("\0" if args.null_delimited else "\n")
+        paths = [Path(p.strip()) for p in raw_paths if p.strip()]
+    else:
+        if args.recursive:
+            paths = sorted(root.rglob("*"))
+        else:
+            paths = sorted(root.iterdir())
+        paths = [p for p in paths if p.is_file()]
+
+    # Apply include/exclude filters
+    if args.include or args.exclude:
+        filtered = []
+        for p in paths:
+            rel = str(p.relative_to(root))
+            if args.exclude and any(fnmatch.fnmatch(rel, pat) for pat in args.exclude):
+                continue
+            if args.include and not any(
+                fnmatch.fnmatch(rel, pat) for pat in args.include
+            ):
+                continue
+            filtered.append(p)
+        paths = filtered
+
+    # Determine storage class mapping
+    ext_to_sc = {}
+    if args.storage_class_by_ext:
+        for mapping in args.storage_class_by_ext:
+            if "=" in mapping:
+                ext, sc = mapping.split("=", 1)
+                ext_to_sc[ext.lstrip(".")] = sc
+
+    # Resolve timestamp mode
+    observed_at = None
+    if args.observed_at and args.observed_at.startswith("fixed:"):
+        observed_at = int(args.observed_at.split(":", 1)[1])
+
+    # Import
+    imported = 0
+    deduped = 0
+    errors = 0
+
+    for p in paths:
+        try:
+            data = p.read_bytes()
+        except OSError as e:
+            print(f"Warning: cannot read {p}: {e}", file=sys.stderr)
+            errors += 1
+            continue
+
+        # Determine storage class
+        sc = args.storage_class
+        if sc is None and ext_to_sc:
+            ext = p.suffix.lstrip(".")
+            sc = ext_to_sc.get(ext)
+
+        # Determine timestamp
+        ts = observed_at
+        if ts is None and args.observed_at == "mtime":
+            ts = int(p.stat().st_mtime * 1000)
+
+        # Build locator
+        if args.locator_prefix:
+            rel = p.relative_to(root)
+            locator = f"{args.locator_prefix}{rel}"
+        else:
+            locator = str(p)
+
+        if args.dry_run:
+            print(f"[dry-run] {locator} <- {p} (storage_class={sc or 'none'})")
+            imported += 1
+            continue
+
+        with Farchive(args.db) as fa:
+            was_new = (
+                fa._conn.execute(
+                    "SELECT COUNT(*) FROM blob WHERE digest=?",
+                    (_sha256(data),),
+                ).fetchone()[0]
+                == 0
+            )
+            fa.store(locator, data, observed_at=ts, storage_class=sc)
+            if was_new:
+                imported += 1
+            else:
+                deduped += 1
+
+    if args.dry_run:
+        print(f"\nDry run: would import {imported} file(s)")
+    else:
+        print(
+            f"Imported: {imported} new, {deduped} deduped, {errors} errors",
+            file=sys.stderr,
+        )
+
+
+def _cmd_import_manifest(args: argparse.Namespace) -> None:
+    """Import from a manifest file (JSONL or TSV)."""
+    manifest_path = Path(args.manifest)
+    if not manifest_path.is_file():
+        print(f"Manifest not found: {args.manifest}", file=sys.stderr)
+        sys.exit(1)
+
+    lines = manifest_path.read_text().strip().split("\n")
+    if not lines:
+        print("Empty manifest", file=sys.stderr)
+        sys.exit(1)
+
+    fmt = args.format or ("jsonl" if args.manifest.endswith(".jsonl") else "tsv")
+    items = []
+    for line in lines:
+        if not line.strip():
+            continue
+        if fmt == "jsonl":
+            items.append(json.loads(line))
+        else:
+            parts = line.split("\t")
+            entry: dict[str, Any] = {"locator": parts[0], "path": parts[1]}
+            if len(parts) > 2:
+                entry["storage_class"] = parts[2] if parts[2] else None
+            if len(parts) > 3:
+                entry["observed_at"] = int(parts[3]) if parts[3] else None
+            if len(parts) > 4:
+                entry["metadata"] = json.loads(parts[4]) if parts[4] else None
+            items.append(entry)
+
+    imported = 0
+    deduped = 0
+    errors = 0
+
+    for item in items:
+        locator = item.get("locator")
+        path = item.get("path")
+        if not locator or not path:
+            print(f"Skipping entry missing locator or path: {item}", file=sys.stderr)
+            errors += 1
+            continue
+
+        p = Path(path)
+        if not p.is_file():
+            print(f"File not found: {path}", file=sys.stderr)
+            errors += 1
+            continue
+
+        try:
+            data = p.read_bytes()
+        except OSError as e:
+            print(f"Cannot read {path}: {e}", file=sys.stderr)
+            errors += 1
+            continue
+
+        sc = item.get("storage_class")
+        ts = item.get("observed_at")
+        meta = item.get("metadata")
+
+        if args.dry_run:
+            print(f"[dry-run] {locator} <- {path}")
+            imported += 1
+            continue
+
+        with Farchive(args.db) as fa:
+            was_new = (
+                fa._conn.execute(
+                    "SELECT COUNT(*) FROM blob WHERE digest=?",
+                    (_sha256(data),),
+                ).fetchone()[0]
+                == 0
+            )
+            fa.store(locator, data, observed_at=ts, storage_class=sc, metadata=meta)
+            if was_new:
+                imported += 1
+            else:
+                deduped += 1
+
+    if args.dry_run:
+        print(f"\nDry run: would import {imported} entry(ies)")
+    else:
+        print(
+            f"Imported: {imported} new, {deduped} deduped, {errors} errors",
+            file=sys.stderr,
+        )
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         prog="farchive",
@@ -823,6 +1079,66 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--json", action="store_true", help="Output as JSON")
     p.add_argument("db", nargs="?", default=_DEFAULT_DB, help="DB path")
 
+    # put-blob
+    p = sub.add_parser("put-blob", help="Store a blob without locator observation")
+    p.add_argument("path", help="File path, or '-' for stdin")
+    p.add_argument("--storage-class", default=None, help="Storage class hint")
+    p.add_argument("--json", action="store_true", help="Output as JSON")
+    p.add_argument("db", nargs="?", default=_DEFAULT_DB, help="DB path")
+
+    # observe
+    p = sub.add_parser("observe", help="Record observation of existing digest")
+    p.add_argument("--locator", required=True, help="Locator string")
+    p.add_argument("--digest", required=True, help="SHA-256 digest")
+    p.add_argument("--observed-at", type=int, default=None, help="Unix ms timestamp")
+    p.add_argument("--metadata-json", default=None, help="JSON metadata string")
+    p.add_argument("--json", action="store_true", help="Output as JSON")
+    p.add_argument("db", nargs="?", default=_DEFAULT_DB, help="DB path")
+
+    # import-files
+    p = sub.add_parser("import-files", help="Import files from a directory")
+    p.add_argument("--root", required=True, help="Root directory to import")
+    p.add_argument("--locator-prefix", default=None, help="Prefix for derived locators")
+    p.add_argument(
+        "--recursive", action="store_true", help="Recurse into subdirectories"
+    )
+    p.add_argument(
+        "--from-stdin", action="store_true", help="Read file paths from stdin"
+    )
+    p.add_argument(
+        "-0", "--null-delimited", action="store_true", help="Null-delimited stdin"
+    )
+    p.add_argument(
+        "--include", action="append", help="Include glob pattern (repeatable)"
+    )
+    p.add_argument(
+        "--exclude", action="append", help="Exclude glob pattern (repeatable)"
+    )
+    p.add_argument(
+        "--storage-class-by-ext",
+        action="append",
+        help="Map ext to class (e.g. html=html)",
+    )
+    p.add_argument(
+        "--storage-class", default=None, help="Override storage class for all"
+    )
+    p.add_argument(
+        "--observed-at",
+        default="now",
+        help="Timestamp mode: now, mtime, or fixed:<ms>",
+    )
+    p.add_argument("--dry-run", action="store_true", help="Show what would be imported")
+    p.add_argument("db", nargs="?", default=_DEFAULT_DB, help="DB path")
+
+    # import-manifest
+    p = sub.add_parser("import-manifest", help="Import from manifest (JSONL or TSV)")
+    p.add_argument("manifest", help="Manifest file path")
+    p.add_argument(
+        "--format", choices=["jsonl", "tsv"], default=None, help="Manifest format"
+    )
+    p.add_argument("--dry-run", action="store_true", help="Show what would be imported")
+    p.add_argument("db", nargs="?", default=_DEFAULT_DB, help="DB path")
+
     args = parser.parse_args(argv)
     if args.command is None:
         parser.print_help()
@@ -843,6 +1159,10 @@ def main(argv: list[str] | None = None) -> None:
         "has": _cmd_has,
         "du": _cmd_du,
         "ls": _cmd_ls,
+        "put-blob": _cmd_put_blob,
+        "observe": _cmd_observe,
+        "import-files": _cmd_import_files,
+        "import-manifest": _cmd_import_manifest,
     }
     cmds[args.command](args)
 
