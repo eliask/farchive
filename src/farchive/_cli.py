@@ -1069,6 +1069,231 @@ def _cmd_diff(args: argparse.Namespace) -> None:
         sys.stdout.writelines(diff)
 
 
+# ---------------------------------------------------------------------------
+# Phase 5: optimize, vacuum, verify, migrate, schema
+# ---------------------------------------------------------------------------
+
+
+def _cmd_optimize(args: argparse.Namespace) -> None:
+    """Umbrella maintenance: train dicts, repack, rechunk."""
+    with Farchive(args.db) as fa:
+        if not args.no_repack:
+            sc = args.storage_class
+            if sc:
+                repack_stats = fa.repack(storage_class=sc, batch_size=args.batch_size)
+                print(
+                    f"Repack: {repack_stats.blobs_repacked:,} blobs, "
+                    f"saved {repack_stats.bytes_saved:,} bytes",
+                    file=sys.stderr,
+                )
+            else:
+                # Repack each storage class that has blobs
+                classes = fa._conn.execute(
+                    "SELECT DISTINCT storage_class FROM blob WHERE storage_class IS NOT NULL"
+                ).fetchall()
+                total_repacked = 0
+                total_saved = 0
+                for row in classes:
+                    try:
+                        rs = fa.repack(storage_class=row[0], batch_size=args.batch_size)
+                        total_repacked += rs.blobs_repacked
+                        total_saved += rs.bytes_saved
+                    except ValueError:
+                        pass  # No trained dict for this class
+                if total_repacked > 0:
+                    print(
+                        f"Repack: {total_repacked:,} blobs, "
+                        f"saved {total_saved:,} bytes",
+                        file=sys.stderr,
+                    )
+
+        if not args.no_rechunk:
+            try:
+                rechunk_stats = fa.rechunk(
+                    storage_class=args.storage_class,
+                    batch_size=args.rechunk_batch_size,
+                    min_blob_size=args.rechunk_min_blob_size,
+                )
+                if rechunk_stats.blobs_rewritten > 0:
+                    print(
+                        f"Rechunk: {rechunk_stats.blobs_rewritten:,} blobs, "
+                        f"{rechunk_stats.chunks_added:,} chunks, "
+                        f"saved {rechunk_stats.bytes_saved:,} bytes",
+                        file=sys.stderr,
+                    )
+            except ValueError as e:
+                print(f"Rechunk skipped: {e}", file=sys.stderr)
+
+        print("Optimize complete.", file=sys.stderr)
+
+
+def _cmd_vacuum(args: argparse.Namespace) -> None:
+    """SQLite maintenance: ANALYZE, checkpoint, VACUUM."""
+    with Farchive(args.db) as fa:
+        if args.analyze:
+            fa._conn.execute("ANALYZE")
+            fa._conn.commit()
+            print("ANALYZE complete.", file=sys.stderr)
+
+        if args.checkpoint:
+            fa._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            print("WAL checkpoint complete.", file=sys.stderr)
+
+        if args.vacuum:
+            fa._conn.execute("VACUUM")
+            print("VACUUM complete.", file=sys.stderr)
+
+        if not args.analyze and not args.checkpoint and not args.vacuum:
+            fa._conn.execute("ANALYZE")
+            fa._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            fa._conn.commit()
+            print("ANALYZE + WAL checkpoint complete.", file=sys.stderr)
+
+
+def _cmd_verify(args: argparse.Namespace) -> None:
+    """Verify archive integrity."""
+    with Farchive(args.db) as fa:
+        errors = 0
+        checked = 0
+
+        # Fast structural checks
+        print("Checking schema version...", file=sys.stderr)
+        db_version = fa._conn.execute("SELECT version FROM schema_info").fetchone()[0]
+        print(f"  Schema version: {db_version}", file=sys.stderr)
+
+        print("Checking foreign key integrity...", file=sys.stderr)
+        fk_errors = fa._conn.execute("PRAGMA foreign_key_check").fetchall()
+        if fk_errors:
+            print(f"  FAIL: {len(fk_errors)} foreign key violations", file=sys.stderr)
+            errors += len(fk_errors)
+        else:
+            print("  OK", file=sys.stderr)
+
+        print("Checking delta bases...", file=sys.stderr)
+        orphan_deltas = fa._conn.execute(
+            "SELECT b.digest FROM blob b LEFT JOIN blob base ON b.base_digest = base.digest "
+            "WHERE b.codec = 'zstd_delta' AND base.digest IS NULL"
+        ).fetchall()
+        if orphan_deltas:
+            print(
+                f"  FAIL: {len(orphan_deltas)} delta blobs with missing base",
+                file=sys.stderr,
+            )
+            errors += len(orphan_deltas)
+        else:
+            print("  OK", file=sys.stderr)
+
+        print("Checking chunked blob manifests...", file=sys.stderr)
+        empty_chunked = fa._conn.execute(
+            "SELECT b.digest FROM blob b LEFT JOIN blob_chunk bc ON b.digest = bc.blob_digest "
+            "WHERE b.codec = 'chunked' AND bc.blob_digest IS NULL"
+        ).fetchall()
+        if empty_chunked:
+            print(
+                f"  FAIL: {len(empty_chunked)} chunked blobs with no chunk rows",
+                file=sys.stderr,
+            )
+            errors += len(empty_chunked)
+        else:
+            print("  OK", file=sys.stderr)
+
+        if args.full or args.sample:
+            print("Full blob verification...", file=sys.stderr)
+            blobs = fa._conn.execute(
+                "SELECT digest, raw_size FROM blob ORDER BY digest"
+            ).fetchall()
+            if args.sample:
+                import random
+
+                total_blobs = fa._conn.execute("SELECT COUNT(*) FROM blob").fetchone()[
+                    0
+                ]
+                if len(blobs) > args.sample:
+                    blobs = random.sample(blobs, args.sample)
+                    print(
+                        f"  Sampling {args.sample} of {total_blobs} blobs",
+                        file=sys.stderr,
+                    )
+
+            for digest, raw_size in blobs:
+                try:
+                    data = fa.read(digest)
+                    if data is None:
+                        print(
+                            f"  FAIL: {digest[:16]}.. — blob not readable",
+                            file=sys.stderr,
+                        )
+                        errors += 1
+                    elif len(data) != raw_size:
+                        print(
+                            f"  FAIL: {digest[:16]}.. — size mismatch: expected {raw_size}, got {len(data)}",
+                            file=sys.stderr,
+                        )
+                        errors += 1
+                    else:
+                        import hashlib
+
+                        computed = hashlib.sha256(data).hexdigest()
+                        if computed != digest:
+                            print(
+                                f"  FAIL: {digest[:16]}.. — digest mismatch",
+                                file=sys.stderr,
+                            )
+                            errors += 1
+                    checked += 1
+                except Exception as e:
+                    print(f"  FAIL: {digest[:16]}.. — {e}", file=sys.stderr)
+                    errors += 1
+                    checked += 1
+
+        if errors == 0:
+            print(f"Verify OK. Checked {checked} blob(s).", file=sys.stderr)
+        else:
+            print(f"Verify FAILED. {errors} error(s) found.", file=sys.stderr)
+            sys.exit(1)
+
+
+def _cmd_migrate(args: argparse.Namespace) -> None:
+    """Explicit schema migration."""
+    from farchive._schema import detect_schema_version, SCHEMA_VERSION
+
+    with Farchive(args.db) as fa:
+        current = detect_schema_version(fa._conn)
+        if current == 0:
+            print(
+                "No existing archive found. Use normally to create one.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if current == SCHEMA_VERSION:
+            print(
+                f"Already at schema version {SCHEMA_VERSION}. No migration needed.",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"Schema is already at version {current}. Migration happens automatically on open.",
+                file=sys.stderr,
+            )
+
+
+def _cmd_schema(args: argparse.Namespace) -> None:
+    """Show schema information."""
+    from farchive._schema import detect_schema_version, SCHEMA_VERSION
+
+    with Farchive(args.db) as fa:
+        current = detect_schema_version(fa._conn)
+        print(f"Current schema version: {current}")
+        print(f"Library supports up to: {SCHEMA_VERSION}")
+        if current < SCHEMA_VERSION:
+            print("Note: archive will be auto-migrated on next write.", file=sys.stderr)
+        elif current > SCHEMA_VERSION:
+            print(
+                "Warning: archive schema is newer than library. Upgrade farchive.",
+                file=sys.stderr,
+            )
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         prog="farchive",
@@ -1266,6 +1491,41 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--text", action="store_true", help="Show text diff if UTF-8")
     p.add_argument("db", nargs="?", default=_DEFAULT_DB, help="DB path")
 
+    # optimize
+    p = sub.add_parser("optimize", help="Run maintenance: repack + rechunk")
+    p.add_argument("db", nargs="?", default=_DEFAULT_DB, help="DB path")
+    p.add_argument("--storage-class", default=None, help="Storage class filter")
+    p.add_argument("--batch-size", type=int, default=1000, help="Repack batch size")
+    p.add_argument("--no-repack", action="store_true", help="Skip repack")
+    p.add_argument("--no-rechunk", action="store_true", help="Skip rechunk")
+    p.add_argument(
+        "--rechunk-batch-size", type=int, default=100, help="Rechunk batch size"
+    )
+    p.add_argument(
+        "--rechunk-min-blob-size", type=int, default=None, help="Rechunk min blob size"
+    )
+
+    # vacuum
+    p = sub.add_parser("vacuum", help="SQLite maintenance")
+    p.add_argument("db", nargs="?", default=_DEFAULT_DB, help="DB path")
+    p.add_argument("--analyze", action="store_true", help="Run ANALYZE")
+    p.add_argument("--checkpoint", action="store_true", help="WAL checkpoint")
+    p.add_argument("--vacuum", action="store_true", help="Run VACUUM")
+
+    # verify
+    p = sub.add_parser("verify", help="Verify archive integrity")
+    p.add_argument("db", nargs="?", default=_DEFAULT_DB, help="DB path")
+    p.add_argument("--full", action="store_true", help="Full blob verification")
+    p.add_argument("--sample", type=int, default=None, help="Verify N random blobs")
+
+    # migrate
+    p = sub.add_parser("migrate", help="Explicit schema migration")
+    p.add_argument("db", nargs="?", default=_DEFAULT_DB, help="DB path")
+
+    # schema
+    p = sub.add_parser("schema", help="Show schema information")
+    p.add_argument("db", nargs="?", default=_DEFAULT_DB, help="DB path")
+
     args = parser.parse_args(argv)
     if args.command is None:
         parser.print_help()
@@ -1292,6 +1552,11 @@ def main(argv: list[str] | None = None) -> None:
         "import-manifest": _cmd_import_manifest,
         "extract": _cmd_extract,
         "diff": _cmd_diff,
+        "optimize": _cmd_optimize,
+        "vacuum": _cmd_vacuum,
+        "verify": _cmd_verify,
+        "migrate": _cmd_migrate,
+        "schema": _cmd_schema,
     }
     cmds[args.command](args)
 
