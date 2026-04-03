@@ -111,6 +111,7 @@ class ArchiveStats:
     total_stored_bytes: int
     compression_ratio: float | None
     codec_distribution: dict[str, dict]
+    storage_class_distribution: dict[str, dict]
     db_path: str
     schema_version: int
     chunk_count: int

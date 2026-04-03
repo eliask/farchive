@@ -1379,6 +1379,18 @@ class Farchive:
                 entry["logical_stored"] = logical
             codec_dist[row[0]] = entry
 
+        storage_class_dist: dict[str, dict] = {}
+        for row in self._conn.execute(
+            "SELECT COALESCE(storage_class, '(none)'), COUNT(*), "
+            "SUM(raw_size), SUM(stored_self_size) "
+            "FROM blob GROUP BY storage_class",
+        ).fetchall():
+            storage_class_dist[row[0]] = {
+                "count": row[1],
+                "raw": row[2],
+                "stored": row[3],
+            }
+
         return ArchiveStats(
             locator_count=loc_count,
             blob_count=blob_count,
@@ -1388,6 +1400,7 @@ class Farchive:
             total_stored_bytes=total_stored,
             compression_ratio=(totals[0] / total_stored) if total_stored else None,
             codec_distribution=codec_dist,
+            storage_class_distribution=storage_class_dist,
             db_path=str(self._db_path),
             schema_version=db_version,
             chunk_count=chunk_count,

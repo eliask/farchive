@@ -38,6 +38,24 @@ def _cmd_stats(args: argparse.Namespace) -> None:
                     f"  {key:<12} {d['count']:>8,} blobs  "
                     f"{d['raw']:>12,} raw  {d['stored']:>12,} stored  ({r:.1f}x)"
                 )
+    if st.storage_class_distribution:
+        classes = sorted(
+            st.storage_class_distribution.items(),
+            key=lambda kv: kv[1]["stored"],
+            reverse=True,
+        )
+        if not args.verbose:
+            classes = classes[:10]
+        print("\nStorage class distribution:")
+        for key, d in classes:
+            r = d["raw"] / d["stored"] if d["stored"] else 0
+            print(
+                f"  {key:<12} {d['count']:>8,} blobs  "
+                f"{d['raw']:>12,} raw  {d['stored']:>12,} stored  ({r:.1f}x)"
+            )
+        if not args.verbose and len(st.storage_class_distribution) > 10:
+            remaining = len(st.storage_class_distribution) - 10
+            print(f"  ... and {remaining} more class(es) (use --verbose to show all)")
 
 
 def _cmd_history(args: argparse.Namespace) -> None:
@@ -205,6 +223,9 @@ def main(argv: list[str] | None = None) -> None:
     # stats
     p = sub.add_parser("stats", help="Show archive statistics")
     p.add_argument("db", nargs="?", default=_DEFAULT_DB, help="DB path")
+    p.add_argument(
+        "-v", "--verbose", action="store_true", help="Show all storage classes"
+    )
 
     # history
     p = sub.add_parser("history", help="Show span history for a locator")
