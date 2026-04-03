@@ -1,8 +1,10 @@
-"""Farchive CLI — stats, history, locators, events, inspect, train-dict, repack, rechunk."""
+"""Farchive CLI — content-addressed archive with observation history."""
 
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import sys
 
 from farchive._archive import Farchive
@@ -213,6 +215,114 @@ def _cmd_inspect(args: argparse.Namespace) -> None:
             print(f"  {loc[0]}")
 
 
+# ---------------------------------------------------------------------------
+# Phase 1: cat, store, resolve, has
+# ---------------------------------------------------------------------------
+
+
+def _cmd_cat(args: argparse.Namespace) -> None:
+    """Write raw bytes to stdout. Errors to stderr. Nothing else."""
+    with Farchive(args.db) as fa:
+        if args.digest:
+            data = fa.read(args.digest)
+            if data is None:
+                print(f"Digest not found: {args.digest}", file=sys.stderr)
+                sys.exit(1)
+        elif args.locator:
+            span = fa.resolve(args.locator, at=args.at)
+            if span is None:
+                print(f"No span found for locator: {args.locator}", file=sys.stderr)
+                sys.exit(1)
+            data = fa.read(span.digest)
+            if data is None:
+                print(f"Blob missing for digest: {span.digest}", file=sys.stderr)
+                sys.exit(1)
+        else:
+            print("Error: --locator or --digest is required", file=sys.stderr)
+            sys.exit(1)
+    sys.stdout.buffer.write(data)
+
+
+def _cmd_store(args: argparse.Namespace) -> None:
+    """Store content at a locator. Reads from file or stdin."""
+    if args.path == "-":
+        data = sys.stdin.buffer.read()
+    else:
+        if not os.path.isfile(args.path):
+            print(f"File not found: {args.path}", file=sys.stderr)
+            sys.exit(1)
+        with open(args.path, "rb") as f:
+            data = f.read()
+
+    metadata = None
+    if args.metadata_json:
+        try:
+            metadata = json.loads(args.metadata_json)
+        except json.JSONDecodeError as e:
+            print(f"Invalid JSON in --metadata-json: {e}", file=sys.stderr)
+            sys.exit(1)
+
+    with Farchive(args.db) as fa:
+        digest = fa.store(
+            args.locator,
+            data,
+            observed_at=args.observed_at,
+            storage_class=args.storage_class,
+            metadata=metadata,
+        )
+
+    if args.json:
+        print(json.dumps({"digest": digest, "locator": args.locator}))
+    else:
+        print(digest)
+
+
+def _cmd_resolve(args: argparse.Namespace) -> None:
+    """Show what a locator resolves to (span metadata, not bytes)."""
+    with Farchive(args.db) as fa:
+        span = fa.resolve(args.locator, at=args.at)
+
+    if span is None:
+        print(f"No span found for locator: {args.locator}", file=sys.stderr)
+        sys.exit(1)
+
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "span_id": span.span_id,
+                    "locator": span.locator,
+                    "digest": span.digest,
+                    "observed_from": span.observed_from,
+                    "observed_until": span.observed_until,
+                    "last_confirmed_at": span.last_confirmed_at,
+                    "observation_count": span.observation_count,
+                    "last_metadata": span.last_metadata,
+                }
+            )
+        )
+    else:
+        until = str(span.observed_until) if span.observed_until else "current"
+        print(f"Locator:        {span.locator}")
+        print(f"Digest:         {span.digest}")
+        print(f"Observed from:  {span.observed_from}")
+        print(f"Observed until: {until}")
+        print(f"Last confirmed: {span.last_confirmed_at}")
+        print(f"Observations:   {span.observation_count}")
+        if span.last_metadata:
+            print(f"Metadata:       {json.dumps(span.last_metadata)}")
+
+
+def _cmd_has(args: argparse.Namespace) -> None:
+    """Check if a locator has a current span, optionally within a freshness window.
+
+    Exit 0 if present/fresh, exit 1 if absent/stale.
+    """
+    with Farchive(args.db) as fa:
+        result = fa.has(args.locator, max_age_hours=args.max_age_hours)
+    sys.exit(0 if result else 1)
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         prog="farchive",
@@ -270,6 +380,38 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--batch-size", type=int, default=100, help="Max blobs rewritten")
     p.add_argument("--min-blob-size", type=int, default=None, help="Min raw size")
 
+    # cat
+    p = sub.add_parser("cat", help="Write raw bytes to stdout")
+    p.add_argument("--locator", default=None, help="Locator to read")
+    p.add_argument("--digest", default=None, help="Digest to read")
+    p.add_argument("--at", type=int, default=None, help="Point-in-time (Unix ms)")
+    p.add_argument("db", nargs="?", default=_DEFAULT_DB, help="DB path")
+
+    # store
+    p = sub.add_parser("store", help="Store content at a locator")
+    p.add_argument("path", help="File path, or '-' for stdin")
+    p.add_argument("--locator", required=True, help="Locator string")
+    p.add_argument("--storage-class", default=None, help="Storage class hint")
+    p.add_argument("--observed-at", type=int, default=None, help="Unix ms timestamp")
+    p.add_argument("--metadata-json", default=None, help="JSON metadata string")
+    p.add_argument("--json", action="store_true", help="Output as JSON")
+    p.add_argument("db", nargs="?", default=_DEFAULT_DB, help="DB path")
+
+    # resolve
+    p = sub.add_parser("resolve", help="Show what a locator resolves to")
+    p.add_argument("--locator", required=True, help="Locator string")
+    p.add_argument("--at", type=int, default=None, help="Point-in-time (Unix ms)")
+    p.add_argument("--json", action="store_true", help="Output as JSON")
+    p.add_argument("db", nargs="?", default=_DEFAULT_DB, help="DB path")
+
+    # has
+    p = sub.add_parser("has", help="Check if locator has a current span")
+    p.add_argument("--locator", required=True, help="Locator string")
+    p.add_argument(
+        "--max-age-hours", type=float, default=float("inf"), help="Freshness window"
+    )
+    p.add_argument("db", nargs="?", default=_DEFAULT_DB, help="DB path")
+
     args = parser.parse_args(argv)
     if args.command is None:
         parser.print_help()
@@ -284,6 +426,10 @@ def main(argv: list[str] | None = None) -> None:
         "events": _cmd_events,
         "inspect": _cmd_inspect,
         "rechunk": _cmd_rechunk,
+        "cat": _cmd_cat,
+        "store": _cmd_store,
+        "resolve": _cmd_resolve,
+        "has": _cmd_has,
     }
     cmds[args.command](args)
 
