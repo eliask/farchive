@@ -960,6 +960,115 @@ def _cmd_import_manifest(args: argparse.Namespace) -> None:
         )
 
 
+# ---------------------------------------------------------------------------
+# Phase 4: extract, diff
+# ---------------------------------------------------------------------------
+
+
+def _cmd_extract(args: argparse.Namespace) -> None:
+    """Write bytes to a file. Supports --at for point-in-time."""
+    with Farchive(args.db) as fa:
+        if args.digest:
+            data = fa.read(args.digest)
+            if data is None:
+                print(f"Digest not found: {args.digest}", file=sys.stderr)
+                sys.exit(1)
+        elif args.locator:
+            span = fa.resolve(args.locator, at=args.at)
+            if span is None:
+                print(f"No span found for locator: {args.locator}", file=sys.stderr)
+                sys.exit(1)
+            data = fa.read(span.digest)
+            if data is None:
+                print(f"Blob missing for digest: {span.digest}", file=sys.stderr)
+                sys.exit(1)
+        else:
+            print("Error: --locator or --digest is required", file=sys.stderr)
+            sys.exit(1)
+
+    if args.output:
+        out = Path(args.output)
+        if out.is_dir():
+            print(f"Output is a directory: {args.output}", file=sys.stderr)
+            sys.exit(1)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(data)
+        print(f"Wrote {len(data):,} bytes to {args.output}", file=sys.stderr)
+    else:
+        sys.stdout.buffer.write(data)
+
+
+def _cmd_diff(args: argparse.Namespace) -> None:
+    """Compare two blob versions. Always shows size/digest comparison."""
+    with Farchive(args.db) as fa:
+        if args.locator:
+            if args.from_at is not None and args.to_at is not None:
+                span_from = fa.resolve(args.locator, at=args.from_at)
+                span_to = fa.resolve(args.locator, at=args.to_at)
+            else:
+                spans = fa.history(args.locator)
+                if len(spans) < 2:
+                    print(
+                        "Need at least 2 spans to diff. "
+                        "Use --from-at and --to-at to compare specific versions.",
+                        file=sys.stderr,
+                    )
+                    sys.exit(1)
+                span_to = spans[0]
+                span_from = spans[1]
+
+            if span_from is None or span_to is None:
+                print("Could not resolve both versions", file=sys.stderr)
+                sys.exit(1)
+            digest_a = span_from.digest
+            digest_b = span_to.digest
+        elif args.digest and args.other_digest:
+            digest_a = args.digest
+            digest_b = args.other_digest
+        else:
+            print(
+                "Error: --locator or (--digest and --other-digest) required",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        data_a = fa.read(digest_a)
+        data_b = fa.read(digest_b)
+        if data_a is None or data_b is None:
+            print("Could not read one or both blobs", file=sys.stderr)
+            sys.exit(1)
+
+    # Always show summary
+    same = data_a == data_b
+    print(f"Digest A: {digest_a}")
+    print(f"Digest B: {digest_b}")
+    print(f"Size A:   {len(data_a):,} bytes")
+    print(f"Size B:   {len(data_b):,} bytes")
+    print(f"Identical: {same}")
+
+    if same:
+        return
+
+    # Optional text diff if user asks and bytes decode as text
+    if args.text:
+        try:
+            text_a = data_a.decode("utf-8")
+            text_b = data_b.decode("utf-8")
+        except UnicodeDecodeError:
+            print("Cannot diff: one or both blobs are not valid UTF-8", file=sys.stderr)
+            sys.exit(1)
+
+        import difflib
+
+        diff = difflib.unified_diff(
+            text_a.splitlines(keepends=True),
+            text_b.splitlines(keepends=True),
+            fromfile=f"digest A ({digest_a[:12]})",
+            tofile=f"digest B ({digest_b[:12]})",
+        )
+        sys.stdout.writelines(diff)
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         prog="farchive",
@@ -1139,6 +1248,24 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--dry-run", action="store_true", help="Show what would be imported")
     p.add_argument("db", nargs="?", default=_DEFAULT_DB, help="DB path")
 
+    # extract
+    p = sub.add_parser("extract", help="Write bytes to a file")
+    p.add_argument("--locator", default=None, help="Locator to extract")
+    p.add_argument("--digest", default=None, help="Digest to extract")
+    p.add_argument("--at", type=int, default=None, help="Point-in-time (Unix ms)")
+    p.add_argument("-o", "--output", default=None, help="Output file path")
+    p.add_argument("db", nargs="?", default=_DEFAULT_DB, help="DB path")
+
+    # diff
+    p = sub.add_parser("diff", help="Compare two blob versions")
+    p.add_argument("--locator", default=None, help="Locator to compare")
+    p.add_argument("--digest", default=None, help="First digest")
+    p.add_argument("--other-digest", default=None, help="Second digest")
+    p.add_argument("--from-at", type=int, default=None, help="From timestamp (Unix ms)")
+    p.add_argument("--to-at", type=int, default=None, help="To timestamp (Unix ms)")
+    p.add_argument("--text", action="store_true", help="Show text diff if UTF-8")
+    p.add_argument("db", nargs="?", default=_DEFAULT_DB, help="DB path")
+
     args = parser.parse_args(argv)
     if args.command is None:
         parser.print_help()
@@ -1163,6 +1290,8 @@ def main(argv: list[str] | None = None) -> None:
         "observe": _cmd_observe,
         "import-files": _cmd_import_files,
         "import-manifest": _cmd_import_manifest,
+        "extract": _cmd_extract,
+        "diff": _cmd_diff,
     }
     cmds[args.command](args)
 
