@@ -7,7 +7,7 @@ import json
 import os
 import sys
 import fnmatch
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 
 from typing import Any
@@ -17,8 +17,41 @@ from farchive._archive import _sha256
 
 
 def _ms_to_dt(ms: int) -> datetime:
-    """Convert Unix milliseconds to UTC datetime."""
-    return datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc)
+    """Convert Unix milliseconds to local datetime."""
+    return datetime.fromtimestamp(ms / 1000.0).astimezone()
+
+
+def _parse_timestamp(value: str) -> datetime:
+    """Parse a timestamp from ISO 8601 string or Unix milliseconds.
+
+    Naive strings (no timezone) are interpreted as local time.
+    """
+    # Try ISO 8601 first
+    for fmt in (
+        "%Y-%m-%dT%H:%M:%S%z",
+        "%Y-%m-%dT%H:%M:%SZ",
+        "%Y-%m-%dT%H:%M:%S.%f%z",
+        "%Y-%m-%dT%H:%M:%S.%fZ",
+        "%Y-%m-%d %H:%M:%S%z",
+        "%Y-%m-%d %H:%M:%SZ",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d %H:%M:%S",
+    ):
+        try:
+            dt = datetime.strptime(value, fmt)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=datetime.now().astimezone().tzinfo)
+            return dt
+        except ValueError:
+            continue
+    # Fall back to integer milliseconds
+    return _ms_to_dt(int(value))
+
+
+def _format_dt(dt: datetime) -> str:
+    """Format datetime in local time, human-readable."""
+    local = dt.astimezone()
+    return local.strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _json_default(obj):
@@ -106,10 +139,10 @@ def _cmd_history(args: argparse.Namespace) -> None:
     )
     print("-" * 74)
     for s in spans:
-        until = str(s.observed_until) if s.observed_until else "current"
+        until = _format_dt(s.observed_until) if s.observed_until else "current"
         print(
-            f"{s.span_id:>8}  {s.digest[:12]:<14} {s.observed_from:<16} "
-            f"{until:<16} {s.observation_count:>6}"
+            f"{s.span_id:>8}  {s.digest[:12]:<14} {_format_dt(s.observed_from):<20} "
+            f"{until:<20} {s.observation_count:>6}"
         )
 
 
@@ -123,15 +156,15 @@ def _cmd_locators(args: argparse.Namespace) -> None:
 
 def _cmd_train_dict(args: argparse.Namespace) -> None:
     if not args.storage_class:
-        print("Error: --storage-class is required", file=sys.stderr)
+        print("Error: storage_class is required", file=sys.stderr)
         sys.exit(1)
     with Farchive(args.db) as fa:
         sc = args.storage_class
         print(
-            f"Training dict (storage_class={sc!r}, samples={args.sample_size})...",
+            f"Training dict (storage_class={sc!r}, samples={args.samples})...",
             file=sys.stderr,
         )
-        dict_id = fa.train_dict(sample_size=args.sample_size, storage_class=sc)
+        dict_id = fa.train_dict(sample_size=args.samples, storage_class=sc)
         row = fa._conn.execute(
             "SELECT sample_count, dict_size FROM dict WHERE dict_id=?",
             (dict_id,),
@@ -155,7 +188,7 @@ def _cmd_events(args: argparse.Namespace) -> None:
     with Farchive(args.db) as fa:
         events = fa.events(
             locator=args.locator or None,
-            since=_ms_to_dt(args.since) if args.since is not None else None,
+            since=_parse_timestamp(args.since) if args.since else None,
             limit=args.limit,
         )
     if not events:
@@ -168,7 +201,7 @@ def _cmd_events(args: argparse.Namespace) -> None:
     for e in events:
         digest = e.digest[:12] if e.digest else ""
         print(
-            f"{e.event_id:>8}  {e.occurred_at:<16} {e.locator:<30} {digest:<14} {e.kind:<12}"
+            f"{e.event_id:>8}  {_format_dt(e.occurred_at):<20} {e.locator:<30} {digest:<14} {e.kind:<12}"
         )
     print(f"\n{len(events)} events", file=sys.stderr)
 
@@ -179,7 +212,7 @@ def _cmd_rechunk(args: argparse.Namespace) -> None:
         stats = fa.rechunk(
             storage_class=sc,
             batch_size=args.batch_size,
-            min_blob_size=args.min_blob_size,
+            min_blob_size=args.min_size,
         )
     print(
         f"Rechunked: {stats.blobs_rewritten:,} blobs, "
@@ -257,25 +290,25 @@ def _cmd_inspect(args: argparse.Namespace) -> None:
 def _cmd_cat(args: argparse.Namespace) -> None:
     """Write raw bytes to stdout. Errors to stderr. Nothing else."""
     with Farchive(args.db) as fa:
-        if args.digest:
-            data = fa.read(args.digest)
+        ref = args.ref
+        # Detect if ref is a digest (64 hex chars) or a locator
+        is_digest = len(ref) == 64 and all(c in "0123456789abcdef" for c in ref.lower())
+        at = _parse_timestamp(args.at) if args.at else None
+
+        if is_digest:
+            data = fa.read(ref)
             if data is None:
-                print(f"Digest not found: {args.digest}", file=sys.stderr)
+                print(f"Digest not found: {ref}", file=sys.stderr)
                 sys.exit(1)
-        elif args.locator:
-            span = fa.resolve(
-                args.locator, at=_ms_to_dt(args.at) if args.at is not None else None
-            )
+        else:
+            span = fa.resolve(ref, at=at)
             if span is None:
-                print(f"No span found for locator: {args.locator}", file=sys.stderr)
+                print(f"No span found for locator: {ref}", file=sys.stderr)
                 sys.exit(1)
             data = fa.read(span.digest)
             if data is None:
                 print(f"Blob missing for digest: {span.digest}", file=sys.stderr)
                 sys.exit(1)
-        else:
-            print("Error: --locator or --digest is required", file=sys.stderr)
-            sys.exit(1)
     sys.stdout.buffer.write(data)
 
 
@@ -291,20 +324,18 @@ def _cmd_store(args: argparse.Namespace) -> None:
             data = f.read()
 
     metadata = None
-    if args.metadata_json:
+    if args.metadata:
         try:
-            metadata = json.loads(args.metadata_json)
+            metadata = json.loads(args.metadata)
         except json.JSONDecodeError as e:
-            print(f"Invalid JSON in --metadata-json: {e}", file=sys.stderr)
+            print(f"Invalid JSON in --metadata: {e}", file=sys.stderr)
             sys.exit(1)
 
     with Farchive(args.db) as fa:
         digest = fa.store(
             args.locator,
             data,
-            observed_at=_ms_to_dt(args.observed_at)
-            if args.observed_at is not None
-            else None,
+            observed_at=_parse_timestamp(args.at) if args.at else None,
             storage_class=args.storage_class,
             metadata=metadata,
         )
@@ -319,7 +350,7 @@ def _cmd_resolve(args: argparse.Namespace) -> None:
     """Show what a locator resolves to (span metadata, not bytes)."""
     with Farchive(args.db) as fa:
         span = fa.resolve(
-            args.locator, at=_ms_to_dt(args.at) if args.at is not None else None
+            args.locator, at=_parse_timestamp(args.at) if args.at else None
         )
 
     if span is None:
@@ -342,12 +373,12 @@ def _cmd_resolve(args: argparse.Namespace) -> None:
             )
         )
     else:
-        until = span.observed_until.isoformat() if span.observed_until else "current"
+        until = _format_dt(span.observed_until) if span.observed_until else "current"
         print(f"Locator:        {span.locator}")
         print(f"Digest:         {span.digest}")
-        print(f"Observed from:  {span.observed_from.isoformat()}")
+        print(f"Observed from:  {_format_dt(span.observed_from)}")
         print(f"Observed until: {until}")
-        print(f"Last confirmed: {span.last_confirmed_at.isoformat()}")
+        print(f"Last confirmed: {_format_dt(span.last_confirmed_at)}")
         print(f"Observations:   {span.observation_count}")
         if span.last_metadata:
             print(f"Metadata:       {_json_dumps(span.last_metadata)}")
@@ -359,7 +390,7 @@ def _cmd_has(args: argparse.Namespace) -> None:
     Exit 0 if present/fresh, exit 1 if absent/stale.
     """
     with Farchive(args.db) as fa:
-        result = fa.has(args.locator, max_age_hours=args.max_age_hours)
+        result = fa.has(args.locator, max_age_hours=args.max_age)
     sys.exit(0 if result else 1)
 
 
@@ -370,8 +401,58 @@ def _cmd_has(args: argparse.Namespace) -> None:
 
 def _cmd_du(args: argparse.Namespace) -> None:
     """Storage accounting: where are the bytes going?"""
+    # Default to storage-class grouping if nothing specified
+    by = args.by or "storage-class"
     with Farchive(args.db) as fa:
-        if args.by == "storage-class":
+        # --locator without --by shows per-span storage for that locator
+        if args.locator and not args.by:
+            rows = fa._conn.execute(
+                "SELECT b.codec, b.raw_size, b.stored_self_size, "
+                "b.storage_class, ls.observed_from, ls.observed_until "
+                "FROM locator_span ls JOIN blob b ON ls.digest = b.digest "
+                "WHERE ls.locator = ? ORDER BY ls.observed_from DESC",
+                (args.locator,),
+            ).fetchall()
+            if not rows:
+                print(f"No spans found for locator: {args.locator}", file=sys.stderr)
+                sys.exit(1)
+            if not args.json:
+                print(f"Storage for: {args.locator}")
+                print(
+                    f"{'codec':<14} {'raw_size':>12} {'stored':>12} {'class':<10} {'from':<20} {'until':<20}"
+                )
+                print("-" * 90)
+                for r in rows:
+                    until = (
+                        _format_dt(
+                            datetime.fromtimestamp(
+                                r["observed_until"] / 1000.0
+                            ).astimezone()
+                        )
+                        if r["observed_until"]
+                        else "current"
+                    )
+                    print(
+                        f"{r['codec']:<14} {r['raw_size']:>12,} {r['stored_self_size']:>12,} "
+                        f"{(r['storage_class'] or ''):<10} {_format_dt(datetime.fromtimestamp(r['observed_from'] / 1000.0).astimezone()):<20} {until:<20}"
+                    )
+            else:
+                items = []
+                for r in rows:
+                    items.append(
+                        {
+                            "codec": r["codec"],
+                            "raw_size": r["raw_size"],
+                            "stored_self_size": r["stored_self_size"],
+                            "storage_class": r["storage_class"],
+                            "observed_from": r["observed_from"],
+                            "observed_until": r["observed_until"],
+                        }
+                    )
+                print(_json_dumps(items, indent=2))
+            return
+
+        if by == "storage-class":
             rows = fa._conn.execute(
                 "SELECT COALESCE(storage_class, '(none)') as sc, "
                 "COUNT(*) as cnt, SUM(raw_size) as raw, "
@@ -399,7 +480,7 @@ def _cmd_du(args: argparse.Namespace) -> None:
                 ]
                 print(_json_dumps(items, indent=2))
 
-        elif args.by == "codec":
+        elif by == "codec":
             rows = fa._conn.execute(
                 "SELECT codec, COUNT(*) as cnt, SUM(raw_size) as raw, "
                 "SUM(stored_self_size) as stored "
@@ -424,7 +505,7 @@ def _cmd_du(args: argparse.Namespace) -> None:
                 ]
                 print(_json_dumps(items, indent=2))
 
-        elif args.by == "locator":
+        elif by == "locator":
             rows = fa._conn.execute(
                 "SELECT ls.locator, COUNT(DISTINCT ls.digest) as blobs, "
                 "COALESCE(SUM(digest_raw.raw_size), 0) as raw, "
@@ -454,46 +535,6 @@ def _cmd_du(args: argparse.Namespace) -> None:
                     }
                     for r in rows
                 ]
-                print(_json_dumps(items, indent=2))
-
-        elif args.locator:
-            rows = fa._conn.execute(
-                "SELECT b.codec, b.raw_size, b.stored_self_size, "
-                "b.storage_class, ls.observed_from, ls.observed_until "
-                "FROM locator_span ls JOIN blob b ON ls.digest = b.digest "
-                "WHERE ls.locator = ? ORDER BY ls.observed_from DESC",
-                (args.locator,),
-            ).fetchall()
-            if not rows:
-                print(f"No spans found for locator: {args.locator}", file=sys.stderr)
-                sys.exit(1)
-            if not args.json:
-                print(f"Storage for: {args.locator}")
-                print(
-                    f"{'codec':<14} {'raw_size':>12} {'stored':>12} {'class':<10} {'from':<16} {'until':<16}"
-                )
-                print("-" * 84)
-                for r in rows:
-                    until = (
-                        str(r["observed_until"]) if r["observed_until"] else "current"
-                    )
-                    print(
-                        f"{r['codec']:<14} {r['raw_size']:>12,} {r['stored_self_size']:>12,} "
-                        f"{(r['storage_class'] or ''):<10} {r['observed_from']:<16} {until:<16}"
-                    )
-            else:
-                items = []
-                for r in rows:
-                    items.append(
-                        {
-                            "codec": r["codec"],
-                            "raw_size": r["raw_size"],
-                            "stored_self_size": r["stored_self_size"],
-                            "storage_class": r["storage_class"],
-                            "observed_from": r["observed_from"],
-                            "observed_until": r["observed_until"],
-                        }
-                    )
                 print(_json_dumps(items, indent=2))
         else:
             print(
@@ -527,10 +568,18 @@ def _cmd_ls(args: argparse.Namespace) -> None:
                 params.append(args.locator)
             if args.since:
                 query += " AND observed_from >= ?"
-                params.append(args.since)
+                params.append(
+                    int(args.since)
+                    if args.since.isdigit()
+                    else int(_parse_timestamp(args.since).timestamp() * 1000)
+                )
             if args.until:
                 query += " AND observed_until <= ?"
-                params.append(args.until)
+                params.append(
+                    int(args.until)
+                    if args.until.isdigit()
+                    else int(_parse_timestamp(args.until).timestamp() * 1000)
+                )
             query += " ORDER BY observed_from DESC"
             if args.limit:
                 query += " LIMIT ?"
@@ -563,11 +612,17 @@ def _cmd_ls(args: argparse.Namespace) -> None:
                 print("-" * 94)
                 for r in rows:
                     until = (
-                        str(r["observed_until"]) if r["observed_until"] else "current"
+                        _format_dt(
+                            datetime.fromtimestamp(
+                                r["observed_until"] / 1000.0
+                            ).astimezone()
+                        )
+                        if r["observed_until"]
+                        else "current"
                     )
                     print(
                         f"{r['span_id']:>8}  {r['locator']:<30} {r['digest'][:12]:<14} "
-                        f"{r['observed_from']:<16} {until:<16} {r['observation_count']:>6}"
+                        f"{_format_dt(datetime.fromtimestamp(r['observed_from'] / 1000.0).astimezone()):<20} {until:<20} {r['observation_count']:>6}"
                     )
 
         elif subcmd == "blobs":
@@ -634,10 +689,18 @@ def _cmd_ls(args: argparse.Namespace) -> None:
                 params.append(args.kind)
             if args.since:
                 query += " AND occurred_at >= ?"
-                params.append(args.since)
+                params.append(
+                    int(args.since)
+                    if args.since.isdigit()
+                    else int(_parse_timestamp(args.since).timestamp() * 1000)
+                )
             if args.until:
                 query += " AND occurred_at <= ?"
-                params.append(args.until)
+                params.append(
+                    int(args.until)
+                    if args.until.isdigit()
+                    else int(_parse_timestamp(args.until).timestamp() * 1000)
+                )
             query += " ORDER BY occurred_at DESC"
             if args.limit:
                 query += " LIMIT ?"
@@ -672,7 +735,7 @@ def _cmd_ls(args: argparse.Namespace) -> None:
                 for r in rows:
                     digest = r["digest"][:12] if r["digest"] else ""
                     print(
-                        f"{r['event_id']:>8}  {r['occurred_at']:<16} {r['locator']:<30} "
+                        f"{r['event_id']:>8}  {_format_dt(datetime.fromtimestamp(r['occurred_at'] / 1000.0).astimezone()):<20} {r['locator']:<30} "
                         f"{digest:<14} {r['kind']:<12}"
                     )
 
@@ -781,20 +844,18 @@ def _cmd_put_blob(args: argparse.Namespace) -> None:
 def _cmd_observe(args: argparse.Namespace) -> None:
     """Record an observation of an existing digest at a locator."""
     metadata = None
-    if args.metadata_json:
+    if args.metadata:
         try:
-            metadata = json.loads(args.metadata_json)
+            metadata = json.loads(args.metadata)
         except json.JSONDecodeError as e:
-            print(f"Invalid JSON in --metadata-json: {e}", file=sys.stderr)
+            print(f"Invalid JSON in --metadata: {e}", file=sys.stderr)
             sys.exit(1)
 
     with Farchive(args.db) as fa:
         span = fa.observe(
             args.locator,
             args.digest,
-            observed_at=_ms_to_dt(args.observed_at)
-            if args.observed_at is not None
-            else None,
+            observed_at=_parse_timestamp(args.at) if args.at else None,
             metadata=metadata,
         )
 
@@ -824,7 +885,7 @@ def _cmd_import_files(args: argparse.Namespace) -> None:
 
     # Build file list
     if args.from_stdin:
-        raw_paths = sys.stdin.read().split("\0" if args.null_delimited else "\n")
+        raw_paths = sys.stdin.read().split("\0" if args.null else "\n")
         paths = [Path(p.strip()) for p in raw_paths if p.strip()]
     else:
         if args.recursive:
@@ -849,16 +910,16 @@ def _cmd_import_files(args: argparse.Namespace) -> None:
 
     # Determine storage class mapping
     ext_to_sc = {}
-    if args.storage_class_by_ext:
-        for mapping in args.storage_class_by_ext:
+    if args.class_by_ext:
+        for mapping in args.class_by_ext:
             if "=" in mapping:
                 ext, sc = mapping.split("=", 1)
                 ext_to_sc[ext.lstrip(".")] = sc
 
     # Resolve timestamp mode
     observed_at = None
-    if args.observed_at and args.observed_at.startswith("fixed:"):
-        observed_at = int(args.observed_at.split(":", 1)[1])
+    if args.at and args.at.startswith("fixed:"):
+        observed_at = int(args.at.split(":", 1)[1])
 
     # Import
     imported = 0
@@ -883,13 +944,13 @@ def _cmd_import_files(args: argparse.Namespace) -> None:
         ts: datetime | None = None
         if observed_at is not None:
             ts = _ms_to_dt(observed_at)
-        elif args.observed_at == "mtime":
+        elif args.at == "mtime":
             ts = _ms_to_dt(int(p.stat().st_mtime * 1000))
 
         # Build locator
-        if args.locator_prefix:
+        if args.prefix:
             rel = p.relative_to(root)
-            locator = f"{args.locator_prefix}{rel}"
+            locator = f"{args.prefix}{rel}"
         else:
             locator = str(p)
 
@@ -1019,25 +1080,24 @@ def _cmd_import_manifest(args: argparse.Namespace) -> None:
 def _cmd_extract(args: argparse.Namespace) -> None:
     """Write bytes to a file. Supports --at for point-in-time."""
     with Farchive(args.db) as fa:
-        if args.digest:
-            data = fa.read(args.digest)
+        ref = args.ref
+        is_digest = len(ref) == 64 and all(c in "0123456789abcdef" for c in ref.lower())
+        at = _parse_timestamp(args.at) if args.at else None
+
+        if is_digest:
+            data = fa.read(ref)
             if data is None:
-                print(f"Digest not found: {args.digest}", file=sys.stderr)
+                print(f"Digest not found: {ref}", file=sys.stderr)
                 sys.exit(1)
-        elif args.locator:
-            span = fa.resolve(
-                args.locator, at=_ms_to_dt(args.at) if args.at is not None else None
-            )
+        else:
+            span = fa.resolve(ref, at=at)
             if span is None:
-                print(f"No span found for locator: {args.locator}", file=sys.stderr)
+                print(f"No span found for locator: {ref}", file=sys.stderr)
                 sys.exit(1)
             data = fa.read(span.digest)
             if data is None:
                 print(f"Blob missing for digest: {span.digest}", file=sys.stderr)
                 sys.exit(1)
-        else:
-            print("Error: --locator or --digest is required", file=sys.stderr)
-            sys.exit(1)
 
     if args.output:
         out = Path(args.output)
@@ -1054,48 +1114,33 @@ def _cmd_extract(args: argparse.Namespace) -> None:
 def _cmd_diff(args: argparse.Namespace) -> None:
     """Compare two blob versions. Always shows size/digest comparison."""
     with Farchive(args.db) as fa:
-        if args.locator:
-            if args.from_at is not None and args.to_at is not None:
-                span_from = fa.resolve(
-                    args.locator,
-                    at=_ms_to_dt(args.from_at) if args.from_at is not None else None,
-                )
-                span_to = fa.resolve(
-                    args.locator,
-                    at=_ms_to_dt(args.to_at) if args.to_at is not None else None,
-                )
-            else:
-                spans = fa.history(args.locator)
-                if len(spans) < 2:
-                    print(
-                        "Need at least 2 spans to diff. "
-                        "Use --from-at and --to-at to compare specific versions.",
-                        file=sys.stderr,
-                    )
-                    sys.exit(1)
-                span_to = spans[0]
-                span_from = spans[1]
+        ref_a = args.ref_a
+        ref_b = args.ref_b
 
-            if span_from is None or span_to is None:
-                print("Could not resolve both versions", file=sys.stderr)
-                sys.exit(1)
-            digest_a = span_from.digest
-            digest_b = span_to.digest
-        elif args.digest and args.other_digest:
-            digest_a = args.digest
-            digest_b = args.other_digest
-        else:
-            print(
-                "Error: --locator or (--digest and --other-digest) required",
-                file=sys.stderr,
+        def _resolve_ref(ref, at_arg):
+            is_digest = len(ref) == 64 and all(
+                c in "0123456789abcdef" for c in ref.lower()
             )
-            sys.exit(1)
+            at = _parse_timestamp(at_arg) if at_arg else None
+            if is_digest:
+                data = fa.read(ref)
+                if data is None:
+                    print(f"Digest not found: {ref}", file=sys.stderr)
+                    sys.exit(1)
+                return ref, data
+            else:
+                span = fa.resolve(ref, at=at)
+                if span is None:
+                    print(f"No span found for locator: {ref}", file=sys.stderr)
+                    sys.exit(1)
+                data = fa.read(span.digest)
+                if data is None:
+                    print(f"Blob missing for digest: {span.digest}", file=sys.stderr)
+                    sys.exit(1)
+                return span.digest, data
 
-        data_a = fa.read(digest_a)
-        data_b = fa.read(digest_b)
-        if data_a is None or data_b is None:
-            print("Could not read one or both blobs", file=sys.stderr)
-            sys.exit(1)
+        digest_a, data_a = _resolve_ref(ref_a, args.from_at)
+        digest_b, data_b = _resolve_ref(ref_b, args.to_at)
 
     # Always show summary
     same = data_a == data_b
@@ -1139,14 +1184,13 @@ def _cmd_optimize(args: argparse.Namespace) -> None:
         if not args.no_repack:
             sc = args.storage_class
             if sc:
-                repack_stats = fa.repack(storage_class=sc, batch_size=args.batch_size)
+                repack_stats = fa.repack(storage_class=sc, batch_size=1000)
                 print(
                     f"Repack: {repack_stats.blobs_repacked:,} blobs, "
                     f"saved {repack_stats.bytes_saved:,} bytes",
                     file=sys.stderr,
                 )
             else:
-                # Repack each storage class that has blobs
                 classes = fa._conn.execute(
                     "SELECT DISTINCT storage_class FROM blob WHERE storage_class IS NOT NULL"
                 ).fetchall()
@@ -1154,11 +1198,11 @@ def _cmd_optimize(args: argparse.Namespace) -> None:
                 total_saved = 0
                 for row in classes:
                     try:
-                        rs = fa.repack(storage_class=row[0], batch_size=args.batch_size)
+                        rs = fa.repack(storage_class=row[0], batch_size=1000)
                         total_repacked += rs.blobs_repacked
                         total_saved += rs.bytes_saved
                     except ValueError:
-                        pass  # No trained dict for this class
+                        pass
                 if total_repacked > 0:
                     print(
                         f"Repack: {total_repacked:,} blobs, "
@@ -1170,8 +1214,7 @@ def _cmd_optimize(args: argparse.Namespace) -> None:
             try:
                 rechunk_stats = fa.rechunk(
                     storage_class=args.storage_class,
-                    batch_size=args.rechunk_batch_size,
-                    min_blob_size=args.rechunk_min_blob_size,
+                    batch_size=100,
                 )
                 if rechunk_stats.blobs_rewritten > 0:
                     print(
@@ -1366,7 +1409,7 @@ def main(argv: list[str] | None = None) -> None:
         "-v", "--verbose", action="store_true", help="Show all storage classes"
     )
 
-    # history
+    # history LOCATOR
     p = sub.add_parser("history", help="Show span history for a locator")
     p.add_argument("locator", help="Locator string")
     p.add_argument("db", nargs="?", default=_DEFAULT_DB, help="DB path")
@@ -1374,207 +1417,182 @@ def main(argv: list[str] | None = None) -> None:
     # locators
     p = sub.add_parser("locators", help="List locators")
     p.add_argument("db", nargs="?", default=_DEFAULT_DB, help="DB path")
-    p.add_argument("--pattern", default="%", help="LIKE pattern")
+    p.add_argument("--pattern", default="%", help="SQL LIKE pattern (default: %)")
 
     # train-dict
     p = sub.add_parser("train-dict", help="Train a zstd dictionary")
+    p.add_argument("storage_class", help="Storage class")
     p.add_argument("db", nargs="?", default=_DEFAULT_DB, help="DB path")
-    p.add_argument("--storage-class", default=None, help="Storage class filter")
-    p.add_argument("--sample-size", type=int, default=500, help="Training samples")
+    p.add_argument("-n", "--samples", type=int, default=500, help="Training samples")
 
     # repack
     p = sub.add_parser("repack", help="Recompress blobs with latest dict")
+    p.add_argument("-s", "--storage-class", default=None, help="Storage class")
+    p.add_argument("-n", "--batch-size", type=int, default=1000, help="Max repacks")
     p.add_argument("db", nargs="?", default=_DEFAULT_DB, help="DB path")
-    p.add_argument("--storage-class", default=None, help="Storage class filter")
-    p.add_argument("--batch-size", type=int, default=1000, help="Batch size")
 
     # events
     p = sub.add_parser("events", help="Query event log")
+    p.add_argument("-l", "--locator", default=None, help="Filter by locator")
+    p.add_argument("--since", default=None, help="Timestamp >= (ms or ISO 8601)")
+    p.add_argument("-n", "--limit", type=int, default=1000, help="Max events")
     p.add_argument("db", nargs="?", default=_DEFAULT_DB, help="DB path")
-    p.add_argument("--locator", default=None, help="Filter by locator")
-    p.add_argument(
-        "--since", type=int, default=None, help="Filter: occurred_at >= since"
-    )
-    p.add_argument("--limit", type=int, default=1000, help="Max events")
 
-    # inspect
+    # inspect DIGEST
     p = sub.add_parser("inspect", help="Show blob metadata by digest")
     p.add_argument("digest", help="SHA-256 digest")
     p.add_argument("db", nargs="?", default=_DEFAULT_DB, help="DB path")
 
     # rechunk
     p = sub.add_parser("rechunk", help="Convert eligible blobs to chunked form")
+    p.add_argument("-s", "--storage-class", default=None, help="Storage class")
+    p.add_argument("-n", "--batch-size", type=int, default=100, help="Max rewrites")
+    p.add_argument("--min-size", type=int, default=None, help="Min raw bytes")
     p.add_argument("db", nargs="?", default=_DEFAULT_DB, help="DB path")
-    p.add_argument("--storage-class", default=None, help="Storage class filter")
-    p.add_argument("--batch-size", type=int, default=100, help="Max blobs rewritten")
-    p.add_argument("--min-blob-size", type=int, default=None, help="Min raw size")
 
-    # cat
+    # cat LOCATOR|DIGEST
     p = sub.add_parser("cat", help="Write raw bytes to stdout")
-    p.add_argument("--locator", default=None, help="Locator to read")
-    p.add_argument("--digest", default=None, help="Digest to read")
-    p.add_argument("--at", type=int, default=None, help="Point-in-time (Unix ms)")
+    p.add_argument("ref", help="Locator or SHA-256 digest")
+    p.add_argument("--at", default=None, help="Point-in-time (ms or ISO 8601)")
     p.add_argument("db", nargs="?", default=_DEFAULT_DB, help="DB path")
 
-    # store
+    # store LOCATOR FILE
     p = sub.add_parser("store", help="Store content at a locator")
+    p.add_argument("locator", help="Locator string")
     p.add_argument("path", help="File path, or '-' for stdin")
-    p.add_argument("--locator", required=True, help="Locator string")
-    p.add_argument("--storage-class", default=None, help="Storage class hint")
-    p.add_argument("--observed-at", type=int, default=None, help="Unix ms timestamp")
-    p.add_argument("--metadata-json", default=None, help="JSON metadata string")
+    p.add_argument("-s", "--storage-class", default=None, help="Storage class")
+    p.add_argument("--at", default=None, help="Timestamp (ms or ISO 8601)")
+    p.add_argument("--metadata", default=None, help="JSON metadata")
     p.add_argument("--json", action="store_true", help="Output as JSON")
     p.add_argument("db", nargs="?", default=_DEFAULT_DB, help="DB path")
 
-    # resolve
+    # resolve LOCATOR
     p = sub.add_parser("resolve", help="Show what a locator resolves to")
-    p.add_argument("--locator", required=True, help="Locator string")
-    p.add_argument("--at", type=int, default=None, help="Point-in-time (Unix ms)")
+    p.add_argument("locator", help="Locator string")
+    p.add_argument("--at", default=None, help="Point-in-time (ms or ISO 8601)")
     p.add_argument("--json", action="store_true", help="Output as JSON")
     p.add_argument("db", nargs="?", default=_DEFAULT_DB, help="DB path")
 
-    # has
+    # has LOCATOR
     p = sub.add_parser("has", help="Check if locator has a current span")
-    p.add_argument("--locator", required=True, help="Locator string")
+    p.add_argument("locator", help="Locator string")
     p.add_argument(
-        "--max-age-hours", type=float, default=float("inf"), help="Freshness window"
+        "--max-age", type=float, default=float("inf"), help="Max age in hours"
     )
     p.add_argument("db", nargs="?", default=_DEFAULT_DB, help="DB path")
 
     # du
     p = sub.add_parser("du", help="Storage accounting: where are the bytes going?")
     p.add_argument(
-        "--by", choices=["locator", "storage-class", "codec"], help="Group by"
+        "--by",
+        choices=["locator", "storage-class", "codec"],
+        default=None,
+        help="Group by (default: storage-class, or per-span if --locator)",
     )
-    p.add_argument("--locator", default=None, help="Show storage for specific locator")
-    p.add_argument("--top", type=int, default=20, help="Top N results (default 20)")
+    p.add_argument("-l", "--locator", default=None, help="Show storage for locator")
+    p.add_argument("-n", "--top", type=int, default=20, help="Top N (default 20)")
     p.add_argument("--json", action="store_true", help="Output as JSON")
     p.add_argument("db", nargs="?", default=_DEFAULT_DB, help="DB path")
 
     # ls
     p = sub.add_parser("ls", help="List archive entities")
     p.add_argument(
-        "--type",
-        dest="ls_type",
+        "ls_type",
+        nargs="?",
         default="locators",
         choices=["locators", "spans", "blobs", "events", "dicts", "chunks"],
         help="What to list (default: locators)",
     )
-    p.add_argument("--locator", default=None, help="Filter by locator")
-    p.add_argument("--digest", default=None, help="Filter by digest")
-    p.add_argument("--codec", default=None, help="Filter by codec")
-    p.add_argument("--storage-class", default=None, help="Filter by storage class")
+    p.add_argument("-l", "--locator", default=None, help="Filter by locator")
+    p.add_argument("-d", "--digest", default=None, help="Filter by digest")
+    p.add_argument("-c", "--codec", default=None, help="Filter by codec")
+    p.add_argument("-s", "--storage-class", default=None, help="Filter by class")
     p.add_argument("--kind", default=None, help="Filter events by kind")
-    p.add_argument("--since", type=int, default=None, help="Filter: timestamp >= since")
-    p.add_argument("--until", type=int, default=None, help="Filter: timestamp <= until")
-    p.add_argument("--limit", type=int, default=100, help="Max results")
+    p.add_argument("--since", default=None, help="Timestamp >= (ms or ISO 8601)")
+    p.add_argument("--until", default=None, help="Timestamp <= (ms or ISO 8601)")
+    p.add_argument("-n", "--limit", type=int, default=100, help="Max results")
     p.add_argument("--json", action="store_true", help="Output as JSON")
     p.add_argument("db", nargs="?", default=_DEFAULT_DB, help="DB path")
 
-    # put-blob
+    # put-blob FILE
     p = sub.add_parser("put-blob", help="Store a blob without locator observation")
     p.add_argument("path", help="File path, or '-' for stdin")
-    p.add_argument("--storage-class", default=None, help="Storage class hint")
+    p.add_argument("-s", "--storage-class", default=None, help="Storage class")
     p.add_argument("--json", action="store_true", help="Output as JSON")
     p.add_argument("db", nargs="?", default=_DEFAULT_DB, help="DB path")
 
-    # observe
+    # observe LOCATOR DIGEST
     p = sub.add_parser("observe", help="Record observation of existing digest")
-    p.add_argument("--locator", required=True, help="Locator string")
-    p.add_argument("--digest", required=True, help="SHA-256 digest")
-    p.add_argument("--observed-at", type=int, default=None, help="Unix ms timestamp")
-    p.add_argument("--metadata-json", default=None, help="JSON metadata string")
+    p.add_argument("locator", help="Locator string")
+    p.add_argument("digest", help="SHA-256 digest")
+    p.add_argument("--at", default=None, help="Timestamp (ms or ISO 8601)")
+    p.add_argument("--metadata", default=None, help="JSON metadata")
     p.add_argument("--json", action="store_true", help="Output as JSON")
     p.add_argument("db", nargs="?", default=_DEFAULT_DB, help="DB path")
 
-    # import-files
+    # import-files ROOT
     p = sub.add_parser("import-files", help="Import files from a directory")
-    p.add_argument("--root", required=True, help="Root directory to import")
-    p.add_argument("--locator-prefix", default=None, help="Prefix for derived locators")
+    p.add_argument("root", help="Root directory to import")
+    p.add_argument("-r", "--recursive", action="store_true", help="Recurse")
+    p.add_argument("-p", "--prefix", default=None, help="Locator prefix")
+    p.add_argument("-s", "--storage-class", default=None, help="Storage class")
     p.add_argument(
-        "--recursive", action="store_true", help="Recurse into subdirectories"
-    )
-    p.add_argument(
-        "--from-stdin", action="store_true", help="Read file paths from stdin"
-    )
-    p.add_argument(
-        "-0", "--null-delimited", action="store_true", help="Null-delimited stdin"
-    )
-    p.add_argument(
-        "--include", action="append", help="Include glob pattern (repeatable)"
-    )
-    p.add_argument(
-        "--exclude", action="append", help="Exclude glob pattern (repeatable)"
-    )
-    p.add_argument(
-        "--storage-class-by-ext",
+        "--class-by-ext",
         action="append",
         help="Map ext to class (e.g. html=html)",
     )
-    p.add_argument(
-        "--storage-class", default=None, help="Override storage class for all"
-    )
-    p.add_argument(
-        "--observed-at",
-        default="now",
-        help="Timestamp mode: now, mtime, or fixed:<ms>",
-    )
-    p.add_argument("--dry-run", action="store_true", help="Show what would be imported")
+    p.add_argument("--at", default="now", help="Timestamp: now, mtime, or fixed:<ms>")
+    p.add_argument("-i", "--include", action="append", help="Include glob")
+    p.add_argument("-x", "--exclude", action="append", help="Exclude glob")
+    p.add_argument("--from-stdin", action="store_true", help="Read paths from stdin")
+    p.add_argument("-0", "--null", action="store_true", help="Null-delimited stdin")
+    p.add_argument("--dry-run", action="store_true", help="Show what would be done")
     p.add_argument("db", nargs="?", default=_DEFAULT_DB, help="DB path")
 
-    # import-manifest
+    # import-manifest MANIFEST
     p = sub.add_parser("import-manifest", help="Import from manifest (JSONL or TSV)")
     p.add_argument("manifest", help="Manifest file path")
     p.add_argument(
         "--format", choices=["jsonl", "tsv"], default=None, help="Manifest format"
     )
-    p.add_argument("--dry-run", action="store_true", help="Show what would be imported")
+    p.add_argument("--dry-run", action="store_true", help="Show what would be done")
     p.add_argument("db", nargs="?", default=_DEFAULT_DB, help="DB path")
 
-    # extract
+    # extract LOCATOR|DIGEST
     p = sub.add_parser("extract", help="Write bytes to a file")
-    p.add_argument("--locator", default=None, help="Locator to extract")
-    p.add_argument("--digest", default=None, help="Digest to extract")
-    p.add_argument("--at", type=int, default=None, help="Point-in-time (Unix ms)")
+    p.add_argument("ref", help="Locator or SHA-256 digest")
+    p.add_argument("--at", default=None, help="Point-in-time (ms or ISO 8601)")
     p.add_argument("-o", "--output", default=None, help="Output file path")
     p.add_argument("db", nargs="?", default=_DEFAULT_DB, help="DB path")
 
     # diff
     p = sub.add_parser("diff", help="Compare two blob versions")
-    p.add_argument("--locator", default=None, help="Locator to compare")
-    p.add_argument("--digest", default=None, help="First digest")
-    p.add_argument("--other-digest", default=None, help="Second digest")
-    p.add_argument("--from-at", type=int, default=None, help="From timestamp (Unix ms)")
-    p.add_argument("--to-at", type=int, default=None, help="To timestamp (Unix ms)")
+    p.add_argument("ref_a", help="First locator or digest")
+    p.add_argument("ref_b", help="Second locator or digest")
+    p.add_argument("--from-at", default=None, help="Timestamp for ref_a")
+    p.add_argument("--to-at", default=None, help="Timestamp for ref_b")
     p.add_argument("--text", action="store_true", help="Show text diff if UTF-8")
     p.add_argument("db", nargs="?", default=_DEFAULT_DB, help="DB path")
 
     # optimize
     p = sub.add_parser("optimize", help="Run maintenance: repack + rechunk")
-    p.add_argument("db", nargs="?", default=_DEFAULT_DB, help="DB path")
-    p.add_argument("--storage-class", default=None, help="Storage class filter")
-    p.add_argument("--batch-size", type=int, default=1000, help="Repack batch size")
+    p.add_argument("-s", "--storage-class", default=None, help="Storage class")
     p.add_argument("--no-repack", action="store_true", help="Skip repack")
     p.add_argument("--no-rechunk", action="store_true", help="Skip rechunk")
-    p.add_argument(
-        "--rechunk-batch-size", type=int, default=100, help="Rechunk batch size"
-    )
-    p.add_argument(
-        "--rechunk-min-blob-size", type=int, default=None, help="Rechunk min blob size"
-    )
+    p.add_argument("db", nargs="?", default=_DEFAULT_DB, help="DB path")
 
     # vacuum
     p = sub.add_parser("vacuum", help="SQLite maintenance")
-    p.add_argument("db", nargs="?", default=_DEFAULT_DB, help="DB path")
     p.add_argument("--analyze", action="store_true", help="Run ANALYZE")
     p.add_argument("--checkpoint", action="store_true", help="WAL checkpoint")
     p.add_argument("--vacuum", action="store_true", help="Run VACUUM")
+    p.add_argument("db", nargs="?", default=_DEFAULT_DB, help="DB path")
 
     # verify
     p = sub.add_parser("verify", help="Verify archive integrity")
-    p.add_argument("db", nargs="?", default=_DEFAULT_DB, help="DB path")
     p.add_argument("--full", action="store_true", help="Full blob verification")
     p.add_argument("--sample", type=int, default=None, help="Verify N random blobs")
+    p.add_argument("db", nargs="?", default=_DEFAULT_DB, help="DB path")
 
     # migrate
     p = sub.add_parser("migrate", help="Explicit schema migration")

@@ -37,7 +37,7 @@ class TestExtract:
     def test_extract_by_locator(self, tmp_path):
         db = _populated_db(tmp_path)
         out = tmp_path / "output.txt"
-        result = _run(["extract", "--locator", "loc/a", "-o", str(out), str(db)])
+        result = _run(["extract", "loc/a", "-o", str(out), str(db)])
         assert result.returncode == 0
         assert out.read_bytes() == b"version two is longer"
 
@@ -48,7 +48,7 @@ class TestExtract:
             assert span is not None
             digest = span.digest
         out = tmp_path / "output.bin"
-        result = _run(["extract", "--digest", digest, "-o", str(out), str(db)])
+        result = _run(["extract", digest, "-o", str(out), str(db)])
         assert result.returncode == 0
         assert out.read_bytes() == b"version two is longer"
 
@@ -62,7 +62,6 @@ class TestExtract:
         result = _run(
             [
                 "extract",
-                "--locator",
                 "loc/a",
                 "--at",
                 "1500",
@@ -76,7 +75,7 @@ class TestExtract:
 
     def test_extract_to_stdout(self, tmp_path):
         db = _populated_db(tmp_path)
-        result = _run(["extract", "--locator", "loc/a", str(db)])
+        result = _run(["extract", "loc/a", str(db)])
         assert result.returncode == 0
         assert result.stdout == b"version two is longer"
         assert result.stderr == b""
@@ -84,9 +83,7 @@ class TestExtract:
     def test_extract_missing_locator(self, tmp_path):
         db = _populated_db(tmp_path)
         out = tmp_path / "output.txt"
-        result = _run(
-            ["extract", "--locator", "loc/nonexistent", "-o", str(out), str(db)]
-        )
+        result = _run(["extract", "loc/nonexistent", "-o", str(out), str(db)])
         assert result.returncode != 0
         assert b"No span found" in result.stderr
 
@@ -110,7 +107,7 @@ class TestDiff:
         result = _run(
             [
                 "diff",
-                "--locator",
+                "loc/a",
                 "loc/a",
                 "--from-at",
                 "1000",
@@ -125,11 +122,16 @@ class TestDiff:
 
     def test_diff_different_content(self, tmp_path):
         db = _populated_db(tmp_path)
-        result = _run(["diff", "--locator", "loc/a", str(db)])
+        with Farchive(db) as fa:
+            spans = fa.history("loc/a")
+            assert len(spans) >= 2
+            d1 = spans[1].digest  # older
+            d2 = spans[0].digest  # newer
+        result = _run(["diff", d1, d2, str(db)])
         assert result.returncode == 0
         output = result.stdout.decode()
         assert "Identical: False" in output
-        assert "version one" in output or "Size A:" in output
+        assert "Size A:" in output
 
     def test_diff_by_digests(self, tmp_path):
         db = _populated_db(tmp_path)
@@ -138,7 +140,7 @@ class TestDiff:
             d1 = spans[1].digest  # older
             d2 = spans[0].digest  # newer
 
-        result = _run(["diff", "--digest", d1, "--other-digest", d2, str(db)])
+        result = _run(["diff", d1, d2, str(db)])
         assert result.returncode == 0
         output = result.stdout.decode()
         assert "Identical: False" in output
@@ -148,8 +150,11 @@ class TestDiff:
         with Farchive(db) as fa:
             fa.store("loc/a", b"line1\nline2\n", observed_at=_ts(1000))
             fa.store("loc/a", b"line1\nline3\n", observed_at=_ts(2000))
+            spans = fa.history("loc/a")
+            d1 = spans[1].digest
+            d2 = spans[0].digest
 
-        result = _run(["diff", "--locator", "loc/a", "--text", str(db)])
+        result = _run(["diff", d1, d2, "--text", str(db)])
         assert result.returncode == 0
         output = result.stdout.decode()
         assert "line2" in output

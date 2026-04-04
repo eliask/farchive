@@ -88,7 +88,7 @@ class TestObserve:
         with Farchive(db) as fa:
             digest = fa.put_blob(b"some data")
 
-        result = _run(["observe", "--locator", "loc/a", "--digest", digest, str(db)])
+        result = _run(["observe", "loc/a", digest, str(db)])
         assert result.returncode == 0
 
         with Farchive(db) as fa:
@@ -101,9 +101,7 @@ class TestObserve:
         with Farchive(db) as fa:
             digest = fa.put_blob(b"data")
 
-        result = _run(
-            ["observe", "--locator", "loc/a", "--digest", digest, "--json", str(db)]
-        )
+        result = _run(["observe", "loc/a", digest, "--json", str(db)])
         assert result.returncode == 0
         output = json.loads(result.stdout.decode())
         assert output["locator"] == "loc/a"
@@ -128,9 +126,8 @@ class TestImportFiles:
         result = _run(
             [
                 "import-files",
-                "--root",
                 str(root),
-                "--locator-prefix",
+                "-p",
                 "file://",
                 str(db),
             ]
@@ -150,7 +147,6 @@ class TestImportFiles:
         result = _run(
             [
                 "import-files",
-                "--root",
                 str(root),
                 "--dry-run",
                 str(db),
@@ -172,10 +168,9 @@ class TestImportFiles:
         result = _run(
             [
                 "import-files",
-                "--root",
                 str(root),
-                "--recursive",
-                "--locator-prefix",
+                "-r",
+                "-p",
                 "file://",
                 str(db),
             ]
@@ -194,11 +189,10 @@ class TestImportFiles:
         result = _run(
             [
                 "import-files",
-                "--root",
                 str(root),
-                "--storage-class-by-ext",
+                "--class-by-ext",
                 "html=html",
-                "--locator-prefix",
+                "-p",
                 "file://",
                 str(db),
             ]
