@@ -144,28 +144,37 @@ def _migrate_v1_to_v2(conn: sqlite3.Connection) -> None:
     v2: codec IN ('raw', 'zstd', 'zstd_dict', 'zstd_delta'), adds base_digest
 
     Existing 'zstd' + codec_dict_id rows become 'zstd_dict'.
-    Wrapped in an explicit transaction so partial failure rolls back.
     """
     now = _now_ms()
 
-    # Idempotency: if v2 tables already exist, just bump version
-    tables = {
-        r[0]
-        for r in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'"
-        ).fetchall()
-    }
-    if "blob_v2" in tables or "chunk" in tables:
+    # Idempotency: check actual target shape, not temp tables.
+    # v2 means the live blob table has base_digest.
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(blob)").fetchall()}
+    if "base_digest" in cols:
         conn.execute(
             "UPDATE schema_info SET version=?, migrated_at=?, generator=?",
             (2, now, _GENERATOR),
         )
         return
 
-    # v2 has no chunk tables, so we only need to rebuild the blob table.
+    # Detect leaked temp tables from a failed prior migration.
+    tables = {
+        r[0]
+        for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    }
+    if "blob_v2" in tables:
+        raise RuntimeError(
+            "Incomplete v1->v2 migration detected: blob_v2 table exists. "
+            "Restore from backup and retry."
+        )
+
     # Disable FK checks during table rebuild (locator_span references blob).
-    with conn:
-        conn.execute("PRAGMA foreign_keys=OFF")
+    # Use explicit BEGIN IMMEDIATE so DDL is inside a real transaction.
+    conn.execute("PRAGMA foreign_keys=OFF")
+    try:
+        conn.execute("BEGIN IMMEDIATE")
         conn.execute("""
             CREATE TABLE blob_v2 (
                 digest              TEXT PRIMARY KEY,
@@ -206,12 +215,16 @@ def _migrate_v1_to_v2(conn: sqlite3.Connection) -> None:
         conn.execute("DROP TABLE blob")
         conn.execute("ALTER TABLE blob_v2 RENAME TO blob")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_blob_base ON blob(base_digest)")
+        conn.execute(
+            "UPDATE schema_info SET version=?, migrated_at=?, generator=?",
+            (2, now, _GENERATOR),
+        )
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    finally:
         conn.execute("PRAGMA foreign_keys=ON")
-
-    conn.execute(
-        "UPDATE schema_info SET version=?, migrated_at=?, generator=?",
-        (2, now, _GENERATOR),
-    )
 
 
 def _migrate_v2_to_v3(conn: sqlite3.Connection) -> None:
@@ -220,32 +233,38 @@ def _migrate_v2_to_v3(conn: sqlite3.Connection) -> None:
     v2: codec IN ('raw', 'zstd', 'zstd_dict', 'zstd_delta')
     v3: codec IN ('raw', 'zstd', 'zstd_dict', 'zstd_delta', 'chunked'),
         adds chunk and blob_chunk tables, blob.payload allows NULL.
-
-    Wrapped in an explicit transaction so partial failure rolls back.
-    Idempotent: if chunk table already exists, skips table creation.
     """
     now = _now_ms()
 
-    # Idempotency: if chunk table already exists, the schema is v3-shaped
+    # Idempotency: check actual target shape.
+    # v3 means blob has stored_self_size AND chunk table exists.
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(blob)").fetchall()}
     tables = {
         r[0]
         for r in conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'"
         ).fetchall()
     }
-    if "chunk" in tables and "blob_chunk" in tables:
+    if "stored_self_size" in cols and "chunk" in tables and "blob_chunk" in tables:
         conn.execute(
             "UPDATE schema_info SET version=?, migrated_at=?, generator=?",
             (3, now, _GENERATOR),
         )
         return
 
+    # Detect leaked temp tables from a failed prior migration.
+    if "blob_v3" in tables:
+        raise RuntimeError(
+            "Incomplete v2->v3 migration detected: blob_v3 table exists. "
+            "Restore from backup and retry."
+        )
+
     # Detect the size column name — v2 may have stored_size or stored_self_size
-    cols = {r[1] for r in conn.execute("PRAGMA table_info(blob)").fetchall()}
     size_col = "stored_self_size" if "stored_self_size" in cols else "stored_size"
 
-    with conn:
-        conn.execute("PRAGMA foreign_keys=OFF")
+    conn.execute("PRAGMA foreign_keys=OFF")
+    try:
+        conn.execute("BEGIN IMMEDIATE")
         conn.execute("""
             CREATE TABLE blob_v3 (
                 digest              TEXT PRIMARY KEY,
@@ -319,12 +338,16 @@ def _migrate_v2_to_v3(conn: sqlite3.Connection) -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_blob_chunk_ref ON blob_chunk(chunk_digest)"
         )
+        conn.execute(
+            "UPDATE schema_info SET version=?, migrated_at=?, generator=?",
+            (3, now, _GENERATOR),
+        )
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    finally:
         conn.execute("PRAGMA foreign_keys=ON")
-
-    conn.execute(
-        "UPDATE schema_info SET version=?, migrated_at=?, generator=?",
-        (3, now, _GENERATOR),
-    )
 
 
 def init_schema(conn: sqlite3.Connection, *, enable_events: bool = False) -> None:

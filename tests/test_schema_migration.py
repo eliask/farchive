@@ -6,6 +6,8 @@ import sqlite3
 import tempfile
 from pathlib import Path
 
+import pytest
+
 from farchive._schema import (
     SCHEMA_VERSION,
     _migrate_v1_to_v2,
@@ -24,6 +26,7 @@ def _empty_db() -> sqlite3.Connection:
         "version INTEGER NOT NULL, created_at INTEGER NOT NULL,"
         "migrated_at INTEGER, generator TEXT)"
     )
+    conn.commit()
     return conn
 
 
@@ -123,6 +126,7 @@ class TestMigrateV1ToV2:
         conn.execute(
             "INSERT INTO blob VALUES ('abc', X'dead', 4, 4, 'raw', NULL, 'bin', 1000)"
         )
+        conn.commit()
 
         _migrate_v1_to_v2(conn)
 
@@ -135,11 +139,34 @@ class TestMigrateV1ToV2:
         conn = _empty_db()
         conn.execute("INSERT INTO schema_info VALUES (1, 1000, NULL, 'test')")
         _create_v1_tables(conn)
+        conn.commit()
 
         _migrate_v1_to_v2(conn)
-        # Second call should be a no-op
         _migrate_v1_to_v2(conn)
         assert detect_schema_version(conn) == 2
+
+    def test_v1_to_v2_fk_restored(self):
+        """foreign_keys must be ON after migration completes."""
+        conn = _empty_db()
+        conn.execute("INSERT INTO schema_info VALUES (1, 1000, NULL, 'test')")
+        _create_v1_tables(conn)
+        conn.commit()
+
+        _migrate_v1_to_v2(conn)
+
+        row = conn.execute("PRAGMA foreign_keys").fetchone()
+        assert row[0] == 1
+
+    def test_v1_to_v2_leaked_blob_v2_raises(self):
+        """If blob_v2 exists from a failed migration, raise."""
+        conn = _empty_db()
+        conn.execute("INSERT INTO schema_info VALUES (1, 1000, NULL, 'test')")
+        _create_v1_tables(conn)
+        conn.execute("CREATE TABLE blob_v2 (digest TEXT PRIMARY KEY)")
+        conn.commit()
+
+        with pytest.raises(RuntimeError, match="Incomplete v1->v2 migration"):
+            _migrate_v1_to_v2(conn)
 
 
 # ---------------------------------------------------------------------------
@@ -155,6 +182,7 @@ class TestMigrateV2ToV3:
         conn.execute(
             "INSERT INTO blob VALUES ('abc', X'dead', 4, 4, 'raw', NULL, NULL, 'bin', 2000)"
         )
+        conn.commit()
 
         _migrate_v2_to_v3(conn)
 
@@ -175,9 +203,9 @@ class TestMigrateV2ToV3:
         conn = _empty_db()
         conn.execute("INSERT INTO schema_info VALUES (2, 2000, NULL, 'test')")
         _create_v2_tables(conn)
+        conn.commit()
 
         _migrate_v2_to_v3(conn)
-        # Second call should be a no-op (chunk table already exists)
         _migrate_v2_to_v3(conn)
         assert detect_schema_version(conn) == 3
 
@@ -185,7 +213,6 @@ class TestMigrateV2ToV3:
         """v2 blob table that already has stored_self_size (partial migration)."""
         conn = _empty_db()
         conn.execute("INSERT INTO schema_info VALUES (2, 2000, NULL, 'test')")
-        # Blob table already has stored_self_size
         conn.execute("""
             CREATE TABLE dict (
                 dict_id INTEGER PRIMARY KEY,
@@ -230,6 +257,7 @@ class TestMigrateV2ToV3:
         conn.execute(
             "INSERT INTO blob VALUES ('abc', X'dead', 4, 4, 'raw', NULL, NULL, 'bin', 2000)"
         )
+        conn.commit()
 
         _migrate_v2_to_v3(conn)
 
@@ -238,6 +266,65 @@ class TestMigrateV2ToV3:
             "SELECT stored_self_size FROM blob WHERE digest='abc'"
         ).fetchone()
         assert row[0] == 4
+
+    def test_v2_to_v3_fk_restored(self):
+        """foreign_keys must be ON after migration completes."""
+        conn = _empty_db()
+        conn.execute("INSERT INTO schema_info VALUES (2, 2000, NULL, 'test')")
+        _create_v2_tables(conn)
+        conn.commit()
+
+        _migrate_v2_to_v3(conn)
+
+        row = conn.execute("PRAGMA foreign_keys").fetchone()
+        assert row[0] == 1
+
+    def test_v2_to_v3_leaked_blob_v3_raises(self):
+        """If blob_v3 exists from a failed migration, raise."""
+        conn = _empty_db()
+        conn.execute("INSERT INTO schema_info VALUES (2, 2000, NULL, 'test')")
+        _create_v2_tables(conn)
+        conn.execute("CREATE TABLE blob_v3 (digest TEXT PRIMARY KEY)")
+        conn.commit()
+
+        with pytest.raises(RuntimeError, match="Incomplete v2->v3 migration"):
+            _migrate_v2_to_v3(conn)
+
+    def test_v2_to_v3_chunk_without_stored_self_size(self):
+        """If chunk/blob_chunk exist but blob still has stored_size,
+        migration should still run and rebuild blob correctly."""
+        conn = _empty_db()
+        conn.execute("INSERT INTO schema_info VALUES (2, 2000, NULL, 'test')")
+        _create_v2_tables(conn)
+        conn.execute(
+            "INSERT INTO blob VALUES ('abc', X'dead', 4, 4, 'raw', NULL, NULL, 'bin', 2000)"
+        )
+        # Create proper chunk tables (simulates partial migration)
+        conn.execute("""
+            CREATE TABLE chunk (
+                chunk_digest TEXT PRIMARY KEY,
+                payload BLOB NOT NULL,
+                raw_size INTEGER NOT NULL,
+                stored_size INTEGER NOT NULL,
+                codec TEXT NOT NULL,
+                codec_dict_id INTEGER,
+                created_at INTEGER NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE blob_chunk (
+                blob_digest TEXT, ordinal INTEGER,
+                raw_offset INTEGER, chunk_digest TEXT,
+                PRIMARY KEY (blob_digest, ordinal)
+            )
+        """)
+        conn.commit()
+
+        _migrate_v2_to_v3(conn)
+
+        assert detect_schema_version(conn) == 3
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(blob)").fetchall()}
+        assert "stored_self_size" in cols
 
 
 # ---------------------------------------------------------------------------
@@ -274,7 +361,6 @@ class TestInitSchema:
             conn.commit()
             conn.close()
 
-            # Reopen with init_schema
             conn = sqlite3.connect(str(db))
             init_schema(conn)
             assert detect_schema_version(conn) == 3
