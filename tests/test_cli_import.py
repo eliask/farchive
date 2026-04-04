@@ -27,6 +27,7 @@ class TestPutBlob:
 
     def test_put_blob_from_file(self, tmp_path):
         db = tmp_path / "test.db"
+        Farchive(db).close()  # Create empty db
         f = tmp_path / "data.bin"
         f.write_bytes(b"hello blob")
 
@@ -40,6 +41,7 @@ class TestPutBlob:
 
     def test_put_blob_from_stdin(self, tmp_path):
         db = tmp_path / "test.db"
+        Farchive(db).close()  # Create empty db
         result = subprocess.run(
             [sys.executable, "-m", "farchive._cli", "put-blob", str(db), "-"],
             input=b"stdin blob",
@@ -54,6 +56,7 @@ class TestPutBlob:
 
     def test_put_blob_json(self, tmp_path):
         db = tmp_path / "test.db"
+        Farchive(db).close()  # Create empty db
         f = tmp_path / "data.bin"
         f.write_bytes(b"data")
 
@@ -65,6 +68,7 @@ class TestPutBlob:
 
     def test_put_blob_no_locator(self, tmp_path):
         db = tmp_path / "test.db"
+        Farchive(db).close()  # Create empty db
         f = tmp_path / "data.bin"
         f.write_bytes(b"data")
 

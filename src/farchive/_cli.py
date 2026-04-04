@@ -69,7 +69,35 @@ def _json_dumps(obj, **kwargs):
 _DEFAULT_DB = "archive.farchive"
 
 
+def _is_valid_db(path: str) -> bool:
+    """Check if file is a valid farchive db (has schema_info table)."""
+    if not os.path.isfile(path):
+        return False
+    try:
+        import sqlite3
+
+        conn = sqlite3.connect(path)
+        conn.execute("SELECT version FROM schema_info")
+        conn.close()
+        return True
+    except Exception:
+        return False
+
+
+def _ensure_db(args: argparse.Namespace) -> None:
+    """Check that db file exists and is valid."""
+    if not _is_valid_db(args.db):
+        print(f"DB not found or invalid: {args.db}", file=sys.stderr)
+        sys.exit(1)
+
+
+def _maybe_create_db(args: argparse.Namespace) -> bool:
+    """Check if db will be created (doesn't exist yet). Returns True if new db."""
+    return not os.path.isfile(args.db)
+
+
 def _cmd_stats(args: argparse.Namespace) -> None:
+    _ensure_db(args)
     with Farchive(args.db) as fa:
         st = fa.stats()
     ratio = f"{st.compression_ratio:.2f}x" if st.compression_ratio else "n/a"
@@ -128,6 +156,7 @@ def _cmd_stats(args: argparse.Namespace) -> None:
 
 
 def _cmd_history(args: argparse.Namespace) -> None:
+    _ensure_db(args)
     with Farchive(args.db) as fa:
         spans = fa.history(args.locator)
     if not spans:
@@ -147,6 +176,7 @@ def _cmd_history(args: argparse.Namespace) -> None:
 
 
 def _cmd_locators(args: argparse.Namespace) -> None:
+    _ensure_db(args)
     with Farchive(args.db) as fa:
         locs = fa.locators(pattern=args.pattern)
     for loc in locs:
@@ -155,6 +185,7 @@ def _cmd_locators(args: argparse.Namespace) -> None:
 
 
 def _cmd_train_dict(args: argparse.Namespace) -> None:
+    _ensure_db(args)
     if not args.storage_class:
         print("Error: storage_class is required", file=sys.stderr)
         sys.exit(1)
@@ -178,6 +209,7 @@ def _cmd_train_dict(args: argparse.Namespace) -> None:
 
 
 def _cmd_repack(args: argparse.Namespace) -> None:
+    _ensure_db(args)
     with Farchive(args.db) as fa:
         sc = args.storage_class or None
         stats = fa.repack(storage_class=sc, batch_size=args.batch_size)
@@ -185,6 +217,7 @@ def _cmd_repack(args: argparse.Namespace) -> None:
 
 
 def _cmd_events(args: argparse.Namespace) -> None:
+    _ensure_db(args)
     with Farchive(args.db) as fa:
         events = fa.events(
             locator=args.locator or None,
@@ -207,6 +240,7 @@ def _cmd_events(args: argparse.Namespace) -> None:
 
 
 def _cmd_rechunk(args: argparse.Namespace) -> None:
+    _ensure_db(args)
     with Farchive(args.db) as fa:
         sc = args.storage_class or None
         stats = fa.rechunk(
@@ -222,6 +256,7 @@ def _cmd_rechunk(args: argparse.Namespace) -> None:
 
 
 def _cmd_inspect(args: argparse.Namespace) -> None:
+    _ensure_db(args)
     with Farchive(args.db) as fa:
         row = fa._conn.execute(
             "SELECT digest, raw_size, stored_self_size, codec, codec_dict_id, "
@@ -289,6 +324,7 @@ def _cmd_inspect(args: argparse.Namespace) -> None:
 
 def _cmd_cat(args: argparse.Namespace) -> None:
     """Write raw bytes to stdout. Errors to stderr. Nothing else."""
+    _ensure_db(args)
     with Farchive(args.db) as fa:
         ref = args.ref
         # Detect if ref is a digest (64 hex chars) or a locator
@@ -314,6 +350,7 @@ def _cmd_cat(args: argparse.Namespace) -> None:
 
 def _cmd_store(args: argparse.Namespace) -> None:
     """Store content at a locator. Reads from file or stdin."""
+    _ensure_db(args)
     if args.path == "-":
         data = sys.stdin.buffer.read()
     else:
@@ -348,6 +385,7 @@ def _cmd_store(args: argparse.Namespace) -> None:
 
 def _cmd_resolve(args: argparse.Namespace) -> None:
     """Show what a locator resolves to (span metadata, not bytes)."""
+    _ensure_db(args)
     with Farchive(args.db) as fa:
         span = fa.resolve(
             args.locator, at=_parse_timestamp(args.at) if args.at else None
@@ -389,6 +427,7 @@ def _cmd_has(args: argparse.Namespace) -> None:
 
     Exit 0 if present/fresh, exit 1 if absent/stale.
     """
+    _ensure_db(args)
     with Farchive(args.db) as fa:
         result = fa.has(args.locator, max_age_hours=args.max_age)
     sys.exit(0 if result else 1)
@@ -401,6 +440,7 @@ def _cmd_has(args: argparse.Namespace) -> None:
 
 def _cmd_du(args: argparse.Namespace) -> None:
     """Storage accounting: where are the bytes going?"""
+    _ensure_db(args)
     # Default to storage-class grouping if nothing specified
     by = args.by or "storage-class"
     with Farchive(args.db) as fa:
@@ -546,6 +586,7 @@ def _cmd_du(args: argparse.Namespace) -> None:
 
 def _cmd_ls(args: argparse.Namespace) -> None:
     """List archive entities: locators, spans, blobs, events, dicts, chunks."""
+    _ensure_db(args)
     subcmd = args.ls_type
 
     with Farchive(args.db) as fa:
@@ -823,6 +864,7 @@ def _cmd_ls(args: argparse.Namespace) -> None:
 
 def _cmd_put_blob(args: argparse.Namespace) -> None:
     """Store a blob without creating a locator observation. Returns digest."""
+    _ensure_db(args)
     if args.path == "-":
         data = sys.stdin.buffer.read()
     else:
@@ -843,6 +885,7 @@ def _cmd_put_blob(args: argparse.Namespace) -> None:
 
 def _cmd_observe(args: argparse.Namespace) -> None:
     """Record an observation of an existing digest at a locator."""
+    _ensure_db(args)
     metadata = None
     if args.metadata:
         try:
@@ -878,6 +921,9 @@ def _cmd_observe(args: argparse.Namespace) -> None:
 
 def _cmd_import_files(args: argparse.Namespace) -> None:
     """Import files from a directory into the archive."""
+    new_db = _maybe_create_db(args)
+    if new_db:
+        print("Created new archive.", file=sys.stderr)
     root = Path(args.root).resolve()
     if not root.is_dir():
         print(f"Not a directory: {args.root}", file=sys.stderr)
@@ -984,6 +1030,9 @@ def _cmd_import_files(args: argparse.Namespace) -> None:
 
 def _cmd_import_manifest(args: argparse.Namespace) -> None:
     """Import from a manifest file (JSONL or TSV)."""
+    new_db = _maybe_create_db(args)
+    if new_db:
+        print("Created new archive.", file=sys.stderr)
     manifest_path = Path(args.manifest)
     if not manifest_path.is_file():
         print(f"Manifest not found: {args.manifest}", file=sys.stderr)
@@ -1079,6 +1128,7 @@ def _cmd_import_manifest(args: argparse.Namespace) -> None:
 
 def _cmd_extract(args: argparse.Namespace) -> None:
     """Write bytes to a file. Supports --at for point-in-time."""
+    _ensure_db(args)
     with Farchive(args.db) as fa:
         ref = args.ref
         is_digest = len(ref) == 64 and all(c in "0123456789abcdef" for c in ref.lower())
@@ -1113,6 +1163,7 @@ def _cmd_extract(args: argparse.Namespace) -> None:
 
 def _cmd_diff(args: argparse.Namespace) -> None:
     """Compare two blob versions. Always shows size/digest comparison."""
+    _ensure_db(args)
     with Farchive(args.db) as fa:
         ref_a = args.ref_a
         ref_b = args.ref_b
@@ -1180,6 +1231,7 @@ def _cmd_diff(args: argparse.Namespace) -> None:
 
 def _cmd_optimize(args: argparse.Namespace) -> None:
     """Umbrella maintenance: train dicts, repack, rechunk."""
+    _ensure_db(args)
     with Farchive(args.db) as fa:
         if not args.no_repack:
             sc = args.storage_class
@@ -1231,6 +1283,7 @@ def _cmd_optimize(args: argparse.Namespace) -> None:
 
 def _cmd_vacuum(args: argparse.Namespace) -> None:
     """SQLite maintenance: ANALYZE, checkpoint, VACUUM."""
+    _ensure_db(args)
     with Farchive(args.db) as fa:
         if args.analyze:
             fa._conn.execute("ANALYZE")
@@ -1254,6 +1307,7 @@ def _cmd_vacuum(args: argparse.Namespace) -> None:
 
 def _cmd_verify(args: argparse.Namespace) -> None:
     """Verify archive integrity."""
+    _ensure_db(args)
     with Farchive(args.db) as fa:
         errors = 0
         checked = 0
@@ -1357,6 +1411,7 @@ def _cmd_verify(args: argparse.Namespace) -> None:
 
 def _cmd_migrate(args: argparse.Namespace) -> None:
     """Explicit schema migration."""
+    _ensure_db(args)
     from farchive._schema import detect_schema_version, SCHEMA_VERSION
 
     with Farchive(args.db) as fa:
@@ -1381,6 +1436,7 @@ def _cmd_migrate(args: argparse.Namespace) -> None:
 
 def _cmd_schema(args: argparse.Namespace) -> None:
     """Show schema information."""
+    _ensure_db(args)
     from farchive._schema import detect_schema_version, SCHEMA_VERSION
 
     with Farchive(args.db) as fa:

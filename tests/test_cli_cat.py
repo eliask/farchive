@@ -108,6 +108,7 @@ class TestStore:
 
     def test_store_from_file(self, tmp_path):
         db = tmp_path / "test.db"
+        Farchive(db).close()  # Create empty db
         content = b"hello from file"
         f = tmp_path / "input.txt"
         f.write_bytes(content)
@@ -122,6 +123,7 @@ class TestStore:
 
     def test_store_from_stdin(self, tmp_path):
         db = tmp_path / "test.db"
+        Farchive(db).close()  # Create empty db
         content = b"hello from stdin"
 
         result = subprocess.run(
@@ -146,6 +148,7 @@ class TestStore:
 
     def test_store_with_storage_class(self, tmp_path):
         db = tmp_path / "test.db"
+        Farchive(db).close()  # Create empty db
         f = tmp_path / "page.html"
         f.write_bytes(b"<html></html>")
 
@@ -170,6 +173,7 @@ class TestStore:
 
     def test_store_json_output(self, tmp_path):
         db = tmp_path / "test.db"
+        Farchive(db).close()  # Create empty db
         f = tmp_path / "data.txt"
         f.write_bytes(b"data")
 
@@ -190,12 +194,14 @@ class TestStore:
 
     def test_store_file_not_found(self, tmp_path):
         db = tmp_path / "test.db"
+        Farchive(db).close()  # Create empty db
         result = _run(["store", str(db), "loc/a", "nonexistent.txt"])
         assert result.returncode != 0
         assert b"File not found" in result.stderr
 
     def test_store_metadata(self, tmp_path):
         db = tmp_path / "test.db"
+        Farchive(db).close()  # Create empty db
         f = tmp_path / "data.txt"
         f.write_bytes(b"data")
 
