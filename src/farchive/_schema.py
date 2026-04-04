@@ -144,54 +144,69 @@ def _migrate_v1_to_v2(conn: sqlite3.Connection) -> None:
     v2: codec IN ('raw', 'zstd', 'zstd_dict', 'zstd_delta'), adds base_digest
 
     Existing 'zstd' + codec_dict_id rows become 'zstd_dict'.
+    Wrapped in an explicit transaction so partial failure rolls back.
     """
     now = _now_ms()
 
-    # Disable FK checks during table rebuild (locator_span references blob)
-    conn.executescript("""
-        PRAGMA foreign_keys=OFF;
+    # Idempotency: if v2 tables already exist, just bump version
+    tables = {
+        r[0]
+        for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    }
+    if "blob_v2" in tables or "chunk" in tables:
+        conn.execute(
+            "UPDATE schema_info SET version=?, migrated_at=?, generator=?",
+            (2, now, _GENERATOR),
+        )
+        return
 
-        CREATE TABLE blob_v2 (
-            digest              TEXT PRIMARY KEY,
-            payload             BLOB NOT NULL,
-            raw_size            INTEGER NOT NULL,
-            stored_size         INTEGER NOT NULL,
-            codec               TEXT NOT NULL CHECK (codec IN (
-                                    'raw', 'zstd', 'zstd_dict', 'zstd_delta'
-                                )),
-            codec_dict_id       INTEGER REFERENCES dict(dict_id),
-            base_digest         TEXT REFERENCES blob_v2(digest),
-            storage_class       TEXT,
-            created_at          INTEGER NOT NULL,
-            CHECK (
-                (codec = 'zstd_delta' AND base_digest IS NOT NULL)
-                OR
-                (codec <> 'zstd_delta' AND base_digest IS NULL)
+    # v2 has no chunk tables, so we only need to rebuild the blob table.
+    # Disable FK checks during table rebuild (locator_span references blob).
+    with conn:
+        conn.execute("PRAGMA foreign_keys=OFF")
+        conn.execute("""
+            CREATE TABLE blob_v2 (
+                digest              TEXT PRIMARY KEY,
+                payload             BLOB NOT NULL,
+                raw_size            INTEGER NOT NULL,
+                stored_size         INTEGER NOT NULL,
+                codec               TEXT NOT NULL CHECK (codec IN (
+                                        'raw', 'zstd', 'zstd_dict', 'zstd_delta'
+                                    )),
+                codec_dict_id       INTEGER REFERENCES dict(dict_id),
+                base_digest         TEXT REFERENCES blob_v2(digest),
+                storage_class       TEXT,
+                created_at          INTEGER NOT NULL,
+                CHECK (
+                    (codec = 'zstd_delta' AND base_digest IS NOT NULL)
+                    OR
+                    (codec <> 'zstd_delta' AND base_digest IS NULL)
+                )
             )
-        );
-
-        INSERT INTO blob_v2 (digest, payload, raw_size, stored_size, codec,
-                             codec_dict_id, base_digest, storage_class, created_at)
-            SELECT
-                digest, payload, raw_size, stored_size,
-                CASE
-                    WHEN codec = 'raw' THEN 'raw'
-                    WHEN codec = 'zstd' AND codec_dict_id IS NOT NULL THEN 'zstd_dict'
-                    WHEN codec = 'zstd' THEN 'zstd'
-                END,
-                codec_dict_id,
-                NULL,
-                storage_class,
-                created_at
-            FROM blob;
-
-        DROP TABLE blob;
-        ALTER TABLE blob_v2 RENAME TO blob;
-
-        CREATE INDEX IF NOT EXISTS idx_blob_base ON blob(base_digest);
-
-        PRAGMA foreign_keys=ON;
-    """)
+        """)
+        conn.execute("""
+            INSERT INTO blob_v2 (digest, payload, raw_size, stored_size, codec,
+                                 codec_dict_id, base_digest, storage_class, created_at)
+                SELECT
+                    digest, payload, raw_size, stored_size,
+                    CASE
+                        WHEN codec = 'raw' THEN 'raw'
+                        WHEN codec = 'zstd' AND codec_dict_id IS NOT NULL
+                            THEN 'zstd_dict'
+                        WHEN codec = 'zstd' THEN 'zstd'
+                    END,
+                    codec_dict_id,
+                    NULL,
+                    storage_class,
+                    created_at
+                FROM blob
+        """)
+        conn.execute("DROP TABLE blob")
+        conn.execute("ALTER TABLE blob_v2 RENAME TO blob")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_blob_base ON blob(base_digest)")
+        conn.execute("PRAGMA foreign_keys=ON")
 
     conn.execute(
         "UPDATE schema_info SET version=?, migrated_at=?, generator=?",
@@ -205,82 +220,106 @@ def _migrate_v2_to_v3(conn: sqlite3.Connection) -> None:
     v2: codec IN ('raw', 'zstd', 'zstd_dict', 'zstd_delta')
     v3: codec IN ('raw', 'zstd', 'zstd_dict', 'zstd_delta', 'chunked'),
         adds chunk and blob_chunk tables, blob.payload allows NULL.
+
+    Wrapped in an explicit transaction so partial failure rolls back.
+    Idempotent: if chunk table already exists, skips table creation.
     """
     now = _now_ms()
 
-    conn.executescript("""
-        PRAGMA foreign_keys=OFF;
+    # Idempotency: if chunk table already exists, the schema is v3-shaped
+    tables = {
+        r[0]
+        for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    }
+    if "chunk" in tables and "blob_chunk" in tables:
+        conn.execute(
+            "UPDATE schema_info SET version=?, migrated_at=?, generator=?",
+            (3, now, _GENERATOR),
+        )
+        return
 
-        CREATE TABLE blob_v3 (
-            digest              TEXT PRIMARY KEY,
-            payload             BLOB,
-            raw_size            INTEGER NOT NULL,
-            stored_self_size    INTEGER NOT NULL,
-            codec               TEXT NOT NULL CHECK (codec IN (
-                                    'raw', 'zstd', 'zstd_dict', 'zstd_delta', 'chunked'
-                                )),
-            codec_dict_id       INTEGER REFERENCES dict(dict_id),
-            base_digest         TEXT REFERENCES blob_v3(digest),
-            storage_class       TEXT,
-            created_at          INTEGER NOT NULL,
-            CHECK (
-                (codec = 'chunked' AND payload IS NULL)
-                OR
-                (codec <> 'chunked' AND payload IS NOT NULL)
-            ),
-            CHECK (
-                (codec = 'zstd_dict' AND codec_dict_id IS NOT NULL)
-                OR
-                (codec <> 'zstd_dict')
-            ),
-            CHECK (
-                (codec = 'zstd_delta' AND base_digest IS NOT NULL)
-                OR
-                (codec <> 'zstd_delta' AND base_digest IS NULL)
+    # Detect the size column name — v2 may have stored_size or stored_self_size
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(blob)").fetchall()}
+    size_col = "stored_self_size" if "stored_self_size" in cols else "stored_size"
+
+    with conn:
+        conn.execute("PRAGMA foreign_keys=OFF")
+        conn.execute("""
+            CREATE TABLE blob_v3 (
+                digest              TEXT PRIMARY KEY,
+                payload             BLOB,
+                raw_size            INTEGER NOT NULL,
+                stored_self_size    INTEGER NOT NULL,
+                codec               TEXT NOT NULL CHECK (codec IN (
+                                        'raw', 'zstd', 'zstd_dict',
+                                        'zstd_delta', 'chunked'
+                                    )),
+                codec_dict_id       INTEGER REFERENCES dict(dict_id),
+                base_digest         TEXT REFERENCES blob_v3(digest),
+                storage_class       TEXT,
+                created_at          INTEGER NOT NULL,
+                CHECK (
+                    (codec = 'chunked' AND payload IS NULL)
+                    OR
+                    (codec <> 'chunked' AND payload IS NOT NULL)
+                ),
+                CHECK (
+                    (codec = 'zstd_dict' AND codec_dict_id IS NOT NULL)
+                    OR
+                    (codec <> 'zstd_dict')
+                ),
+                CHECK (
+                    (codec = 'zstd_delta' AND base_digest IS NOT NULL)
+                    OR
+                    (codec <> 'zstd_delta' AND base_digest IS NULL)
+                )
             )
-        );
-
-        INSERT INTO blob_v3 (digest, payload, raw_size, stored_self_size, codec,
-                             codec_dict_id, base_digest, storage_class, created_at)
-            SELECT digest, payload, raw_size, stored_size, codec,
-                   codec_dict_id, base_digest, storage_class, created_at
-            FROM blob;
-
-        DROP TABLE blob;
-        ALTER TABLE blob_v3 RENAME TO blob;
-
-        CREATE INDEX IF NOT EXISTS idx_blob_base ON blob(base_digest);
-
-        CREATE TABLE IF NOT EXISTS chunk (
-            chunk_digest        TEXT PRIMARY KEY,
-            payload             BLOB NOT NULL,
-            raw_size            INTEGER NOT NULL,
-            stored_size         INTEGER NOT NULL,
-            codec               TEXT NOT NULL CHECK (codec IN (
-                                    'raw', 'zstd', 'zstd_dict'
-                                )),
-            codec_dict_id       INTEGER REFERENCES dict(dict_id),
-            created_at          INTEGER NOT NULL,
-            CHECK (
-                (codec = 'zstd_dict' AND codec_dict_id IS NOT NULL)
-                OR
-                (codec <> 'zstd_dict')
+        """)
+        conn.execute(f"""
+            INSERT INTO blob_v3 (
+                digest, payload, raw_size, stored_self_size, codec,
+                codec_dict_id, base_digest, storage_class, created_at
             )
-        );
-
-        CREATE TABLE IF NOT EXISTS blob_chunk (
-            blob_digest         TEXT NOT NULL REFERENCES blob(digest),
-            ordinal             INTEGER NOT NULL,
-            raw_offset          INTEGER NOT NULL,
-            chunk_digest        TEXT NOT NULL REFERENCES chunk(chunk_digest),
-            PRIMARY KEY (blob_digest, ordinal)
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_blob_chunk_ref
-            ON blob_chunk(chunk_digest);
-
-        PRAGMA foreign_keys=ON;
-    """)
+                SELECT digest, payload, raw_size, {size_col}, codec,
+                       codec_dict_id, base_digest, storage_class, created_at
+                FROM blob
+        """)
+        conn.execute("DROP TABLE blob")
+        conn.execute("ALTER TABLE blob_v3 RENAME TO blob")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_blob_base ON blob(base_digest)")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS chunk (
+                chunk_digest        TEXT PRIMARY KEY,
+                payload             BLOB NOT NULL,
+                raw_size            INTEGER NOT NULL,
+                stored_size         INTEGER NOT NULL,
+                codec               TEXT NOT NULL CHECK (codec IN (
+                                        'raw', 'zstd', 'zstd_dict'
+                                    )),
+                codec_dict_id       INTEGER REFERENCES dict(dict_id),
+                created_at          INTEGER NOT NULL,
+                CHECK (
+                    (codec = 'zstd_dict' AND codec_dict_id IS NOT NULL)
+                    OR
+                    (codec <> 'zstd_dict')
+                )
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS blob_chunk (
+                blob_digest         TEXT NOT NULL REFERENCES blob(digest),
+                ordinal             INTEGER NOT NULL,
+                raw_offset          INTEGER NOT NULL,
+                chunk_digest        TEXT NOT NULL REFERENCES chunk(chunk_digest),
+                PRIMARY KEY (blob_digest, ordinal)
+            )
+        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_blob_chunk_ref ON blob_chunk(chunk_digest)"
+        )
+        conn.execute("PRAGMA foreign_keys=ON")
 
     conn.execute(
         "UPDATE schema_info SET version=?, migrated_at=?, generator=?",
