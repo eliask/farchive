@@ -6,7 +6,7 @@ import sqlite3
 from datetime import datetime, timezone
 
 SCHEMA_VERSION = 3
-_GENERATOR = "farchive 2.0.0"
+_GENERATOR = "farchive 3.0.0"
 
 
 def _now_ms() -> int:

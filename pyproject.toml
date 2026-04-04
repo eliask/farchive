@@ -1,6 +1,6 @@
 [project]
 name = "farchive"
-version = "2.1.0"
+version = "3.0.0"
 description = "Local content-addressed archive with locator-scoped history for opaque bytes."
 requires-python = ">=3.11"
 dependencies = [

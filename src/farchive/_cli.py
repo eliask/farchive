@@ -59,26 +59,36 @@ def _cmd_stats(args: argparse.Namespace) -> None:
                     f"{d['raw']:>12,} raw  {logical:>12,} logical  (self=0)"
                 )
             else:
-                r = d["raw"] / d["stored"] if d["stored"] else 0
+                stored = d.get("stored", d.get("stored_self", 0))
+                r = d["raw"] / stored if stored else 0
                 print(
                     f"  {key:<12} {d['count']:>8,} blobs  "
-                    f"{d['raw']:>12,} raw  {d['stored']:>12,} stored  ({r:.1f}x)"
+                    f"{d['raw']:>12,} raw  {stored:>12,} stored  ({r:.1f}x)"
                 )
     if st.storage_class_distribution:
         classes = sorted(
             st.storage_class_distribution.items(),
-            key=lambda kv: kv[1]["stored"],
+            key=lambda kv: kv[1].get("logical_stored", kv[1].get("stored_self", 0)),
             reverse=True,
         )
         if not args.verbose:
             classes = classes[:10]
         print("\nStorage class distribution:")
         for key, d in classes:
-            r = d["raw"] / d["stored"] if d["stored"] else 0
-            print(
-                f"  {key:<12} {d['count']:>8,} blobs  "
-                f"{d['raw']:>12,} raw  {d['stored']:>12,} stored  ({r:.1f}x)"
-            )
+            stored_self = d.get("stored_self", 0)
+            logical = d.get("logical_stored", 0)
+            total = stored_self + logical
+            r = d["raw"] / total if total else 0
+            if logical > 0:
+                print(
+                    f"  {key:<12} {d['count']:>8,} blobs  "
+                    f"{d['raw']:>12,} raw  {stored_self:>8,} self  {logical:>8,} logical  ({r:.1f}x)"
+                )
+            else:
+                print(
+                    f"  {key:<12} {d['count']:>8,} blobs  "
+                    f"{d['raw']:>12,} raw  {stored_self:>12,} stored  ({r:.1f}x)"
+                )
         if not args.verbose and len(st.storage_class_distribution) > 10:
             remaining = len(st.storage_class_distribution) - 10
             print(f"  ... and {remaining} more class(es) (use --verbose to show all)")
@@ -145,7 +155,7 @@ def _cmd_events(args: argparse.Namespace) -> None:
     with Farchive(args.db) as fa:
         events = fa.events(
             locator=args.locator or None,
-            since=_ms_to_dt(args.since) if args.since else None,
+            since=_ms_to_dt(args.since) if args.since is not None else None,
             limit=args.limit,
         )
     if not events:
@@ -253,7 +263,9 @@ def _cmd_cat(args: argparse.Namespace) -> None:
                 print(f"Digest not found: {args.digest}", file=sys.stderr)
                 sys.exit(1)
         elif args.locator:
-            span = fa.resolve(args.locator, at=_ms_to_dt(args.at) if args.at else None)
+            span = fa.resolve(
+                args.locator, at=_ms_to_dt(args.at) if args.at is not None else None
+            )
             if span is None:
                 print(f"No span found for locator: {args.locator}", file=sys.stderr)
                 sys.exit(1)
@@ -290,7 +302,9 @@ def _cmd_store(args: argparse.Namespace) -> None:
         digest = fa.store(
             args.locator,
             data,
-            observed_at=_ms_to_dt(args.observed_at) if args.observed_at else None,
+            observed_at=_ms_to_dt(args.observed_at)
+            if args.observed_at is not None
+            else None,
             storage_class=args.storage_class,
             metadata=metadata,
         )
@@ -304,7 +318,9 @@ def _cmd_store(args: argparse.Namespace) -> None:
 def _cmd_resolve(args: argparse.Namespace) -> None:
     """Show what a locator resolves to (span metadata, not bytes)."""
     with Farchive(args.db) as fa:
-        span = fa.resolve(args.locator, at=_ms_to_dt(args.at) if args.at else None)
+        span = fa.resolve(
+            args.locator, at=_ms_to_dt(args.at) if args.at is not None else None
+        )
 
     if span is None:
         print(f"No span found for locator: {args.locator}", file=sys.stderr)
@@ -326,12 +342,12 @@ def _cmd_resolve(args: argparse.Namespace) -> None:
             )
         )
     else:
-        until = str(span.observed_until) if span.observed_until else "current"
+        until = span.observed_until.isoformat() if span.observed_until else "current"
         print(f"Locator:        {span.locator}")
         print(f"Digest:         {span.digest}")
-        print(f"Observed from:  {span.observed_from}")
+        print(f"Observed from:  {span.observed_from.isoformat()}")
         print(f"Observed until: {until}")
-        print(f"Last confirmed: {span.last_confirmed_at}")
+        print(f"Last confirmed: {span.last_confirmed_at.isoformat()}")
         print(f"Observations:   {span.observation_count}")
         if span.last_metadata:
             print(f"Metadata:       {_json_dumps(span.last_metadata)}")
@@ -411,9 +427,12 @@ def _cmd_du(args: argparse.Namespace) -> None:
         elif args.by == "locator":
             rows = fa._conn.execute(
                 "SELECT ls.locator, COUNT(DISTINCT ls.digest) as blobs, "
-                "SUM(DISTINCT b.raw_size) as raw, "
-                "SUM(DISTINCT b.stored_self_size) as stored "
-                "FROM locator_span ls JOIN blob b ON ls.digest = b.digest "
+                "COALESCE(SUM(digest_raw.raw_size), 0) as raw, "
+                "COALESCE(SUM(digest_raw.stored_self_size), 0) as stored "
+                "FROM locator_span ls "
+                "LEFT JOIN ("
+                "  SELECT digest, raw_size, stored_self_size FROM blob"
+                ") digest_raw ON ls.digest = digest_raw.digest "
                 "GROUP BY ls.locator ORDER BY stored DESC"
             ).fetchall()
             if not args.json:
@@ -599,6 +618,12 @@ def _cmd_ls(args: argparse.Namespace) -> None:
                     )
 
         elif subcmd == "events":
+            has_table = fa._conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='event'"
+            ).fetchone()
+            if not has_table:
+                print("No event table (events never enabled for this archive).")
+                return
             query = "SELECT * FROM event WHERE 1=1"
             params = []
             if args.locator:
@@ -767,7 +792,9 @@ def _cmd_observe(args: argparse.Namespace) -> None:
         span = fa.observe(
             args.locator,
             args.digest,
-            observed_at=_ms_to_dt(args.observed_at) if args.observed_at else None,
+            observed_at=_ms_to_dt(args.observed_at)
+            if args.observed_at is not None
+            else None,
             metadata=metadata,
         )
 
@@ -950,7 +977,10 @@ def _cmd_import_manifest(args: argparse.Namespace) -> None:
             continue
 
         sc = item.get("storage_class")
-        ts = item.get("observed_at")
+        raw_ts = item.get("observed_at")
+        ts: datetime | None = None
+        if raw_ts is not None:
+            ts = _ms_to_dt(int(raw_ts))
         meta = item.get("metadata")
 
         if args.dry_run:
@@ -995,7 +1025,9 @@ def _cmd_extract(args: argparse.Namespace) -> None:
                 print(f"Digest not found: {args.digest}", file=sys.stderr)
                 sys.exit(1)
         elif args.locator:
-            span = fa.resolve(args.locator, at=_ms_to_dt(args.at) if args.at else None)
+            span = fa.resolve(
+                args.locator, at=_ms_to_dt(args.at) if args.at is not None else None
+            )
             if span is None:
                 print(f"No span found for locator: {args.locator}", file=sys.stderr)
                 sys.exit(1)
@@ -1025,10 +1057,12 @@ def _cmd_diff(args: argparse.Namespace) -> None:
         if args.locator:
             if args.from_at is not None and args.to_at is not None:
                 span_from = fa.resolve(
-                    args.locator, at=_ms_to_dt(args.from_at) if args.from_at else None
+                    args.locator,
+                    at=_ms_to_dt(args.from_at) if args.from_at is not None else None,
                 )
                 span_to = fa.resolve(
-                    args.locator, at=_ms_to_dt(args.to_at) if args.to_at else None
+                    args.locator,
+                    at=_ms_to_dt(args.to_at) if args.to_at is not None else None,
                 )
             else:
                 spans = fa.history(args.locator)
@@ -1321,10 +1355,9 @@ def _cmd_schema(args: argparse.Namespace) -> None:
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
-        prog="farchive",
         description="Content-addressed archive with observation history.",
     )
-    sub = parser.add_subparsers(dest="command")
+    sub = parser.add_subparsers(dest="command", metavar="COMMAND")
 
     # stats
     p = sub.add_parser("stats", help="Show archive statistics")

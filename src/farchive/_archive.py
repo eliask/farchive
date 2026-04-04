@@ -1396,11 +1396,35 @@ class Farchive:
             "SUM(raw_size), SUM(stored_self_size) "
             "FROM blob GROUP BY storage_class",
         ).fetchall():
-            storage_class_dist[row[0]] = {
+            entry = {
                 "count": row[1],
                 "raw": row[2],
-                "stored": row[3],
+                "stored_self": row[3],
             }
+            # For chunked blobs, add logical_stored (unique chunk bytes)
+            sc = row[0]
+            if sc == "(none)":
+                logical = self._conn.execute(
+                    "SELECT COALESCE(SUM(DISTINCT c.stored_size), 0) FROM chunk c "
+                    "WHERE c.chunk_digest IN ("
+                    "  SELECT DISTINCT bc.chunk_digest FROM blob_chunk bc "
+                    "  JOIN blob b ON bc.blob_digest = b.digest "
+                    "  WHERE b.codec = 'chunked' AND b.storage_class IS NULL"
+                    ")"
+                ).fetchone()[0]
+            else:
+                logical = self._conn.execute(
+                    "SELECT COALESCE(SUM(DISTINCT c.stored_size), 0) FROM chunk c "
+                    "WHERE c.chunk_digest IN ("
+                    "  SELECT DISTINCT bc.chunk_digest FROM blob_chunk bc "
+                    "  JOIN blob b ON bc.blob_digest = b.digest "
+                    "  WHERE b.codec = 'chunked' AND b.storage_class = ?"
+                    ")",
+                    (sc,),
+                ).fetchone()[0]
+            if logical > 0:
+                entry["logical_stored"] = logical
+            storage_class_dist[row[0]] = entry
 
         return ArchiveStats(
             locator_count=loc_count,
