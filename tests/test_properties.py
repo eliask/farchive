@@ -50,7 +50,7 @@ def test_at_most_one_current_span_per_locator(observations):
         with Farchive(db) as fa:
             for locator, content, ts in observations:
                 try:
-                    fa.store(locator, content, observed_at=ts)
+                    fa.store(locator, content, observed_at=_ts(ts))
                 except ValueError:
                     # Out-of-order or same-timestamp transitions are rejected — expected
                     pass
@@ -80,7 +80,7 @@ def test_span_timestamps_are_monotone(observations):
         with Farchive(db) as fa:
             for locator, content, ts in observations:
                 try:
-                    fa.store(locator, content, observed_at=ts)
+                    fa.store(locator, content, observed_at=_ts(ts))
                 except ValueError:
                     pass
 
@@ -271,7 +271,7 @@ def test_event_count_matches_successful_observations(observations):
             success_count = 0
             for locator, content, ts in observations:
                 try:
-                    fa.store(locator, content, observed_at=ts)
+                    fa.store(locator, content, observed_at=_ts(ts))
                     success_count += 1
                 except ValueError:
                     pass
