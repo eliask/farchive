@@ -1404,85 +1404,86 @@ def main(argv: list[str] | None = None) -> None:
 
     # stats
     p = sub.add_parser("stats", help="Show archive statistics")
-    p.add_argument("db", nargs="?", default=_DEFAULT_DB, help="DB path")
+    p.add_argument("db", help="DB path")
     p.add_argument(
         "-v", "--verbose", action="store_true", help="Show all storage classes"
     )
 
     # history LOCATOR
     p = sub.add_parser("history", help="Show span history for a locator")
+    p.add_argument("db", help="DB path")
     p.add_argument("locator", help="Locator string")
-    p.add_argument("db", nargs="?", default=_DEFAULT_DB, help="DB path")
 
     # locators
     p = sub.add_parser("locators", help="List locators")
-    p.add_argument("db", nargs="?", default=_DEFAULT_DB, help="DB path")
+    p.add_argument("db", help="DB path")
     p.add_argument("--pattern", default="%", help="SQL LIKE pattern (default: %)")
 
     # train-dict
     p = sub.add_parser("train-dict", help="Train a zstd dictionary")
+    p.add_argument("db", help="DB path")
     p.add_argument("storage_class", help="Storage class")
-    p.add_argument("db", nargs="?", default=_DEFAULT_DB, help="DB path")
-    p.add_argument("-n", "--samples", type=int, default=500, help="Training samples")
 
     # repack
     p = sub.add_parser("repack", help="Recompress blobs with latest dict")
-    p.add_argument("-s", "--storage-class", default=None, help="Storage class")
-    p.add_argument("-n", "--batch-size", type=int, default=1000, help="Max repacks")
-    p.add_argument("db", nargs="?", default=_DEFAULT_DB, help="DB path")
+    p.add_argument("db", help="DB path")
+    p.add_argument(
+        "-v", "--verbose", action="store_true", help="Show all storage classes"
+    )
 
     # events
     p = sub.add_parser("events", help="Query event log")
+    p.add_argument("db", help="DB path")
     p.add_argument("-l", "--locator", default=None, help="Filter by locator")
     p.add_argument("--since", default=None, help="Timestamp >= (ms or ISO 8601)")
     p.add_argument("-n", "--limit", type=int, default=1000, help="Max events")
-    p.add_argument("db", nargs="?", default=_DEFAULT_DB, help="DB path")
 
     # inspect DIGEST
     p = sub.add_parser("inspect", help="Show blob metadata by digest")
+    p.add_argument("db", help="DB path")
     p.add_argument("digest", help="SHA-256 digest")
-    p.add_argument("db", nargs="?", default=_DEFAULT_DB, help="DB path")
 
     # rechunk
     p = sub.add_parser("rechunk", help="Convert eligible blobs to chunked form")
+    p.add_argument("db", help="DB path")
     p.add_argument("-s", "--storage-class", default=None, help="Storage class")
     p.add_argument("-n", "--batch-size", type=int, default=100, help="Max rewrites")
     p.add_argument("--min-size", type=int, default=None, help="Min raw bytes")
-    p.add_argument("db", nargs="?", default=_DEFAULT_DB, help="DB path")
 
     # cat LOCATOR|DIGEST
     p = sub.add_parser("cat", help="Write raw bytes to stdout")
+    p.add_argument("db", help="DB path")
     p.add_argument("ref", help="Locator or SHA-256 digest")
     p.add_argument("--at", default=None, help="Point-in-time (ms or ISO 8601)")
-    p.add_argument("db", nargs="?", default=_DEFAULT_DB, help="DB path")
 
     # store LOCATOR FILE
     p = sub.add_parser("store", help="Store content at a locator")
+    p.add_argument("db", help="DB path")
     p.add_argument("locator", help="Locator string")
     p.add_argument("path", help="File path, or '-' for stdin")
     p.add_argument("-s", "--storage-class", default=None, help="Storage class")
     p.add_argument("--at", default=None, help="Timestamp (ms or ISO 8601)")
     p.add_argument("--metadata", default=None, help="JSON metadata")
     p.add_argument("--json", action="store_true", help="Output as JSON")
-    p.add_argument("db", nargs="?", default=_DEFAULT_DB, help="DB path")
 
     # resolve LOCATOR
     p = sub.add_parser("resolve", help="Show what a locator resolves to")
+    p.add_argument("db", help="DB path")
     p.add_argument("locator", help="Locator string")
     p.add_argument("--at", default=None, help="Point-in-time (ms or ISO 8601)")
     p.add_argument("--json", action="store_true", help="Output as JSON")
-    p.add_argument("db", nargs="?", default=_DEFAULT_DB, help="DB path")
 
     # has LOCATOR
     p = sub.add_parser("has", help="Check if locator has a current span")
+    p.add_argument("db", help="DB path")
     p.add_argument("locator", help="Locator string")
     p.add_argument(
         "--max-age", type=float, default=float("inf"), help="Max age in hours"
     )
-    p.add_argument("db", nargs="?", default=_DEFAULT_DB, help="DB path")
 
     # du
     p = sub.add_parser("du", help="Storage accounting: where are the bytes going?")
+    p.add_argument("db", help="DB path")
     p.add_argument(
         "--by",
         choices=["locator", "storage-class", "codec"],
@@ -1492,10 +1493,10 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("-l", "--locator", default=None, help="Show storage for locator")
     p.add_argument("-n", "--top", type=int, default=20, help="Top N (default 20)")
     p.add_argument("--json", action="store_true", help="Output as JSON")
-    p.add_argument("db", nargs="?", default=_DEFAULT_DB, help="DB path")
 
     # ls
     p = sub.add_parser("ls", help="List archive entities")
+    p.add_argument("db", help="DB path")
     p.add_argument(
         "ls_type",
         nargs="?",
@@ -1512,26 +1513,26 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--until", default=None, help="Timestamp <= (ms or ISO 8601)")
     p.add_argument("-n", "--limit", type=int, default=100, help="Max results")
     p.add_argument("--json", action="store_true", help="Output as JSON")
-    p.add_argument("db", nargs="?", default=_DEFAULT_DB, help="DB path")
 
     # put-blob FILE
     p = sub.add_parser("put-blob", help="Store a blob without locator observation")
+    p.add_argument("db", help="DB path")
     p.add_argument("path", help="File path, or '-' for stdin")
     p.add_argument("-s", "--storage-class", default=None, help="Storage class")
     p.add_argument("--json", action="store_true", help="Output as JSON")
-    p.add_argument("db", nargs="?", default=_DEFAULT_DB, help="DB path")
 
     # observe LOCATOR DIGEST
     p = sub.add_parser("observe", help="Record observation of existing digest")
+    p.add_argument("db", help="DB path")
     p.add_argument("locator", help="Locator string")
     p.add_argument("digest", help="SHA-256 digest")
     p.add_argument("--at", default=None, help="Timestamp (ms or ISO 8601)")
     p.add_argument("--metadata", default=None, help="JSON metadata")
     p.add_argument("--json", action="store_true", help="Output as JSON")
-    p.add_argument("db", nargs="?", default=_DEFAULT_DB, help="DB path")
 
     # import-files ROOT
     p = sub.add_parser("import-files", help="Import files from a directory")
+    p.add_argument("db", help="DB path")
     p.add_argument("root", help="Root directory to import")
     p.add_argument("-r", "--recursive", action="store_true", help="Recurse")
     p.add_argument("-p", "--prefix", default=None, help="Locator prefix")
@@ -1547,60 +1548,59 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--from-stdin", action="store_true", help="Read paths from stdin")
     p.add_argument("-0", "--null", action="store_true", help="Null-delimited stdin")
     p.add_argument("--dry-run", action="store_true", help="Show what would be done")
-    p.add_argument("db", nargs="?", default=_DEFAULT_DB, help="DB path")
 
     # import-manifest MANIFEST
     p = sub.add_parser("import-manifest", help="Import from manifest (JSONL or TSV)")
+    p.add_argument("db", help="DB path")
     p.add_argument("manifest", help="Manifest file path")
     p.add_argument(
         "--format", choices=["jsonl", "tsv"], default=None, help="Manifest format"
     )
     p.add_argument("--dry-run", action="store_true", help="Show what would be done")
-    p.add_argument("db", nargs="?", default=_DEFAULT_DB, help="DB path")
 
     # extract LOCATOR|DIGEST
     p = sub.add_parser("extract", help="Write bytes to a file")
+    p.add_argument("db", help="DB path")
     p.add_argument("ref", help="Locator or SHA-256 digest")
     p.add_argument("--at", default=None, help="Point-in-time (ms or ISO 8601)")
     p.add_argument("-o", "--output", default=None, help="Output file path")
-    p.add_argument("db", nargs="?", default=_DEFAULT_DB, help="DB path")
 
     # diff
     p = sub.add_parser("diff", help="Compare two blob versions")
+    p.add_argument("db", help="DB path")
     p.add_argument("ref_a", help="First locator or digest")
     p.add_argument("ref_b", help="Second locator or digest")
     p.add_argument("--from-at", default=None, help="Timestamp for ref_a")
     p.add_argument("--to-at", default=None, help="Timestamp for ref_b")
     p.add_argument("--text", action="store_true", help="Show text diff if UTF-8")
-    p.add_argument("db", nargs="?", default=_DEFAULT_DB, help="DB path")
 
     # optimize
     p = sub.add_parser("optimize", help="Run maintenance: repack + rechunk")
+    p.add_argument("db", help="DB path")
     p.add_argument("-s", "--storage-class", default=None, help="Storage class")
     p.add_argument("--no-repack", action="store_true", help="Skip repack")
     p.add_argument("--no-rechunk", action="store_true", help="Skip rechunk")
-    p.add_argument("db", nargs="?", default=_DEFAULT_DB, help="DB path")
 
     # vacuum
     p = sub.add_parser("vacuum", help="SQLite maintenance")
+    p.add_argument("db", help="DB path")
     p.add_argument("--analyze", action="store_true", help="Run ANALYZE")
     p.add_argument("--checkpoint", action="store_true", help="WAL checkpoint")
     p.add_argument("--vacuum", action="store_true", help="Run VACUUM")
-    p.add_argument("db", nargs="?", default=_DEFAULT_DB, help="DB path")
 
     # verify
     p = sub.add_parser("verify", help="Verify archive integrity")
+    p.add_argument("db", help="DB path")
     p.add_argument("--full", action="store_true", help="Full blob verification")
     p.add_argument("--sample", type=int, default=None, help="Verify N random blobs")
-    p.add_argument("db", nargs="?", default=_DEFAULT_DB, help="DB path")
 
     # migrate
     p = sub.add_parser("migrate", help="Explicit schema migration")
-    p.add_argument("db", nargs="?", default=_DEFAULT_DB, help="DB path")
+    p.add_argument("db", help="DB path")
 
     # schema
     p = sub.add_parser("schema", help="Show schema information")
-    p.add_argument("db", nargs="?", default=_DEFAULT_DB, help="DB path")
+    p.add_argument("db", help="DB path")
 
     args = parser.parse_args(argv)
     if args.command is None:

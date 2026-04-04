@@ -55,12 +55,12 @@ class TestVacuum:
 
     def test_vacuum_analyze(self, tmp_path):
         db = _populated_db(tmp_path)
-        result = _run(["vacuum", "--analyze", str(db)])
+        result = _run(["vacuum", str(db), "--analyze"])
         assert result.returncode == 0
 
     def test_vacuum_checkpoint(self, tmp_path):
         db = _populated_db(tmp_path)
-        result = _run(["vacuum", "--checkpoint", str(db)])
+        result = _run(["vacuum", str(db), "--checkpoint"])
         assert result.returncode == 0
 
 
@@ -80,13 +80,13 @@ class TestVerify:
 
     def test_verify_full(self, tmp_path):
         db = _populated_db(tmp_path)
-        result = _run(["verify", "--full", str(db)])
+        result = _run(["verify", str(db), "--full"])
         assert result.returncode == 0
         assert b"Verify OK" in result.stderr
 
     def test_verify_sample(self, tmp_path):
         db = _populated_db(tmp_path)
-        result = _run(["verify", "--sample", "1", str(db)])
+        result = _run(["verify", str(db), "--sample", "1"])
         assert result.returncode == 0
         assert b"Verify OK" in result.stderr
 

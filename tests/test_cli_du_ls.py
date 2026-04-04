@@ -38,7 +38,7 @@ class TestDu:
 
     def test_du_by_storage_class(self, tmp_path):
         db = _populated_db(tmp_path)
-        result = _run(["du", "--by", "storage-class", str(db)])
+        result = _run(["du", str(db), "--by", "storage-class"])
         assert result.returncode == 0
         output = result.stdout.decode()
         assert "text" in output
@@ -46,14 +46,14 @@ class TestDu:
 
     def test_du_by_codec(self, tmp_path):
         db = _populated_db(tmp_path)
-        result = _run(["du", "--by", "codec", str(db)])
+        result = _run(["du", str(db), "--by", "codec"])
         assert result.returncode == 0
         output = result.stdout.decode()
         assert "raw" in output or "zstd" in output
 
     def test_du_by_locator(self, tmp_path):
         db = _populated_db(tmp_path)
-        result = _run(["du", "--by", "locator", str(db)])
+        result = _run(["du", str(db), "--by", "locator"])
         assert result.returncode == 0
         output = result.stdout.decode()
         assert "loc/a" in output
@@ -62,7 +62,7 @@ class TestDu:
 
     def test_du_by_locator_json(self, tmp_path):
         db = _populated_db(tmp_path)
-        result = _run(["du", "--by", "storage-class", "--json", str(db)])
+        result = _run(["du", str(db), "--by", "storage-class", "--json"])
         assert result.returncode == 0
         data = json.loads(result.stdout.decode())
         assert isinstance(data, list)
@@ -75,14 +75,14 @@ class TestDu:
 
     def test_du_specific_locator(self, tmp_path):
         db = _populated_db(tmp_path)
-        result = _run(["du", "--locator", "loc/a", str(db)])
+        result = _run(["du", str(db), "--locator", "loc/a"])
         assert result.returncode == 0
         output = result.stdout.decode()
         assert "loc/a" in output
 
     def test_du_top_limit(self, tmp_path):
         db = _populated_db(tmp_path)
-        result = _run(["du", "--by", "locator", "--top", "2", str(db)])
+        result = _run(["du", str(db), "--by", "locator", "--top", "2"])
         assert result.returncode == 0
         output = result.stdout.decode()
         lines = [line for line in output.strip().split("\n") if line.startswith("loc/")]
@@ -99,7 +99,7 @@ class TestLs:
 
     def test_ls_locators(self, tmp_path):
         db = _populated_db(tmp_path)
-        result = _run(["ls", "locators", str(db)])
+        result = _run(["ls", str(db), "locators"])
         assert result.returncode == 0
         output = result.stdout.decode()
         assert "loc/a" in output
@@ -108,7 +108,7 @@ class TestLs:
 
     def test_ls_locators_json(self, tmp_path):
         db = _populated_db(tmp_path)
-        result = _run(["ls", "locators", "--json", str(db)])
+        result = _run(["ls", str(db), "locators", "--json"])
         assert result.returncode == 0
         data = json.loads(result.stdout.decode())
         assert "loc/a" in data
@@ -116,7 +116,7 @@ class TestLs:
 
     def test_ls_spans(self, tmp_path):
         db = _populated_db(tmp_path)
-        result = _run(["ls", "spans", str(db)])
+        result = _run(["ls", str(db), "spans"])
         assert result.returncode == 0
         output = result.stdout.decode()
         assert "span_id" in output
@@ -124,7 +124,7 @@ class TestLs:
 
     def test_ls_spans_filtered(self, tmp_path):
         db = _populated_db(tmp_path)
-        result = _run(["ls", "spans", "--locator", "loc/a", str(db)])
+        result = _run(["ls", str(db), "spans", "--locator", "loc/a"])
         assert result.returncode == 0
         output = result.stdout.decode()
         assert "loc/a" in output
@@ -132,7 +132,7 @@ class TestLs:
 
     def test_ls_spans_json(self, tmp_path):
         db = _populated_db(tmp_path)
-        result = _run(["ls", "spans", "--json", str(db)])
+        result = _run(["ls", str(db), "spans", "--json"])
         assert result.returncode == 0
         data = json.loads(result.stdout.decode())
         assert isinstance(data, list)
@@ -144,14 +144,14 @@ class TestLs:
 
     def test_ls_blobs(self, tmp_path):
         db = _populated_db(tmp_path)
-        result = _run(["ls", "blobs", str(db)])
+        result = _run(["ls", str(db), "blobs"])
         assert result.returncode == 0
         output = result.stdout.decode()
         assert "raw_size" in output or "stored" in output
 
     def test_ls_blobs_by_codec(self, tmp_path):
         db = _populated_db(tmp_path)
-        result = _run(["ls", "blobs", "--codec", "raw", str(db)])
+        result = _run(["ls", str(db), "blobs", "--codec", "raw"])
         assert result.returncode == 0
         output = result.stdout.decode()
         if output.strip():
@@ -159,7 +159,7 @@ class TestLs:
 
     def test_ls_blobs_by_storage_class(self, tmp_path):
         db = _populated_db(tmp_path)
-        result = _run(["ls", "blobs", "--storage-class", "xml", str(db)])
+        result = _run(["ls", str(db), "blobs", "--storage-class", "xml"])
         assert result.returncode == 0
         output = result.stdout.decode()
         if output.strip():
@@ -169,7 +169,7 @@ class TestLs:
         db = tmp_path / "test.db"
         with Farchive(db, enable_events=True) as fa:
             fa.store("loc/a", b"data", storage_class="text")
-        result = _run(["ls", "events", str(db)])
+        result = _run(["ls", str(db), "events"])
         assert result.returncode == 0
         output = result.stdout.decode()
         assert "event_id" in output
@@ -178,28 +178,28 @@ class TestLs:
         db = tmp_path / "test.db"
         with Farchive(db, enable_events=True) as fa:
             fa.store("loc/a", b"data", storage_class="text")
-        result = _run(["ls", "events", "--kind", "fa.store", str(db)])
+        result = _run(["ls", str(db), "events", "--kind", "fa.store"])
         assert result.returncode == 0
         output = result.stdout.decode()
         assert "fa.store" in output
 
     def test_ls_dicts_empty(self, tmp_path):
         db = _populated_db(tmp_path)
-        result = _run(["ls", "dicts", str(db)])
+        result = _run(["ls", str(db), "dicts"])
         assert result.returncode == 0
         output = result.stdout.decode()
         assert "No dictionaries" in output or "dict_id" in output
 
     def test_ls_chunks_empty(self, tmp_path):
         db = _populated_db(tmp_path)
-        result = _run(["ls", "chunks", str(db)])
+        result = _run(["ls", str(db), "chunks"])
         assert result.returncode == 0
         output = result.stdout.decode()
         assert "No chunks" in output or "chunk_digest" in output
 
     def test_ls_limit(self, tmp_path):
         db = _populated_db(tmp_path)
-        result = _run(["ls", "blobs", "--limit", "1", str(db)])
+        result = _run(["ls", str(db), "blobs", "--limit", "1"])
         assert result.returncode == 0
         output = result.stdout.decode()
         lines = [
@@ -211,7 +211,7 @@ class TestLs:
 
     def test_ls_default_is_locators(self, tmp_path):
         db = _populated_db(tmp_path)
-        result = _run(["ls", "locators", str(db)])
+        result = _run(["ls", str(db), "locators"])
         assert result.returncode == 0
         output = result.stdout.decode()
         assert "loc/a" in output

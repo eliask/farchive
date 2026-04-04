@@ -79,7 +79,7 @@ def test_stats_shows_schema_version(tmp_path):
 
 def test_history_shows_span_table(tmp_path):
     db = _populated_db(tmp_path)
-    result = _run(["history", "loc/a", str(db)])
+    result = _run(["history", str(db), "loc/a"])
 
     assert result.returncode == 0, f"stderr: {result.stderr}"
     # loc/a was stored twice with different content → 2 spans
@@ -89,7 +89,7 @@ def test_history_shows_span_table(tmp_path):
 
 def test_history_shows_current_span(tmp_path):
     db = _populated_db(tmp_path)
-    result = _run(["history", "loc/b", str(db)])
+    result = _run(["history", str(db), "loc/b"])
 
     assert result.returncode == 0
     assert "current" in result.stdout
@@ -97,7 +97,7 @@ def test_history_shows_current_span(tmp_path):
 
 def test_history_unknown_locator_reports_no_history(tmp_path):
     db = _populated_db(tmp_path)
-    result = _run(["history", "loc/does_not_exist", str(db)])
+    result = _run(["history", str(db), "loc/does_not_exist"])
 
     assert result.returncode == 0
     assert "No history" in result.stdout
@@ -208,7 +208,7 @@ def test_inspect_shows_blob_metadata(tmp_path):
         assert span is not None
         digest = span.digest
 
-    result = _run(["inspect", digest, str(db)])
+    result = _run(["inspect", str(db), digest])
 
     assert result.returncode == 0, f"stderr: {result.stderr}"
     assert "Digest:" in result.stdout
@@ -222,7 +222,7 @@ def test_inspect_shows_blob_metadata(tmp_path):
 
 def test_inspect_unknown_digest_exits_nonzero(tmp_path):
     db = _populated_db(tmp_path)
-    result = _run(["inspect", "0" * 64, str(db)])
+    result = _run(["inspect", str(db), "0" * 64])
 
     assert result.returncode != 0
     assert "not found" in result.stdout.lower()
@@ -285,7 +285,7 @@ def test_inspect_shows_chunked_blob_info(tmp_path):
         )
         fa._conn.commit()
 
-    result = _run(["inspect", digest, str(db)])
+    result = _run(["inspect", str(db), digest])
     assert result.returncode == 0, f"stderr: {result.stderr}"
     assert "Codec:          chunked" in result.stdout
     assert "Chunk refs:" in result.stdout

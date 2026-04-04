@@ -30,7 +30,7 @@ class TestPutBlob:
         f = tmp_path / "data.bin"
         f.write_bytes(b"hello blob")
 
-        result = _run(["put-blob", str(f), str(db)])
+        result = _run(["put-blob", str(db), str(f)])
         assert result.returncode == 0
         digest = result.stdout.decode().strip()
         assert len(digest) == 64
@@ -41,7 +41,7 @@ class TestPutBlob:
     def test_put_blob_from_stdin(self, tmp_path):
         db = tmp_path / "test.db"
         result = subprocess.run(
-            [sys.executable, "-m", "farchive._cli", "put-blob", "-", str(db)],
+            [sys.executable, "-m", "farchive._cli", "put-blob", str(db), "-"],
             input=b"stdin blob",
             capture_output=True,
         )
@@ -57,7 +57,7 @@ class TestPutBlob:
         f = tmp_path / "data.bin"
         f.write_bytes(b"data")
 
-        result = _run(["put-blob", str(f), "--json", str(db)])
+        result = _run(["put-blob", str(db), str(f), "--json"])
         assert result.returncode == 0
         output = json.loads(result.stdout.decode())
         assert "digest" in output
@@ -68,7 +68,7 @@ class TestPutBlob:
         f = tmp_path / "data.bin"
         f.write_bytes(b"data")
 
-        _run(["put-blob", str(f), str(db)])
+        _run(["put-blob", str(db), str(f)])
 
         with Farchive(db) as fa:
             locators = fa.locators()
@@ -88,7 +88,7 @@ class TestObserve:
         with Farchive(db) as fa:
             digest = fa.put_blob(b"some data")
 
-        result = _run(["observe", "loc/a", digest, str(db)])
+        result = _run(["observe", str(db), "loc/a", digest])
         assert result.returncode == 0
 
         with Farchive(db) as fa:
@@ -101,7 +101,7 @@ class TestObserve:
         with Farchive(db) as fa:
             digest = fa.put_blob(b"data")
 
-        result = _run(["observe", "loc/a", digest, "--json", str(db)])
+        result = _run(["observe", str(db), "loc/a", digest, "--json"])
         assert result.returncode == 0
         output = json.loads(result.stdout.decode())
         assert output["locator"] == "loc/a"
@@ -126,10 +126,10 @@ class TestImportFiles:
         result = _run(
             [
                 "import-files",
+                str(db),
                 str(root),
                 "-p",
                 "file://",
-                str(db),
             ]
         )
         assert result.returncode == 0
@@ -147,9 +147,9 @@ class TestImportFiles:
         result = _run(
             [
                 "import-files",
+                str(db),
                 str(root),
                 "--dry-run",
-                str(db),
             ]
         )
         assert result.returncode == 0
@@ -168,11 +168,11 @@ class TestImportFiles:
         result = _run(
             [
                 "import-files",
+                str(db),
                 str(root),
                 "-r",
                 "-p",
                 "file://",
-                str(db),
             ]
         )
         assert result.returncode == 0
@@ -189,12 +189,12 @@ class TestImportFiles:
         result = _run(
             [
                 "import-files",
+                str(db),
                 str(root),
                 "--class-by-ext",
                 "html=html",
                 "-p",
                 "file://",
-                str(db),
             ]
         )
         assert result.returncode == 0
@@ -231,7 +231,7 @@ class TestImportManifest:
             + "\n"
         )
 
-        result = _run(["import-manifest", str(manifest), str(db)])
+        result = _run(["import-manifest", str(db), str(manifest)])
         assert result.returncode == 0
 
         with Farchive(db) as fa:
@@ -249,7 +249,7 @@ class TestImportManifest:
             json.dumps({"locator": "loc/a", "path": str(root / "a.txt")}) + "\n"
         )
 
-        result = _run(["import-manifest", str(manifest), "--dry-run", str(db)])
+        result = _run(["import-manifest", str(db), str(manifest), "--dry-run"])
         assert result.returncode == 0
         assert b"dry-run" in result.stdout
 

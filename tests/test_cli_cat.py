@@ -38,7 +38,7 @@ class TestCat:
 
     def test_cat_by_locator(self, tmp_path):
         db = _populated_db(tmp_path)
-        result = _run(["cat", "loc/a", str(db)])
+        result = _run(["cat", str(db), "loc/a"])
         assert result.returncode == 0
         assert result.stdout == b"hello world"
         assert result.stderr == b""
@@ -49,7 +49,7 @@ class TestCat:
             span = fa.resolve("loc/a")
             assert span is not None
             digest = span.digest
-        result = _run(["cat", digest, str(db)])
+        result = _run(["cat", str(db), digest])
         assert result.returncode == 0
         assert result.stdout == b"hello world"
         assert result.stderr == b""
@@ -61,23 +61,23 @@ class TestCat:
             fa.store("loc/a", b"v2", observed_at=_ts(2000))
             fa.store("loc/a", b"v3", observed_at=_ts(3000))
 
-        result = _run(["cat", "loc/a", "--at", "1500", str(db)])
+        result = _run(["cat", str(db), "loc/a", "--at", "1500"])
         assert result.returncode == 0
         assert result.stdout == b"v1"
 
-        result = _run(["cat", "loc/a", "--at", "2500", str(db)])
+        result = _run(["cat", str(db), "loc/a", "--at", "2500"])
         assert result.returncode == 0
         assert result.stdout == b"v2"
 
     def test_cat_missing_locator(self, tmp_path):
         db = _populated_db(tmp_path)
-        result = _run(["cat", "loc/nonexistent", str(db)])
+        result = _run(["cat", str(db), "loc/nonexistent"])
         assert result.returncode != 0
         assert b"No span found" in result.stderr
 
     def test_cat_missing_digest(self, tmp_path):
         db = _populated_db(tmp_path)
-        result = _run(["cat", "0" * 64, str(db)])
+        result = _run(["cat", str(db), "0" * 64])
         assert result.returncode != 0
         assert b"Digest not found" in result.stderr
 
@@ -93,7 +93,7 @@ class TestCat:
         data = bytes(range(256)) * 100
         with Farchive(db) as fa:
             fa.store("loc/bin", data, storage_class="binary")
-        result = _run(["cat", "loc/bin", str(db)])
+        result = _run(["cat", str(db), "loc/bin"])
         assert result.returncode == 0
         assert result.stdout == data
 
@@ -112,7 +112,7 @@ class TestStore:
         f = tmp_path / "input.txt"
         f.write_bytes(content)
 
-        result = _run(["store", "loc/a", str(f), str(db)])
+        result = _run(["store", str(db), "loc/a", str(f)])
         assert result.returncode == 0
         digest = result.stdout.decode().strip()
         assert len(digest) == 64
@@ -130,9 +130,9 @@ class TestStore:
                 "-m",
                 "farchive._cli",
                 "store",
+                str(db),
                 "loc/a",
                 "-",
-                str(db),
             ],
             input=content,
             capture_output=True,
@@ -152,11 +152,11 @@ class TestStore:
         result = _run(
             [
                 "store",
+                str(db),
                 "loc/a",
                 str(f),
                 "-s",
                 "html",
-                str(db),
             ]
         )
         assert result.returncode == 0
@@ -176,10 +176,10 @@ class TestStore:
         result = _run(
             [
                 "store",
+                str(db),
                 "loc/a",
                 str(f),
                 "--json",
-                str(db),
             ]
         )
         assert result.returncode == 0
@@ -190,7 +190,7 @@ class TestStore:
 
     def test_store_file_not_found(self, tmp_path):
         db = tmp_path / "test.db"
-        result = _run(["store", "loc/a", "nonexistent.txt", str(db)])
+        result = _run(["store", str(db), "loc/a", "nonexistent.txt"])
         assert result.returncode != 0
         assert b"File not found" in result.stderr
 
@@ -202,11 +202,11 @@ class TestStore:
         result = _run(
             [
                 "store",
+                str(db),
                 "loc/a",
                 str(f),
                 "--metadata",
                 '{"etag": "abc123"}',
-                str(db),
             ]
         )
         assert result.returncode == 0
@@ -227,7 +227,7 @@ class TestResolve:
 
     def test_resolve_current(self, tmp_path):
         db = _populated_db(tmp_path)
-        result = _run(["resolve", "loc/a", str(db)])
+        result = _run(["resolve", str(db), "loc/a"])
         assert result.returncode == 0
         output = result.stdout.decode()
         assert "Locator:" in output
@@ -242,7 +242,7 @@ class TestResolve:
             fa.store("loc/a", b"v1", observed_at=_ts(1000))
             fa.store("loc/a", b"v2", observed_at=_ts(2000))
 
-        result = _run(["resolve", "loc/a", "--at", "1500", str(db)])
+        result = _run(["resolve", str(db), "loc/a", "--at", "1500"])
         assert result.returncode == 0
         output = result.stdout.decode()
         # v1 was stored at 1000ms; output is in local time
@@ -252,7 +252,7 @@ class TestResolve:
 
     def test_resolve_json(self, tmp_path):
         db = _populated_db(tmp_path)
-        result = _run(["resolve", "loc/a", "--json", str(db)])
+        result = _run(["resolve", str(db), "loc/a", "--json"])
         assert result.returncode == 0
         output = json.loads(result.stdout.decode())
         assert output["locator"] == "loc/a"
@@ -262,7 +262,7 @@ class TestResolve:
 
     def test_resolve_missing(self, tmp_path):
         db = _populated_db(tmp_path)
-        result = _run(["resolve", "loc/nonexistent", str(db)])
+        result = _run(["resolve", str(db), "loc/nonexistent"])
         assert result.returncode != 0
         assert b"No span found" in result.stderr
 
@@ -277,17 +277,17 @@ class TestHas:
 
     def test_has_present(self, tmp_path):
         db = _populated_db(tmp_path)
-        result = _run(["has", "loc/a", str(db)])
+        result = _run(["has", str(db), "loc/a"])
         assert result.returncode == 0
 
     def test_has_absent(self, tmp_path):
         db = _populated_db(tmp_path)
-        result = _run(["has", "loc/nonexistent", str(db)])
+        result = _run(["has", str(db), "loc/nonexistent"])
         assert result.returncode == 1
 
     def test_has_fresh(self, tmp_path):
         db = _populated_db(tmp_path)
-        result = _run(["has", "loc/a", "--max-age", "1", str(db)])
+        result = _run(["has", str(db), "loc/a", "--max-age", "1"])
         # Just created, should be fresh
         assert result.returncode == 0
 
@@ -295,5 +295,5 @@ class TestHas:
         db = tmp_path / "test.db"
         with Farchive(db) as fa:
             fa.store("loc/a", b"data", observed_at=_ts(1000))
-        result = _run(["has", "loc/a", "--max-age", "0.000001", str(db)])
+        result = _run(["has", str(db), "loc/a", "--max-age", "0.000001"])
         assert result.returncode == 1
