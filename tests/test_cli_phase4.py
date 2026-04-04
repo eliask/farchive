@@ -6,6 +6,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from tests.test_timestamps import _ts
 from farchive import Farchive
 
 
@@ -54,8 +55,8 @@ class TestExtract:
     def test_extract_by_locator_at_time(self, tmp_path):
         db = tmp_path / "test.db"
         with Farchive(db) as fa:
-            fa.store("loc/a", b"v1", observed_at=1000)
-            fa.store("loc/a", b"v2", observed_at=2000)
+            fa.store("loc/a", b"v1", observed_at=_ts(1000))
+            fa.store("loc/a", b"v2", observed_at=_ts(2000))
 
         out = tmp_path / "output.txt"
         result = _run(
@@ -101,9 +102,9 @@ class TestDiff:
     def test_diff_same_content(self, tmp_path):
         db = tmp_path / "test.db"
         with Farchive(db) as fa:
-            fa.store("loc/a", b"same", observed_at=1000)
-            fa.store("loc/a", b"same v2", observed_at=2000)
-            fa.store("loc/a", b"same", observed_at=3000)
+            fa.store("loc/a", b"same", observed_at=_ts(1000))
+            fa.store("loc/a", b"same v2", observed_at=_ts(2000))
+            fa.store("loc/a", b"same", observed_at=_ts(3000))
 
         # Compare first and last spans (same content)
         result = _run(
@@ -145,8 +146,8 @@ class TestDiff:
     def test_diff_text_mode(self, tmp_path):
         db = tmp_path / "test.db"
         with Farchive(db) as fa:
-            fa.store("loc/a", b"line1\nline2\n", observed_at=1000)
-            fa.store("loc/a", b"line1\nline3\n", observed_at=2000)
+            fa.store("loc/a", b"line1\nline2\n", observed_at=_ts(1000))
+            fa.store("loc/a", b"line1\nline3\n", observed_at=_ts(2000))
 
         result = _run(["diff", "--locator", "loc/a", "--text", str(db)])
         assert result.returncode == 0

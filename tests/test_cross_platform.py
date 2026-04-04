@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import unittest.mock
 
+from tests.test_timestamps import _ts
 from farchive import Farchive
 
 
@@ -70,9 +71,9 @@ def test_multiple_operations_without_fcntl(tmp_path):
                 assert fa.get(f"loc/{i}") == f"content {i}".encode()
 
             # Multiple observations at same locator
-            fa.store("loc/repeat", b"v1", observed_at=1000)
-            fa.store("loc/repeat", b"v2", observed_at=2000)
-            fa.store("loc/repeat", b"v1", observed_at=3000)
+            fa.store("loc/repeat", b"v1", observed_at=_ts(1000))
+            fa.store("loc/repeat", b"v2", observed_at=_ts(2000))
+            fa.store("loc/repeat", b"v1", observed_at=_ts(3000))
 
             spans = fa.history("loc/repeat")
             assert len(spans) == 3

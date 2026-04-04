@@ -3,7 +3,24 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any
+
+
+def _ms_to_dt(ms: int | None) -> datetime | None:
+    """Convert Unix milliseconds to UTC datetime."""
+    if ms is None:
+        return None
+    return datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc)
+
+
+def _dt_to_ms(dt: datetime | None) -> int | None:
+    """Convert UTC datetime to Unix milliseconds."""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return int(dt.timestamp() * 1000)
 
 
 @dataclass(frozen=True, slots=True)
@@ -13,9 +30,9 @@ class StateSpan:
     span_id: int
     locator: str
     digest: str
-    observed_from: int  # UTC Unix ms, inclusive
-    observed_until: int | None  # UTC Unix ms, exclusive; None = current
-    last_confirmed_at: int  # UTC Unix ms
+    observed_from: datetime  # UTC, inclusive
+    observed_until: datetime | None  # UTC, exclusive; None = current
+    last_confirmed_at: datetime  # UTC
     observation_count: int
     last_metadata: dict[str, Any] | None = None
 
@@ -92,7 +109,7 @@ class Event:
     """An append-only audit record of one archival operation."""
 
     event_id: int
-    occurred_at: int  # UTC Unix ms
+    occurred_at: datetime  # UTC
     locator: str
     digest: str | None
     kind: str

@@ -7,12 +7,31 @@ import json
 import os
 import sys
 import fnmatch
+from datetime import datetime, timezone
 from pathlib import Path
 
 from typing import Any
 
 from farchive._archive import Farchive
 from farchive._archive import _sha256
+
+
+def _ms_to_dt(ms: int) -> datetime:
+    """Convert Unix milliseconds to UTC datetime."""
+    return datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc)
+
+
+def _json_default(obj):
+    """JSON serializer for objects not serializable by default json code."""
+    if isinstance(obj, datetime):
+        return obj.isoformat()
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
+
+def _json_dumps(obj, **kwargs):
+    """JSON dumps with datetime support."""
+    return json.dumps(obj, default=_json_default, **kwargs)
+
 
 _DEFAULT_DB = "archive.farchive"
 
@@ -126,7 +145,7 @@ def _cmd_events(args: argparse.Namespace) -> None:
     with Farchive(args.db) as fa:
         events = fa.events(
             locator=args.locator or None,
-            since=args.since or None,
+            since=_ms_to_dt(args.since) if args.since else None,
             limit=args.limit,
         )
     if not events:
@@ -234,7 +253,7 @@ def _cmd_cat(args: argparse.Namespace) -> None:
                 print(f"Digest not found: {args.digest}", file=sys.stderr)
                 sys.exit(1)
         elif args.locator:
-            span = fa.resolve(args.locator, at=args.at)
+            span = fa.resolve(args.locator, at=_ms_to_dt(args.at) if args.at else None)
             if span is None:
                 print(f"No span found for locator: {args.locator}", file=sys.stderr)
                 sys.exit(1)
@@ -271,13 +290,13 @@ def _cmd_store(args: argparse.Namespace) -> None:
         digest = fa.store(
             args.locator,
             data,
-            observed_at=args.observed_at,
+            observed_at=_ms_to_dt(args.observed_at) if args.observed_at else None,
             storage_class=args.storage_class,
             metadata=metadata,
         )
 
     if args.json:
-        print(json.dumps({"digest": digest, "locator": args.locator}))
+        print(_json_dumps({"digest": digest, "locator": args.locator}))
     else:
         print(digest)
 
@@ -285,7 +304,7 @@ def _cmd_store(args: argparse.Namespace) -> None:
 def _cmd_resolve(args: argparse.Namespace) -> None:
     """Show what a locator resolves to (span metadata, not bytes)."""
     with Farchive(args.db) as fa:
-        span = fa.resolve(args.locator, at=args.at)
+        span = fa.resolve(args.locator, at=_ms_to_dt(args.at) if args.at else None)
 
     if span is None:
         print(f"No span found for locator: {args.locator}", file=sys.stderr)
@@ -293,7 +312,7 @@ def _cmd_resolve(args: argparse.Namespace) -> None:
 
     if args.json:
         print(
-            json.dumps(
+            _json_dumps(
                 {
                     "span_id": span.span_id,
                     "locator": span.locator,
@@ -315,7 +334,7 @@ def _cmd_resolve(args: argparse.Namespace) -> None:
         print(f"Last confirmed: {span.last_confirmed_at}")
         print(f"Observations:   {span.observation_count}")
         if span.last_metadata:
-            print(f"Metadata:       {json.dumps(span.last_metadata)}")
+            print(f"Metadata:       {_json_dumps(span.last_metadata)}")
 
 
 def _cmd_has(args: argparse.Namespace) -> None:
@@ -362,7 +381,7 @@ def _cmd_du(args: argparse.Namespace) -> None:
                     }
                     for r in rows
                 ]
-                print(json.dumps(items, indent=2))
+                print(_json_dumps(items, indent=2))
 
         elif args.by == "codec":
             rows = fa._conn.execute(
@@ -387,7 +406,7 @@ def _cmd_du(args: argparse.Namespace) -> None:
                     }
                     for r in rows
                 ]
-                print(json.dumps(items, indent=2))
+                print(_json_dumps(items, indent=2))
 
         elif args.by == "locator":
             rows = fa._conn.execute(
@@ -416,7 +435,7 @@ def _cmd_du(args: argparse.Namespace) -> None:
                     }
                     for r in rows
                 ]
-                print(json.dumps(items, indent=2))
+                print(_json_dumps(items, indent=2))
 
         elif args.locator:
             rows = fa._conn.execute(
@@ -456,7 +475,7 @@ def _cmd_du(args: argparse.Namespace) -> None:
                             "observed_until": r["observed_until"],
                         }
                     )
-                print(json.dumps(items, indent=2))
+                print(_json_dumps(items, indent=2))
         else:
             print(
                 "Error: --by (locator|storage-class|codec) or --locator is required",
@@ -475,7 +494,7 @@ def _cmd_ls(args: argparse.Namespace) -> None:
                 "SELECT DISTINCT locator FROM locator_span ORDER BY locator"
             ).fetchall()
             if args.json:
-                print(json.dumps([r["locator"] for r in rows], indent=2))
+                print(_json_dumps([r["locator"] for r in rows], indent=2))
             else:
                 for r in rows:
                     print(r["locator"])
@@ -513,7 +532,7 @@ def _cmd_ls(args: argparse.Namespace) -> None:
                             "observation_count": r["observation_count"],
                         }
                     )
-                print(json.dumps(items, indent=2))
+                print(_json_dumps(items, indent=2))
             else:
                 if not rows:
                     print("No spans found.")
@@ -563,7 +582,7 @@ def _cmd_ls(args: argparse.Namespace) -> None:
                             "created_at": r["created_at"],
                         }
                     )
-                print(json.dumps(items, indent=2))
+                print(_json_dumps(items, indent=2))
             else:
                 if not rows:
                     print("No blobs found.")
@@ -615,7 +634,7 @@ def _cmd_ls(args: argparse.Namespace) -> None:
                             else None,
                         }
                     )
-                print(json.dumps(items, indent=2))
+                print(_json_dumps(items, indent=2))
             else:
                 if not rows:
                     print("No events found.")
@@ -649,7 +668,7 @@ def _cmd_ls(args: argparse.Namespace) -> None:
                             "dict_size": r["dict_size"],
                         }
                     )
-                print(json.dumps(items, indent=2))
+                print(_json_dumps(items, indent=2))
             else:
                 if not rows:
                     print("No dictionaries found.")
@@ -689,7 +708,7 @@ def _cmd_ls(args: argparse.Namespace) -> None:
                             "created_at": r["created_at"],
                         }
                     )
-                print(json.dumps(items, indent=2))
+                print(_json_dumps(items, indent=2))
             else:
                 if not rows:
                     print("No chunks found.")
@@ -729,7 +748,7 @@ def _cmd_put_blob(args: argparse.Namespace) -> None:
         digest = fa.put_blob(data, storage_class=args.storage_class)
 
     if args.json:
-        print(json.dumps({"digest": digest}))
+        print(_json_dumps({"digest": digest}))
     else:
         print(digest)
 
@@ -748,13 +767,13 @@ def _cmd_observe(args: argparse.Namespace) -> None:
         span = fa.observe(
             args.locator,
             args.digest,
-            observed_at=args.observed_at,
+            observed_at=_ms_to_dt(args.observed_at) if args.observed_at else None,
             metadata=metadata,
         )
 
     if args.json:
         print(
-            json.dumps(
+            _json_dumps(
                 {
                     "span_id": span.span_id,
                     "locator": span.locator,
@@ -834,9 +853,11 @@ def _cmd_import_files(args: argparse.Namespace) -> None:
             sc = ext_to_sc.get(ext)
 
         # Determine timestamp
-        ts = observed_at
-        if ts is None and args.observed_at == "mtime":
-            ts = int(p.stat().st_mtime * 1000)
+        ts: datetime | None = None
+        if observed_at is not None:
+            ts = _ms_to_dt(observed_at)
+        elif args.observed_at == "mtime":
+            ts = _ms_to_dt(int(p.stat().st_mtime * 1000))
 
         # Build locator
         if args.locator_prefix:
@@ -974,7 +995,7 @@ def _cmd_extract(args: argparse.Namespace) -> None:
                 print(f"Digest not found: {args.digest}", file=sys.stderr)
                 sys.exit(1)
         elif args.locator:
-            span = fa.resolve(args.locator, at=args.at)
+            span = fa.resolve(args.locator, at=_ms_to_dt(args.at) if args.at else None)
             if span is None:
                 print(f"No span found for locator: {args.locator}", file=sys.stderr)
                 sys.exit(1)
@@ -1003,8 +1024,12 @@ def _cmd_diff(args: argparse.Namespace) -> None:
     with Farchive(args.db) as fa:
         if args.locator:
             if args.from_at is not None and args.to_at is not None:
-                span_from = fa.resolve(args.locator, at=args.from_at)
-                span_to = fa.resolve(args.locator, at=args.to_at)
+                span_from = fa.resolve(
+                    args.locator, at=_ms_to_dt(args.from_at) if args.from_at else None
+                )
+                span_to = fa.resolve(
+                    args.locator, at=_ms_to_dt(args.to_at) if args.to_at else None
+                )
             else:
                 spans = fa.history(args.locator)
                 if len(spans) < 2:

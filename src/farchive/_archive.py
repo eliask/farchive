@@ -20,6 +20,7 @@ import os
 import sqlite3
 import sys
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -51,6 +52,8 @@ from farchive._types import (
     RepackStats,
     RechunkStats,
     StateSpan,
+    _dt_to_ms,
+    _ms_to_dt,
 )
 
 
@@ -64,9 +67,11 @@ def _row_to_span(row: sqlite3.Row) -> StateSpan:
         span_id=row["span_id"],
         locator=row["locator"],
         digest=row["digest"],
-        observed_from=row["observed_from"],
-        observed_until=row["observed_until"],
-        last_confirmed_at=row["last_confirmed_at"],
+        observed_from=_ms_to_dt(row["observed_from"])
+        or datetime.fromtimestamp(0, tz=timezone.utc),
+        observed_until=_ms_to_dt(row["observed_until"]),
+        last_confirmed_at=_ms_to_dt(row["last_confirmed_at"])
+        or datetime.fromtimestamp(0, tz=timezone.utc),
         observation_count=row["observation_count"],
         last_metadata=json.loads(meta_json) if meta_json else None,
     )
@@ -76,7 +81,8 @@ def _row_to_event(row: sqlite3.Row) -> Event:
     meta_json = row["metadata_json"]
     return Event(
         event_id=row["event_id"],
-        occurred_at=row["occurred_at"],
+        occurred_at=_ms_to_dt(row["occurred_at"])
+        or datetime.fromtimestamp(0, tz=timezone.utc),
         locator=row["locator"],
         digest=row["digest"],
         kind=row["kind"],
@@ -752,7 +758,7 @@ class Farchive:
         locator: str,
         digest: str,
         *,
-        observed_at: int | None = None,
+        observed_at: datetime | None = None,
         metadata: dict | None = None,
     ) -> StateSpan:
         """Record an observation of a digest at a locator.
@@ -764,9 +770,10 @@ class Farchive:
         last_confirmed_at (monotone time enforcement).
         """
         if observed_at is not None:
-            now, caller_ts = observed_at, True
+            now, caller_ts = _dt_to_ms(observed_at), True
         else:
             now, caller_ts = _now_ms(), False
+        assert now is not None
         with self._write_lock():
             with self._conn:
                 return self._observe_impl(
@@ -782,15 +789,16 @@ class Farchive:
         locator: str,
         data: bytes,
         *,
-        observed_at: int | None = None,
+        observed_at: datetime | None = None,
         storage_class: str | None = None,
         metadata: dict | None = None,
     ) -> str:
         """Store content at a locator. put_blob + observe, atomic. Returns digest."""
         if observed_at is not None:
-            now, caller_ts = observed_at, True
+            now, caller_ts = _dt_to_ms(observed_at), True
         else:
             now, caller_ts = _now_ms(), False
+        assert now is not None
         digest = _sha256(data)
         with self._write_lock():
             return self._store_impl(
@@ -832,7 +840,7 @@ class Farchive:
                 kind="fa.store",
                 locator=locator,
                 digest=digest,
-                occurred_at=span.last_confirmed_at,
+                occurred_at=_dt_to_ms(span.last_confirmed_at),
             )
 
         # Auto-train if eligible and no dict yet (non-fatal)
@@ -845,15 +853,16 @@ class Farchive:
         self,
         items: list[tuple[str, bytes]],
         *,
-        observed_at: int | None = None,
+        observed_at: datetime | None = None,
         storage_class: str | None = None,
         progress: Callable[[int, int], None] | None = None,
     ) -> ImportStats:
         """Bulk store (locator, data) tuples. Efficient for import."""
+        ms = _dt_to_ms(observed_at) if observed_at is not None else None
         with self._write_lock():
             return self._store_batch_impl(
                 items,
-                observed_at=observed_at,
+                observed_at=ms,
                 storage_class=storage_class,
                 progress=progress,
             )
@@ -949,9 +958,10 @@ class Farchive:
         """Read exact raw bytes by digest. None if not found."""
         return self._read_raw(digest)
 
-    def resolve(self, locator: str, *, at: int | None = None) -> StateSpan | None:
+    def resolve(self, locator: str, *, at: datetime | None = None) -> StateSpan | None:
         """Resolve the current or point-in-time span for a locator."""
-        if at is None:
+        ms = _dt_to_ms(at) if at is not None else None
+        if ms is None:
             row = self._conn.execute(
                 "SELECT * FROM locator_span "
                 "WHERE locator=? AND observed_until IS NULL "
@@ -964,13 +974,13 @@ class Farchive:
                 "WHERE locator=? AND observed_from <= ? "
                 "AND (observed_until IS NULL OR ? < observed_until) "
                 "ORDER BY observed_from DESC, span_id DESC LIMIT 1",
-                (locator, at, at),
+                (locator, ms, ms),
             ).fetchone()
         if row is None:
             return None
         return _row_to_span(row)
 
-    def get(self, locator: str, *, at: int | None = None) -> bytes | None:
+    def get(self, locator: str, *, at: datetime | None = None) -> bytes | None:
         """Get content for a locator. Convenience: resolve + read."""
         span = self.resolve(locator, at=at)
         if span is None:
@@ -1018,7 +1028,7 @@ class Farchive:
         self,
         locator: str | None = None,
         *,
-        since: int | None = None,
+        since: datetime | None = None,
         limit: int = 1000,
     ) -> list[Event]:
         """Query event log.
@@ -1027,6 +1037,7 @@ class Farchive:
         event table (via enable_events=True), all subsequent sessions append
         events and can read the full history. Returns events newest-first.
         """
+        since_ms = _dt_to_ms(since) if since is not None else None
         # Check if event table exists (may have been created by a prior session)
         has_table = self._conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='event'"
@@ -1039,9 +1050,9 @@ class Farchive:
         if locator is not None:
             conditions.append("locator = ?")
             params.append(locator)
-        if since is not None:
+        if since_ms is not None:
             conditions.append("occurred_at >= ?")
-            params.append(since)
+            params.append(since_ms)
 
         where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
         params.append(limit)

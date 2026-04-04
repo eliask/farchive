@@ -10,6 +10,7 @@ import hashlib
 
 from hypothesis import given, settings, strategies as st
 
+from tests.test_timestamps import _ts
 from farchive import Farchive
 
 
@@ -128,9 +129,9 @@ def test_aba_creates_three_spans(content_a, content_b):
     with tempfile.TemporaryDirectory() as td:
         db = Path(td) / "test.db"
         with Farchive(db) as fa:
-            fa.store("loc/x", content_a, observed_at=1000)
-            fa.store("loc/x", content_b, observed_at=2000)
-            fa.store("loc/x", content_a, observed_at=3000)
+            fa.store("loc/x", content_a, observed_at=_ts(1000))
+            fa.store("loc/x", content_b, observed_at=_ts(2000))
+            fa.store("loc/x", content_a, observed_at=_ts(3000))
 
             spans = fa.history("loc/x")
             assert len(spans) == 3, (
@@ -220,7 +221,7 @@ def test_observation_count_matches_stores(data, n):
         db = Path(td) / "test.db"
         with Farchive(db) as fa:
             for i in range(n):
-                fa.store("loc/count", data, observed_at=1_000_000 + i)
+                fa.store("loc/count", data, observed_at=_ts(1_000_000 + i))
 
             span = fa.resolve("loc/count")
             assert span is not None

@@ -7,6 +7,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from tests.test_timestamps import _ts
 from farchive import Farchive
 
 
@@ -56,9 +57,9 @@ class TestCat:
     def test_cat_by_locator_at_time(self, tmp_path):
         db = tmp_path / "test.db"
         with Farchive(db) as fa:
-            fa.store("loc/a", b"v1", observed_at=1000)
-            fa.store("loc/a", b"v2", observed_at=2000)
-            fa.store("loc/a", b"v3", observed_at=3000)
+            fa.store("loc/a", b"v1", observed_at=_ts(1000))
+            fa.store("loc/a", b"v2", observed_at=_ts(2000))
+            fa.store("loc/a", b"v3", observed_at=_ts(3000))
 
         result = _run(["cat", "--locator", "loc/a", "--at", "1500", str(db)])
         assert result.returncode == 0
@@ -241,13 +242,14 @@ class TestResolve:
     def test_resolve_at_time(self, tmp_path):
         db = tmp_path / "test.db"
         with Farchive(db) as fa:
-            fa.store("loc/a", b"v1", observed_at=1000)
-            fa.store("loc/a", b"v2", observed_at=2000)
+            fa.store("loc/a", b"v1", observed_at=_ts(1000))
+            fa.store("loc/a", b"v2", observed_at=_ts(2000))
 
         result = _run(["resolve", "--locator", "loc/a", "--at", "1500", str(db)])
         assert result.returncode == 0
         output = result.stdout.decode()
-        assert "1000" in output
+        # v1 was stored at 1000ms (1970-01-01 00:00:01 UTC)
+        assert "1970-01-01 00:00:01" in output
 
     def test_resolve_json(self, tmp_path):
         db = _populated_db(tmp_path)
@@ -302,7 +304,7 @@ class TestHas:
     def test_has_stale(self, tmp_path):
         db = tmp_path / "test.db"
         with Farchive(db) as fa:
-            fa.store("loc/a", b"data", observed_at=1000)
+            fa.store("loc/a", b"data", observed_at=_ts(1000))
         result = _run(
             [
                 "has",

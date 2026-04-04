@@ -8,14 +8,15 @@ SPEC.md section 5.7 (Transactional visibility).
 from __future__ import annotations
 
 import pytest
+from datetime import datetime, timezone
 from typing import cast
 
 from farchive import Farchive
 
 
-_T0 = 1_700_000_000_000
-_T1 = _T0 + 1_000
-_T2 = _T0 + 2_000
+_T0 = datetime(2023, 11, 14, 22, 13, 20, tzinfo=timezone.utc)
+_T1 = datetime(2023, 11, 14, 22, 13, 21, tzinfo=timezone.utc)
+_T2 = datetime(2023, 11, 14, 22, 13, 22, tzinfo=timezone.utc)
 
 
 # ---------------------------------------------------------------------------
