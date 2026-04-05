@@ -1537,9 +1537,22 @@ def _cmd_schema(args: argparse.Namespace) -> None:
             print("Note: archive will be auto-migrated on next write.", file=sys.stderr)
         elif current > SCHEMA_VERSION:
             print(
-                "Warning: archive schema is newer than library. Upgrade farchive.",
+                "ERROR: archive schema is newer than library supports.",
                 file=sys.stderr,
             )
+
+
+def _cmd_init(args: argparse.Namespace) -> None:
+    """Initialize a new archive."""
+    if os.path.isfile(args.db):
+        print(f"Archive already exists: {args.db}", file=sys.stderr)
+        sys.exit(1)
+    if _is_valid_db(args.db):
+        print(f"Archive already exists (valid): {args.db}", file=sys.stderr)
+        sys.exit(1)
+    with Farchive(args.db) as fa:
+        pass
+    print(f"Created new archive: {args.db}", file=sys.stderr)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -1554,6 +1567,10 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument(
         "-v", "--verbose", action="store_true", help="Show all storage classes"
     )
+
+    # init
+    p = sub.add_parser("init", help="Initialize a new archive")
+    p.add_argument("db", help="DB path")
 
     # history LOCATOR
     p = sub.add_parser("history", help="Show span history for a locator")
@@ -1766,6 +1783,7 @@ def main(argv: list[str] | None = None) -> None:
         sys.exit(1)
 
     cmds = {
+        "init": _cmd_init,
         "stats": _cmd_stats,
         "history": _cmd_history,
         "locators": _cmd_locators,
