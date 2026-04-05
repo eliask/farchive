@@ -326,9 +326,25 @@ def _cmd_cat(args: argparse.Namespace) -> None:
     """Write raw bytes to stdout. Errors to stderr. Nothing else."""
     _ensure_db(args)
     with Farchive(args.db) as fa:
-        ref = args.ref
-        # Detect if ref is a digest (64 hex chars) or a locator
-        is_digest = len(ref) == 64 and all(c in "0123456789abcdef" for c in ref.lower())
+        # Determine ref: explicit flag > positional > error
+        if args.digest:
+            ref = args.digest
+            is_digest = True
+        elif args.locator:
+            ref = args.locator
+            is_digest = False
+        elif args.ref:
+            ref = args.ref
+            is_digest = len(ref) == 64 and all(
+                c in "0123456789abcdef" for c in ref.lower()
+            )
+        else:
+            print(
+                "Error: must specify --locator, --digest, or positional ref",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
         at = _parse_timestamp(args.at) if args.at else None
 
         if is_digest:
@@ -1130,8 +1146,25 @@ def _cmd_extract(args: argparse.Namespace) -> None:
     """Write bytes to a file. Supports --at for point-in-time."""
     _ensure_db(args)
     with Farchive(args.db) as fa:
-        ref = args.ref
-        is_digest = len(ref) == 64 and all(c in "0123456789abcdef" for c in ref.lower())
+        # Determine ref: explicit flag > positional > error
+        if args.digest:
+            ref = args.digest
+            is_digest = True
+        elif args.locator:
+            ref = args.locator
+            is_digest = False
+        elif args.ref:
+            ref = args.ref
+            is_digest = len(ref) == 64 and all(
+                c in "0123456789abcdef" for c in ref.lower()
+            )
+        else:
+            print(
+                "Error: must specify --locator, --digest, or positional ref",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
         at = _parse_timestamp(args.at) if args.at else None
 
         if is_digest:
@@ -1165,13 +1198,41 @@ def _cmd_diff(args: argparse.Namespace) -> None:
     """Compare two blob versions. Always shows size/digest comparison."""
     _ensure_db(args)
     with Farchive(args.db) as fa:
-        ref_a = args.ref_a
-        ref_b = args.ref_b
-
-        def _resolve_ref(ref, at_arg):
-            is_digest = len(ref) == 64 and all(
-                c in "0123456789abcdef" for c in ref.lower()
+        # Resolve ref_a
+        if args.digest_a:
+            ref_a, is_digest_a = args.digest_a, True
+        elif args.locator_a:
+            ref_a, is_digest_a = args.locator_a, False
+        elif args.ref_a:
+            ref_a = args.ref_a
+            is_digest_a = len(ref_a) == 64 and all(
+                c in "0123456789abcdef" for c in ref_a.lower()
             )
+        else:
+            print(
+                "Error: must specify --locator-a, --digest-a, or positional ref_a",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        # Resolve ref_b
+        if args.digest_b:
+            ref_b, is_digest_b = args.digest_b, True
+        elif args.locator_b:
+            ref_b, is_digest_b = args.locator_b, False
+        elif args.ref_b:
+            ref_b = args.ref_b
+            is_digest_b = len(ref_b) == 64 and all(
+                c in "0123456789abcdef" for c in ref_b.lower()
+            )
+        else:
+            print(
+                "Error: must specify --locator-b, --digest-b, or positional ref_b",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        def _resolve_ref(ref, is_digest, at_arg):
             at = _parse_timestamp(at_arg) if at_arg else None
             if is_digest:
                 data = fa.read(ref)
@@ -1190,8 +1251,8 @@ def _cmd_diff(args: argparse.Namespace) -> None:
                     sys.exit(1)
                 return span.digest, data
 
-        digest_a, data_a = _resolve_ref(ref_a, args.from_at)
-        digest_b, data_b = _resolve_ref(ref_b, args.to_at)
+        digest_a, data_a = _resolve_ref(ref_a, is_digest_a, args.from_at)
+        digest_b, data_b = _resolve_ref(ref_b, is_digest_b, args.to_at)
 
     # Always show summary
     same = data_a == data_b
@@ -1479,13 +1540,13 @@ def main(argv: list[str] | None = None) -> None:
     p = sub.add_parser("train-dict", help="Train a zstd dictionary")
     p.add_argument("db", help="DB path")
     p.add_argument("storage_class", help="Storage class")
+    p.add_argument("-n", "--samples", type=int, default=500, help="Training samples")
 
     # repack
     p = sub.add_parser("repack", help="Recompress blobs with latest dict")
     p.add_argument("db", help="DB path")
-    p.add_argument(
-        "-v", "--verbose", action="store_true", help="Show all storage classes"
-    )
+    p.add_argument("-s", "--storage-class", default=None, help="Storage class")
+    p.add_argument("-n", "--batch-size", type=int, default=1000, help="Max repacks")
 
     # events
     p = sub.add_parser("events", help="Query event log")
@@ -1509,7 +1570,10 @@ def main(argv: list[str] | None = None) -> None:
     # cat LOCATOR|DIGEST
     p = sub.add_parser("cat", help="Write raw bytes to stdout")
     p.add_argument("db", help="DB path")
-    p.add_argument("ref", help="Locator or SHA-256 digest")
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("ref", nargs="?", default=None, help="Locator or SHA-256 digest")
+    g.add_argument("--locator", default=None, help="Explicit locator")
+    g.add_argument("--digest", default=None, help="Explicit digest")
     p.add_argument("--at", default=None, help="Point-in-time (ms or ISO 8601)")
 
     # store LOCATOR FILE
@@ -1617,15 +1681,24 @@ def main(argv: list[str] | None = None) -> None:
     # extract LOCATOR|DIGEST
     p = sub.add_parser("extract", help="Write bytes to a file")
     p.add_argument("db", help="DB path")
-    p.add_argument("ref", help="Locator or SHA-256 digest")
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("ref", nargs="?", default=None, help="Locator or SHA-256 digest")
+    g.add_argument("--locator", default=None, help="Explicit locator")
+    g.add_argument("--digest", default=None, help="Explicit digest")
     p.add_argument("--at", default=None, help="Point-in-time (ms or ISO 8601)")
     p.add_argument("-o", "--output", default=None, help="Output file path")
 
     # diff
     p = sub.add_parser("diff", help="Compare two blob versions")
     p.add_argument("db", help="DB path")
-    p.add_argument("ref_a", help="First locator or digest")
-    p.add_argument("ref_b", help="Second locator or digest")
+    g = p.add_mutually_exclusive_group(required=True)
+    g.add_argument("ref_a", nargs="?", default=None, help="First locator or digest")
+    g.add_argument("--locator-a", default=None, help="Explicit first locator")
+    g.add_argument("--digest-a", default=None, help="Explicit first digest")
+    g = p.add_mutually_exclusive_group(required=True)
+    g.add_argument("ref_b", nargs="?", default=None, help="Second locator or digest")
+    g.add_argument("--locator-b", default=None, help="Explicit second locator")
+    g.add_argument("--digest-b", default=None, help="Explicit second digest")
     p.add_argument("--from-at", default=None, help="Timestamp for ref_a")
     p.add_argument("--to-at", default=None, help="Timestamp for ref_b")
     p.add_argument("--text", action="store_true", help="Show text diff if UTF-8")
