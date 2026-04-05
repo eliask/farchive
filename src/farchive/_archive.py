@@ -110,21 +110,29 @@ class Farchive:
         *,
         compression: CompressionPolicy | None = None,
         enable_events: bool = False,
+        readonly: bool = False,
     ):
         self._db_path = Path(db_path)
-        self._db_path.parent.mkdir(parents=True, exist_ok=True)
         self._policy = compression or CompressionPolicy()
+        self._readonly = readonly
 
         # Use default isolation_level ("") for proper transaction support.
         # `with self._conn:` gives atomic BEGIN/COMMIT blocks.
         # check_same_thread=True enforces the documented "not thread-safe" contract.
-        self._conn = sqlite3.connect(str(self._db_path))
-        self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA busy_timeout=5000")
-        self._conn.execute("PRAGMA foreign_keys=ON")
+        if readonly:
+            # Read-only mode: use URI mode to prevent writes
+            self._conn = sqlite3.connect(f"file:{self._db_path}?mode=ro", uri=True)
+        else:
+            self._db_path.parent.mkdir(parents=True, exist_ok=True)
+            self._conn = sqlite3.connect(str(self._db_path))
 
-        init_schema(self._conn, enable_events=enable_events)
+        self._conn.row_factory = sqlite3.Row
+
+        if not readonly:
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA busy_timeout=5000")
+            self._conn.execute("PRAGMA foreign_keys=ON")
+            init_schema(self._conn, enable_events=enable_events)
 
         # Event logging is an archive property: once the event table exists
         # (created by any session with enable_events=True), ALL subsequent
