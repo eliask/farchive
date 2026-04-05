@@ -966,9 +966,7 @@ def _cmd_observe(args: argparse.Namespace) -> None:
 
 def _cmd_import_files(args: argparse.Namespace) -> None:
     """Import files from a directory into the archive."""
-    new_db = _maybe_create_db(args)
-    if new_db:
-        print("Created new archive.", file=sys.stderr)
+    _ensure_db(args)
     root = Path(args.root).resolve()
     if not root.is_dir():
         print(f"Not a directory: {args.root}", file=sys.stderr)
@@ -1075,9 +1073,7 @@ def _cmd_import_files(args: argparse.Namespace) -> None:
 
 def _cmd_import_manifest(args: argparse.Namespace) -> None:
     """Import from a manifest file (JSONL or TSV)."""
-    new_db = _maybe_create_db(args)
-    if new_db:
-        print("Created new archive.", file=sys.stderr)
+    _ensure_db(args)
     manifest_path = Path(args.manifest)
     if not manifest_path.is_file():
         print(f"Manifest not found: {args.manifest}", file=sys.stderr)

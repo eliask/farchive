@@ -130,6 +130,9 @@ class TestImportFiles:
 
     def test_import_files_basic(self, tmp_path):
         db = tmp_path / "test.db"
+        subprocess.run(
+            [sys.executable, "-m", "farchive._cli", "init", str(db)], check=True
+        )
         root = tmp_path / "files"
         root.mkdir()
         (root / "a.txt").write_bytes(b"content a")
@@ -152,6 +155,9 @@ class TestImportFiles:
 
     def test_import_files_dry_run(self, tmp_path):
         db = tmp_path / "test.db"
+        subprocess.run(
+            [sys.executable, "-m", "farchive._cli", "init", str(db)], check=True
+        )
         root = tmp_path / "files"
         root.mkdir()
         (root / "a.txt").write_bytes(b"content")
@@ -172,6 +178,9 @@ class TestImportFiles:
 
     def test_import_files_recursive(self, tmp_path):
         db = tmp_path / "test.db"
+        subprocess.run(
+            [sys.executable, "-m", "farchive._cli", "init", str(db)], check=True
+        )
         root = tmp_path / "files"
         root.mkdir()
         (root / "sub").mkdir()
@@ -194,6 +203,9 @@ class TestImportFiles:
 
     def test_import_files_storage_class_by_ext(self, tmp_path):
         db = tmp_path / "test.db"
+        subprocess.run(
+            [sys.executable, "-m", "farchive._cli", "init", str(db)], check=True
+        )
         root = tmp_path / "files"
         root.mkdir()
         (root / "page.html").write_bytes(b"<html></html>")
@@ -230,6 +242,9 @@ class TestImportManifest:
 
     def test_import_manifest_jsonl(self, tmp_path):
         db = tmp_path / "test.db"
+        subprocess.run(
+            [sys.executable, "-m", "farchive._cli", "init", str(db)], check=True
+        )
         root = tmp_path / "files"
         root.mkdir()
         (root / "a.txt").write_bytes(b"content a")
@@ -252,6 +267,9 @@ class TestImportManifest:
 
     def test_import_manifest_dry_run(self, tmp_path):
         db = tmp_path / "test.db"
+        subprocess.run(
+            [sys.executable, "-m", "farchive._cli", "init", str(db)], check=True
+        )
         root = tmp_path / "files"
         root.mkdir()
         (root / "a.txt").write_bytes(b"content")
