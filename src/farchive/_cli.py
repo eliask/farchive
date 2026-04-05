@@ -515,12 +515,24 @@ def _cmd_du(args: argparse.Namespace) -> None:
                 "SUM(stored_self_size) as stored "
                 "FROM blob GROUP BY sc ORDER BY stored DESC"
             ).fetchall()
+            # Add chunk storage for chunked blobs (they have stored_self_size=0)
+            chunk_stored = fa._conn.execute(
+                "SELECT COALESCE(b.storage_class, '(none)'), SUM(c.stored_size) "
+                "FROM chunk c "
+                "JOIN blob_chunk bc ON c.chunk_digest = bc.chunk_digest "
+                "JOIN blob b ON bc.blob_digest = b.digest "
+                "WHERE b.codec = 'chunked' "
+                "GROUP BY b.storage_class"
+            ).fetchall()
+            chunk_by_sc = {r[0]: r[1] for r in chunk_stored}
             if not args.json:
                 print(f"{'storage_class':<16} {'blobs':>8} {'raw':>12} {'stored':>12}")
                 print("-" * 52)
                 for r in rows[: args.top]:
+                    extra = chunk_by_sc.get(r["sc"], 0)
+                    total_stored = r["stored"] + extra
                     print(
-                        f"{r['sc']:<16} {r['cnt']:>8,} {r['raw']:>12,} {r['stored']:>12,}"
+                        f"{r['sc']:<16} {r['cnt']:>8,} {r['raw']:>12,} {total_stored:>12,}"
                     )
                 if args.top and len(rows) > args.top:
                     print(f"  ... and {len(rows) - args.top} more")
@@ -530,7 +542,7 @@ def _cmd_du(args: argparse.Namespace) -> None:
                         "storage_class": r["sc"],
                         "blobs": r["cnt"],
                         "raw": r["raw"],
-                        "stored": r["stored"],
+                        "stored": r["stored"] + chunk_by_sc.get(r["sc"], 0),
                     }
                     for r in rows
                 ]
@@ -542,6 +554,19 @@ def _cmd_du(args: argparse.Namespace) -> None:
                 "SUM(stored_self_size) as stored "
                 "FROM blob GROUP BY codec ORDER BY stored DESC"
             ).fetchall()
+            # Add chunk storage for chunked codec
+            chunk_stored = fa._conn.execute(
+                "SELECT 'chunked', SUM(c.stored_size) "
+                "FROM chunk c "
+                "JOIN blob_chunk bc ON c.chunk_digest = bc.chunk_digest "
+                "JOIN blob b ON bc.blob_digest = b.digest "
+                "WHERE b.codec = 'chunked'"
+            ).fetchone()
+            chunk_by_codec = (
+                {chunk_stored[0]: chunk_stored[1]}
+                if chunk_stored and chunk_stored[1]
+                else {}
+            )
             if not args.json:
                 print(f"{'codec':<16} {'blobs':>8} {'raw':>12} {'stored':>12}")
                 print("-" * 52)
@@ -555,22 +580,26 @@ def _cmd_du(args: argparse.Namespace) -> None:
                         "codec": r["codec"],
                         "blobs": r["cnt"],
                         "raw": r["raw"],
-                        "stored": r["stored"],
+                        "stored": r["stored"] + chunk_by_codec.get(r["codec"], 0),
                     }
                     for r in rows
                 ]
                 print(_json_dumps(items, indent=2))
 
         elif by == "locator":
+            # Use subquery to get distinct digests per locator, avoiding double-counting
             rows = fa._conn.execute(
-                "SELECT ls.locator, COUNT(DISTINCT ls.digest) as blobs, "
-                "COALESCE(SUM(digest_raw.raw_size), 0) as raw, "
-                "COALESCE(SUM(digest_raw.stored_self_size), 0) as stored "
-                "FROM locator_span ls "
-                "LEFT JOIN ("
-                "  SELECT digest, raw_size, stored_self_size FROM blob"
-                ") digest_raw ON ls.digest = digest_raw.digest "
-                "GROUP BY ls.locator ORDER BY stored DESC"
+                "SELECT locator, COUNT(*) as blobs, "
+                "COALESCE(SUM(raw_size), 0) as raw, "
+                "COALESCE(SUM(stored_self_size), 0) as stored "
+                "FROM ("
+                "  SELECT ls.locator, b.raw_size, b.stored_self_size, "
+                "  ROW_NUMBER() OVER (PARTITION BY ls.locator, ls.digest ORDER BY 1) as rn "
+                "  FROM locator_span ls "
+                "  JOIN blob b ON ls.digest = b.digest"
+                ") sub "
+                "WHERE rn = 1 "
+                "GROUP BY locator ORDER BY stored DESC"
             ).fetchall()
             if not args.json:
                 print(f"{'locator':<40} {'blobs':>6} {'raw':>12} {'stored':>12}")

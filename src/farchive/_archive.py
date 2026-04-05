@@ -1405,7 +1405,7 @@ class Farchive:
             sc = row[0]
             if sc == "(none)":
                 logical = self._conn.execute(
-                    "SELECT COALESCE(SUM(DISTINCT c.stored_size), 0) FROM chunk c "
+                    "SELECT COALESCE(SUM(c.stored_size), 0) FROM chunk c "
                     "WHERE c.chunk_digest IN ("
                     "  SELECT DISTINCT bc.chunk_digest FROM blob_chunk bc "
                     "  JOIN blob b ON bc.blob_digest = b.digest "
@@ -1414,7 +1414,7 @@ class Farchive:
                 ).fetchone()[0]
             else:
                 logical = self._conn.execute(
-                    "SELECT COALESCE(SUM(DISTINCT c.stored_size), 0) FROM chunk c "
+                    "SELECT COALESCE(SUM(c.stored_size), 0) FROM chunk c "
                     "WHERE c.chunk_digest IN ("
                     "  SELECT DISTINCT bc.chunk_digest FROM blob_chunk bc "
                     "  JOIN blob b ON bc.blob_digest = b.digest "
