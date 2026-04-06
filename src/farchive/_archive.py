@@ -43,7 +43,7 @@ from farchive._compression import (
     repack_blobs,
     train_dict_from_samples,
 )
-from farchive._schema import _now_ms, init_schema
+from farchive._schema import _now_ms, init_schema, detect_schema_version, SCHEMA_VERSION
 from farchive._types import (
     ArchiveStats,
     CompressionPolicy,
@@ -54,6 +54,7 @@ from farchive._types import (
     StateSpan,
     _dt_to_ms,
     _ms_to_dt,
+    PathLike,
 )
 
 
@@ -106,7 +107,7 @@ class Farchive:
 
     def __init__(
         self,
-        db_path: str | Path = "archive.farchive",
+        db_path: PathLike,
         *,
         compression: CompressionPolicy | None = None,
         enable_events: bool = False,
@@ -120,13 +121,25 @@ class Farchive:
         # `with self._conn:` gives atomic BEGIN/COMMIT blocks.
         # check_same_thread=True enforces the documented "not thread-safe" contract.
         if readonly:
-            # Read-only mode: use URI mode to prevent writes
-            self._conn = sqlite3.connect(f"file:{self._db_path}?mode=ro", uri=True)
+            # Read-only mode: use URI mode to prevent writes, resolving to absolute
+            # URI for robustness against special characters/Windows paths.
+            url = self._db_path.resolve().as_uri() + "?mode=ro"
+            self._conn = sqlite3.connect(url, uri=True)
         else:
             self._db_path.parent.mkdir(parents=True, exist_ok=True)
             self._conn = sqlite3.connect(str(self._db_path))
 
         self._conn.row_factory = sqlite3.Row
+
+        if readonly:
+            # Read-only libraries MUST verify schema version explicitly if skipping init_schema
+            version = detect_schema_version(self._conn)
+            if version != SCHEMA_VERSION:
+                self._conn.close()
+                raise RuntimeError(
+                    f"Farchive DB version {version} is incompatible with current "
+                    f"SCHEMA_VERSION={SCHEMA_VERSION}. Please run 'farchive migrate'."
+                )
 
         if not readonly:
             self._conn.execute("PRAGMA journal_mode=WAL")
@@ -1341,9 +1354,8 @@ class Farchive:
 
     def stats(self) -> ArchiveStats:
         """Non-semantic reporting snapshot."""
-        from farchive._schema import detect_schema_version
-
-        db_version = detect_schema_version(self._conn)
+        res = self._conn.execute("SELECT version, generator FROM schema_info").fetchone()
+        db_version, generator = (res[0], res[1]) if res else (0, "unknown")
         loc_count = self._conn.execute(
             "SELECT COUNT(DISTINCT locator) FROM locator_span",
         ).fetchone()[0]
@@ -1448,6 +1460,7 @@ class Farchive:
             schema_version=db_version,
             chunk_count=chunk_count,
             db_file_bytes=db_file_bytes,
+            generator=generator,
         )
 
     # ------------------------------------------------------------------

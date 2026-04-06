@@ -137,6 +137,26 @@ def detect_schema_version(conn: sqlite3.Connection) -> int:
         return 0
 
 
+def _ensure_v3_indexes(conn: sqlite3.Connection) -> None:
+    """Ensure all canonical v3 indexes exist on the base tables."""
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_span_one_open "
+        "ON locator_span(locator) WHERE observed_until IS NULL"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_span_locator "
+        "ON locator_span(locator, observed_from DESC)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_span_locator_time "
+        "ON locator_span(locator, observed_from, observed_until)"
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_blob_base ON blob(base_digest)")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_blob_chunk_ref ON blob_chunk(chunk_digest)"
+    )
+
+
 def _migrate_v1_to_v2(conn: sqlite3.Connection) -> None:
     """Migrate schema v1 to v2: add zstd_delta support.
 
@@ -155,6 +175,7 @@ def _migrate_v1_to_v2(conn: sqlite3.Connection) -> None:
             "UPDATE schema_info SET version=?, migrated_at=?, generator=?",
             (2, now, _GENERATOR),
         )
+        conn.commit()
         return
 
     # Detect leaked temp tables from a failed prior migration.
@@ -221,7 +242,10 @@ def _migrate_v1_to_v2(conn: sqlite3.Connection) -> None:
         )
         conn.execute("COMMIT")
     except Exception:
-        conn.execute("ROLLBACK")
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
         raise
     finally:
         conn.execute("PRAGMA foreign_keys=ON")
@@ -246,10 +270,12 @@ def _migrate_v2_to_v3(conn: sqlite3.Connection) -> None:
         ).fetchall()
     }
     if "stored_self_size" in cols and "chunk" in tables and "blob_chunk" in tables:
+        _ensure_v3_indexes(conn)
         conn.execute(
             "UPDATE schema_info SET version=?, migrated_at=?, generator=?",
             (3, now, _GENERATOR),
         )
+        conn.commit()
         return
 
     # Detect leaked temp tables from a failed prior migration.
@@ -335,16 +361,17 @@ def _migrate_v2_to_v3(conn: sqlite3.Connection) -> None:
                 PRIMARY KEY (blob_digest, ordinal)
             )
         """)
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_blob_chunk_ref ON blob_chunk(chunk_digest)"
-        )
+        _ensure_v3_indexes(conn)
         conn.execute(
             "UPDATE schema_info SET version=?, migrated_at=?, generator=?",
             (3, now, _GENERATOR),
         )
         conn.execute("COMMIT")
     except Exception:
-        conn.execute("ROLLBACK")
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
         raise
     finally:
         conn.execute("PRAGMA foreign_keys=ON")
@@ -367,12 +394,14 @@ def init_schema(conn: sqlite3.Connection, *, enable_events: bool = False) -> Non
             "INSERT OR IGNORE INTO schema_info VALUES (?, ?, NULL, ?)",
             (SCHEMA_VERSION, now, _GENERATOR),
         )
+        conn.commit()
     elif version == 1:
         _migrate_v1_to_v2(conn)
         _migrate_v2_to_v3(conn)
     elif version == 2:
         _migrate_v2_to_v3(conn)
-    # version == SCHEMA_VERSION: already current
+    # version == SCHEMA_VERSION: ensure canonical normalization (indexes)
+    _ensure_v3_indexes(conn)
     if enable_events:
         tables = {
             r[0]
@@ -382,3 +411,5 @@ def init_schema(conn: sqlite3.Connection, *, enable_events: bool = False) -> Non
         }
         if "event" not in tables:
             conn.executescript(_EVENT_TABLE)
+
+    conn.commit()

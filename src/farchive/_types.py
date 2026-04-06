@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
+
+PathLike = str | os.PathLike[str]
 
 
 def _ms_to_dt(ms: int | None) -> datetime | None:
@@ -133,3 +136,4 @@ class ArchiveStats:
     schema_version: int
     chunk_count: int
     db_file_bytes: int
+    generator: str

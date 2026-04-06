@@ -365,3 +365,17 @@ class TestInitSchema:
             init_schema(conn)
             assert detect_schema_version(conn) == 3
             conn.close()
+
+    def test_init_persists_schema_info(self):
+        """init_schema must commit the schema_info row so it survives reopen."""
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "test.db"
+            conn = sqlite3.connect(str(db))
+            init_schema(conn)
+            conn.close()
+
+            # Reopen on a different connection and check explicitly
+            conn2 = sqlite3.connect(str(db))
+            version = conn2.execute("SELECT version FROM schema_info").fetchone()[0]
+            assert version == SCHEMA_VERSION
+            conn2.close()

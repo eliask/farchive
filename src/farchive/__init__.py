@@ -9,6 +9,7 @@ from farchive._types import (
     RepackStats,
     RechunkStats,
     StateSpan,
+    PathLike,
 )
 
 __all__ = [
@@ -20,5 +21,6 @@ __all__ = [
     "RechunkStats",
     "RepackStats",
     "StateSpan",
+    "PathLike",
 ]
 __version__ = "3.0.0"

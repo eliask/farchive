@@ -48,7 +48,7 @@ class TestExtract:
             assert span is not None
             digest = span.digest
         out = tmp_path / "output.bin"
-        result = _run(["extract", str(db), digest, "-o", str(out)])
+        result = _run(["extract", str(db), "--digest", digest, "-o", str(out)])
         assert result.returncode == 0
         assert out.read_bytes() == b"version two is longer"
 
@@ -127,7 +127,7 @@ class TestDiff:
             assert len(spans) >= 2
             d1 = spans[1].digest  # older
             d2 = spans[0].digest  # newer
-        result = _run(["diff", str(db), d1, d2])
+        result = _run(["diff", str(db), "--digest-a", d1, "--digest-b", d2])
         assert result.returncode == 0
         output = result.stdout.decode()
         assert "Identical: False" in output
@@ -140,7 +140,7 @@ class TestDiff:
             d1 = spans[1].digest  # older
             d2 = spans[0].digest  # newer
 
-        result = _run(["diff", str(db), d1, d2])
+        result = _run(["diff", str(db), "--digest-a", d1, "--digest-b", d2])
         assert result.returncode == 0
         output = result.stdout.decode()
         assert "Identical: False" in output
@@ -154,7 +154,7 @@ class TestDiff:
             d1 = spans[1].digest
             d2 = spans[0].digest
 
-        result = _run(["diff", str(db), d1, d2, "--text"])
+        result = _run(["diff", str(db), "--digest-a", d1, "--digest-b", d2, "--text"])
         assert result.returncode == 0
         output = result.stdout.decode()
         assert "line2" in output

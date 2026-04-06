@@ -49,7 +49,8 @@ class TestCat:
             span = fa.resolve("loc/a")
             assert span is not None
             digest = span.digest
-        result = _run(["cat", str(db), digest])
+        # Must use explicit --digest flag for digest-based access
+        result = _run(["cat", str(db), "--digest", digest])
         assert result.returncode == 0
         assert result.stdout == b"hello world"
         assert result.stderr == b""
@@ -77,9 +78,29 @@ class TestCat:
 
     def test_cat_missing_digest(self, tmp_path):
         db = _populated_db(tmp_path)
-        result = _run(["cat", str(db), "0" * 64])
+        # Must use explicit --digest flag for digest-based access
+        result = _run(["cat", str(db), "--digest", "0" * 64])
         assert result.returncode != 0
         assert b"Digest not found" in result.stderr
+
+    def test_cat_ambiguous_64hex_errors(self, tmp_path):
+        """A 64-hex positional ref is ambiguous — must error with a clear message."""
+        db = _populated_db(tmp_path)
+        with Farchive(db) as fa:
+            span = fa.resolve("loc/a")
+            assert span is not None
+            digest = span.digest
+        # Positional 64-hex string: should error, not silently treat as digest
+        result = _run(["cat", str(db), digest])
+        assert result.returncode != 0
+        assert b"ambiguous" in result.stderr
+        assert b"--digest" in result.stderr
+
+    def test_cat_by_explicit_locator_flag(self, tmp_path):
+        db = _populated_db(tmp_path)
+        result = _run(["cat", str(db), "--locator", "loc/a"])
+        assert result.returncode == 0
+        assert result.stdout == b"hello world"
 
     def test_cat_no_selector(self, tmp_path):
         db = _populated_db(tmp_path)
