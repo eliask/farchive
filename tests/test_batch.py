@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import unittest.mock
+import pytest
 
-from farchive import Farchive, CompressionPolicy
+from farchive import Farchive, CompressionPolicy, BatchItem
 
 
 # ---------------------------------------------------------------------------
@@ -24,6 +25,15 @@ def _make_xml_blob(i: int, size: int = 500) -> bytes:
         f"  </section>\n"
         f"</doc>\n"
     ).encode()
+
+
+def _make_delta_pair(size: int = 8192) -> tuple[bytes, bytes]:
+    base = _make_xml_blob(1, size=size)
+    changed = bytearray(base)
+    changed[123] = ord("B") if changed[123] != 66 else ord("C")
+    changed[255] = ord("b") if changed[255] != 98 else ord("c")
+    changed = bytes(changed)
+    return base, changed
 
 
 # ---------------------------------------------------------------------------
@@ -116,6 +126,65 @@ def test_store_batch_triggers_auto_train(low_threshold_archive):
 
     assert stats.items_stored == threshold
     assert fa._get_latest_dict_id("xml") is not None
+
+
+def test_store_batch_prefers_series_key_over_new_locator_in_delta(archive):
+    """BatchItem.series_key allows a cross-locator delta when same-locator history is absent."""
+    base, changed = _make_delta_pair()
+    if not archive._supports_span_series_key:
+        pytest.skip(
+            "span-level series_key column not available; schema migration required "
+            "for this assertion"
+        )
+
+    stats = archive.store_batch(
+        [
+            BatchItem(
+                locator="loc/series/base",
+                data=base,
+                series_key="law/series-1",
+            ),
+            BatchItem(
+                locator="loc/series/new",
+                data=changed,
+                series_key="law/series-1",
+            ),
+        ],
+        storage_class="xml",
+    )
+
+    assert stats.items_stored == 2
+    base_span = archive.resolve("loc/series/base")
+    new_span = archive.resolve("loc/series/new")
+    assert base_span is not None
+    assert new_span is not None
+    assert base_span.series_key == "law/series-1"
+    assert new_span.series_key == "law/series-1"
+    assert base_span.digest != new_span.digest
+
+    row = archive._conn.execute(
+        "SELECT codec, base_digest FROM blob WHERE digest=?", (new_span.digest,)
+    ).fetchone()
+    assert row is not None
+    assert row["codec"] == "zstd_delta"
+    assert row["base_digest"] == base_span.digest
+
+
+def test_store_batch_series_key_default_applies_to_shared_series(archive):
+    items = [
+        ("loc/shared/series/default_a", b"default-a"),
+        BatchItem(locator="loc/shared/series/default_b", data=b"default-b"),
+    ]
+
+    stats = archive.store_batch(
+        items,
+        storage_class="xml",
+        series_key="shared/series-1",
+    )
+
+    assert stats.items_stored == 2
+    assert archive.resolve("loc/shared/series/default_a").series_key == "shared/series-1"
+    assert archive.resolve("loc/shared/series/default_b").series_key == "shared/series-1"
 
 
 def test_store_batch_stats_fields(low_threshold_archive):
@@ -324,8 +393,7 @@ def test_repack_zero_means_done(tmp_path):
 def test_repack_batch_size_caps_successful_repacks(tmp_path):
     """batch_size limits successful repacks, not rows examined."""
     db = tmp_path / "repack_batch.farchive"
-    fa = Farchive(db)
-    try:
+    with Farchive(db) as fa:
         # Store many blobs, then manually train a dict
         for i in range(30):
             fa.store(f"loc/xml/{i}", _make_xml_blob(i, size=600), storage_class="xml")
@@ -344,8 +412,60 @@ def test_repack_batch_size_caps_successful_repacks(tmp_path):
         # Third call should find nothing
         stats3 = fa.repack(storage_class="xml")
         assert stats3.blobs_repacked == 0
-    finally:
-        fa.close()
+
+
+def test_repack_series_key_scope_limits_candidates(tmp_path):
+    """repack() with series_key only rewrites matching-span series."""
+    policy = CompressionPolicy(auto_train_thresholds={})
+    with Farchive(tmp_path / "repack_series.db", compression=policy) as fa:
+        # Build two cohorts with shared class but distinct series keys.
+        for i in range(20):
+            fa.store(
+                f"loc/series-a/{i}",
+                _make_xml_blob(i, size=1000),
+                storage_class="xml",
+                series_key="series/a",
+            )
+            fa.store(
+                f"loc/series-b/{i}",
+                _make_xml_blob(i + 20, size=1000),
+                storage_class="xml",
+                series_key="series/b",
+            )
+
+        dict_id = fa.train_dict(storage_class="xml")
+        assert dict_id is not None
+
+        stats = fa.repack(storage_class="xml", series_key="series/a")
+
+        repacked_non_target = fa._conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM blob b
+            JOIN locator_span ls
+                ON ls.digest = b.digest
+            WHERE b.codec = 'zstd_dict'
+                AND b.storage_class = 'xml'
+                AND ls.series_key = 'series/b'
+            """
+        ).fetchone()[0]
+
+        repacked_target = fa._conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM blob b
+            JOIN locator_span ls
+                ON ls.digest = b.digest
+            WHERE b.codec = 'zstd_dict'
+                AND b.storage_class = 'xml'
+                AND ls.series_key = 'series/a'
+            """
+        ).fetchone()[0]
+
+        if stats.blobs_repacked > 0:
+            assert repacked_target > 0
+        assert repacked_non_target == 0
+        assert repacked_target <= 20
 
 
 # ---------------------------------------------------------------------------

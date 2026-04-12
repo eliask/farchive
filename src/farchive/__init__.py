@@ -5,6 +5,9 @@ from farchive._types import (
     ArchiveStats,
     CompressionPolicy,
     Event,
+    BatchItem,
+    LocatorHeadComparison,
+    PurgeStats,
     ImportStats,
     RepackStats,
     RechunkStats,
@@ -15,12 +18,15 @@ from farchive._types import (
 __all__ = [
     "ArchiveStats",
     "CompressionPolicy",
+    "BatchItem",
+    "LocatorHeadComparison",
     "Event",
     "Farchive",
     "ImportStats",
+    "PurgeStats",
     "RechunkStats",
     "RepackStats",
     "StateSpan",
     "PathLike",
 ]
-__version__ = "3.0.0"
+__version__ = "3.1.0"

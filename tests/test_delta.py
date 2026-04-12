@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 
 from farchive import CompressionPolicy, Farchive
+import pytest
 
 
 # ---------------------------------------------------------------------------
@@ -102,6 +103,43 @@ class TestDeltaSelection:
                 "SELECT codec FROM blob WHERE digest=?", (d2,)
             ).fetchone()
             assert row["codec"] != "zstd_delta"
+
+    def test_cross_locator_delta_uses_series_key(self, tmp_path):
+        db = tmp_path / "series.db"
+        with Farchive(db) as fa:
+            if not fa._supports_span_series_key:
+                pytest.skip(
+                    "span-level series_key column not available; "
+                    "schema migration required for this assertion"
+                )
+
+            base = _make_blob(8192, seed=7)
+            revised = _make_similar(base, changes=2)
+
+            base_digest = fa.store(
+                "loc/series/base",
+                base,
+                storage_class="html",
+                series_key="s/1",
+            )
+            revised_digest = fa.store(
+                "loc/series/revision",
+                revised,
+                storage_class="html",
+                series_key="s/1",
+            )
+
+            row = fa._conn.execute(
+                "SELECT codec, base_digest FROM blob WHERE digest=?", (revised_digest,)
+            ).fetchone()
+            assert row["codec"] == "zstd_delta"
+            assert row["base_digest"] == base_digest
+            base_span = fa.resolve("loc/series/base")
+            revised_span = fa.resolve("loc/series/revision")
+            assert base_span is not None
+            assert revised_span is not None
+            assert base_span.series_key == "s/1"
+            assert revised_span.series_key == "s/1"
 
     def test_delta_not_chosen_below_min_size(self, tmp_path):
         """Blobs below delta_min_size (4 KiB) should not use delta."""

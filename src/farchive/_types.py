@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Literal
 
 PathLike = str | os.PathLike[str]
 
@@ -37,6 +37,7 @@ class StateSpan:
     observed_until: datetime | None  # UTC, exclusive; None = current
     last_confirmed_at: datetime  # UTC
     observation_count: int
+    series_key: str | None = None
     last_metadata: dict[str, Any] | None = None
 
 
@@ -107,6 +108,18 @@ class RechunkStats:
     bytes_saved: int = 0
 
 
+@dataclass
+class PurgeStats:
+    """Results from locator purge operation."""
+
+    locators_requested: int = 0
+    locators_purged: int = 0
+    spans_deleted: int = 0
+    blobs_deleted: int = 0
+    chunks_deleted: int = 0
+    dry_run: bool = False
+
+
 @dataclass(frozen=True, slots=True)
 class Event:
     """An append-only audit record of one archival operation."""
@@ -117,6 +130,18 @@ class Event:
     digest: str | None
     kind: str
     metadata: dict[str, Any] | None
+
+
+@dataclass(frozen=True, slots=True)
+class BatchItem:
+    """Input envelope for batch ingestion."""
+
+    locator: str
+    data: bytes
+    observed_at: datetime | None = None
+    storage_class: str | None = None
+    series_key: str | None = None
+    metadata: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,3 +162,13 @@ class ArchiveStats:
     chunk_count: int
     db_file_bytes: int
     generator: str
+
+
+@dataclass(frozen=True, slots=True)
+class LocatorHeadComparison:
+    """Result of comparing candidate content against a locator head."""
+
+    locator: str
+    current_span: StateSpan | None
+    candidate_digest: str
+    status: Literal["absent", "same", "changed"]

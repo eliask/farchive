@@ -33,11 +33,52 @@ def _populated_db(tmp_path: Path) -> Path:
 class TestOptimize:
     """farchive optimize runs maintenance."""
 
-    def test_optimize_basic(self, tmp_path):
+    def test_optimize_requires_operation(self, tmp_path):
         db = _populated_db(tmp_path)
         result = _run(["optimize", str(db)])
+        assert result.returncode != 0
+        assert b"operation" in result.stderr.lower() or b"usage" in result.stderr.lower()
+
+    def test_optimize_basic(self, tmp_path):
+        db = _populated_db(tmp_path)
+        result = _run(["optimize", str(db), "rechunk"])
         assert result.returncode == 0
-        # Should complete without error even if nothing to optimize
+        # Should complete without error even if nothing to optimize.
+
+    def test_optimize_series_key_scope(self, tmp_path):
+        db = tmp_path / "optimize_scope.db"
+        with Farchive(db) as fa:
+            for i in range(20):
+                fa.store(
+                    f"loc/a/{i}",
+                    (f"series-a-{i}".ljust(120, "x")).encode(),
+                    storage_class="text",
+                    series_key="series/a",
+                )
+                fa.store(
+                    f"loc/b/{i}",
+                    (f"series-b-{i}".ljust(120, "y")).encode(),
+                    storage_class="text",
+                    series_key="series/b",
+                )
+            fa.train_dict(storage_class="text")
+
+        result = _run(["optimize", str(db), "repack", "-s", "text", "--series-key", "series/a"])
+        assert result.returncode == 0
+
+        with Farchive(db) as fa:
+            non_target_repacked = fa._conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM blob b
+                JOIN locator_span ls ON ls.digest = b.digest
+                WHERE b.codec='zstd_dict'
+                  AND b.storage_class='text'
+                  AND ls.series_key='series/b'
+                """
+            ).fetchone()[0]
+
+            assert non_target_repacked == 0
 
 
 # ---------------------------------------------------------------------------
@@ -259,4 +300,4 @@ class TestCliMigration:
             assert res.returncode == 0, f"Stats failed for {version} post-migrate:{diagnostic}"
             assert "Schema version" in out, f"No schema info in output:{diagnostic}"
             assert "3" in out, f"Expected version 3, got: {out}"
-            assert "farchive 3.0.0" in out, f"Expected generator string not found:{diagnostic}"
+            assert "farchive 3.1.0" in out, f"Expected generator string not found:{diagnostic}"

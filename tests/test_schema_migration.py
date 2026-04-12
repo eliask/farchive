@@ -7,6 +7,7 @@ import tempfile
 from pathlib import Path
 
 import pytest
+from farchive import Farchive
 
 from farchive._schema import (
     SCHEMA_VERSION,
@@ -112,6 +113,90 @@ def _create_v2_tables(conn: sqlite3.Connection) -> None:
         )
     """)
 
+
+def _create_v3_no_series_tables(conn: sqlite3.Connection) -> None:
+    """Create a historical v3 schema shape without locator_span.series_key."""
+    conn.execute("""
+        CREATE TABLE schema_info (
+            version INTEGER NOT NULL, created_at INTEGER NOT NULL,
+            migrated_at INTEGER, generator TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE dict (
+            dict_id INTEGER PRIMARY KEY,
+            storage_class TEXT NOT NULL DEFAULT '',
+            trained_at INTEGER NOT NULL,
+            sample_count INTEGER NOT NULL,
+            dict_bytes BLOB NOT NULL,
+            dict_size INTEGER NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE blob (
+            digest TEXT PRIMARY KEY,
+            payload BLOB,
+            raw_size INTEGER NOT NULL,
+            stored_self_size INTEGER NOT NULL,
+            codec TEXT NOT NULL CHECK (codec IN (
+                'raw', 'zstd', 'zstd_dict', 'zstd_delta', 'chunked'
+            )),
+            codec_dict_id INTEGER REFERENCES dict(dict_id),
+            base_digest TEXT REFERENCES blob(digest),
+            storage_class TEXT,
+            created_at INTEGER NOT NULL,
+            CHECK (
+                (codec = 'zstd_dict' AND codec_dict_id IS NOT NULL)
+                OR (codec <> 'zstd_dict')
+            ),
+            CHECK (
+                (codec = 'zstd_delta' AND base_digest IS NOT NULL)
+                OR (codec <> 'zstd_delta' AND base_digest IS NULL)
+            ),
+            CHECK (
+                (codec = 'chunked' AND payload IS NULL)
+                OR (codec <> 'chunked' AND payload IS NOT NULL)
+            )
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE chunk (
+            chunk_digest TEXT PRIMARY KEY,
+            payload BLOB NOT NULL,
+            raw_size INTEGER NOT NULL,
+            stored_size INTEGER NOT NULL,
+            codec TEXT NOT NULL CHECK (codec IN (
+                'raw', 'zstd', 'zstd_dict'
+            )),
+            codec_dict_id INTEGER REFERENCES dict(dict_id),
+            created_at INTEGER NOT NULL,
+            CHECK (
+                (codec = 'zstd_dict' AND codec_dict_id IS NOT NULL)
+                OR (codec <> 'zstd_dict')
+            )
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE blob_chunk (
+            blob_digest TEXT NOT NULL REFERENCES blob(digest),
+            ordinal INTEGER NOT NULL,
+            raw_offset INTEGER NOT NULL,
+            chunk_digest TEXT NOT NULL REFERENCES chunk(chunk_digest),
+            PRIMARY KEY (blob_digest, ordinal)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE locator_span (
+            span_id INTEGER PRIMARY KEY,
+            locator TEXT NOT NULL,
+            digest TEXT NOT NULL REFERENCES blob(digest),
+            observed_from INTEGER NOT NULL,
+            observed_until INTEGER,
+            last_confirmed_at INTEGER NOT NULL,
+            observation_count INTEGER NOT NULL DEFAULT 1,
+            last_metadata_json TEXT
+        )
+    """)
 
 # ---------------------------------------------------------------------------
 # v1 -> v2 migration
@@ -325,6 +410,33 @@ class TestMigrateV2ToV3:
         assert detect_schema_version(conn) == 3
         cols = {r[1] for r in conn.execute("PRAGMA table_info(blob)").fetchall()}
         assert "stored_self_size" in cols
+        span_cols = {r[1] for r in conn.execute("PRAGMA table_info(locator_span)").fetchall()}
+        assert "series_key" in span_cols
+
+    def test_v2_to_v3_adds_series_key_column(self):
+        """Migration to v3 must add locator_span.series_key."""
+        conn = _empty_db()
+        conn.execute("INSERT INTO schema_info VALUES (2, 2000, NULL, 'test')")
+        _create_v2_tables(conn)
+        conn.execute(
+            "INSERT INTO blob VALUES ('abc', X'dead', 4, 4, 'raw', NULL, NULL, 'bin', 2000)"
+        )
+        conn.execute(
+            "INSERT INTO locator_span (locator, digest, observed_from, observed_until, "
+            "last_confirmed_at, observation_count, last_metadata_json) "
+            "VALUES ('loc/a', 'abc', 2000, NULL, 2000, 1, NULL)"
+        )
+        conn.commit()
+
+        _migrate_v2_to_v3(conn)
+
+        span_cols = {r[1] for r in conn.execute("PRAGMA table_info(locator_span)").fetchall()}
+        assert "series_key" in span_cols
+        row = conn.execute(
+            "SELECT series_key FROM locator_span WHERE locator='loc/a'"
+        ).fetchone()
+        assert row is not None
+        assert row[0] is None
 
 
 # ---------------------------------------------------------------------------
@@ -379,3 +491,52 @@ class TestInitSchema:
             version = conn2.execute("SELECT version FROM schema_info").fetchone()[0]
             assert version == SCHEMA_VERSION
             conn2.close()
+
+    def test_init_adds_series_key_column_for_legacy_v3(self):
+        """init_schema should add series_key to version-3 databases missing it."""
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "legacy_v3.db"
+            conn = sqlite3.connect(str(db))
+            _create_v3_no_series_tables(conn)
+            conn.execute("INSERT INTO schema_info VALUES (3, 3000, NULL, 'test')")
+            conn.commit()
+
+            init_schema(conn)
+            cols = {
+                r[1] for r in conn.execute(
+                    "PRAGMA table_info(locator_span)"
+                ).fetchall()
+            }
+            assert "series_key" in cols
+            conn.close()
+
+            with Farchive(db) as fa:
+                fa.store("loc/new", b"hello", storage_class=None)
+                span = fa.resolve("loc/new")
+                assert span is not None
+                assert span.series_key is None
+                assert fa.read(span.digest) == b"hello"
+
+    def test_readonly_open_legacy_v3_without_series_key(self):
+        """Readonly access should still work on legacy v3 rows before migration."""
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "legacy_ro.db"
+            conn = sqlite3.connect(str(db))
+            _create_v3_no_series_tables(conn)
+            conn.execute("INSERT INTO schema_info VALUES (3, 3000, NULL, 'test')")
+            conn.execute("INSERT INTO blob VALUES ('abc', X'dead', 4, 4, 'raw', NULL, NULL, 'bin', 3000)")
+            conn.execute("""
+                INSERT INTO locator_span (
+                    locator, digest, observed_from, observed_until,
+                    last_confirmed_at, observation_count, last_metadata_json
+                ) VALUES (
+                    'loc/a', 'abc', 3000, NULL, 3000, 1, NULL
+                )
+            """)
+            conn.commit()
+            conn.close()
+
+            with Farchive(db, readonly=True) as fa:
+                span = fa.resolve("loc/a")
+                assert span is not None
+                assert span.series_key is None

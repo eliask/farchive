@@ -180,6 +180,7 @@ def repack_blobs(
     dict_data: Any,
     policy: CompressionPolicy,
     storage_class: str | None = None,
+    series_key: str | None = None,
     batch_size: int = 1000,
 ) -> RepackStats:
     """Recompress vanilla-zstd blobs with a trained dictionary.
@@ -192,13 +193,23 @@ def repack_blobs(
     decompressor = _get_vanilla_decompressor()
 
     query = (
-        "SELECT digest, payload, raw_size, stored_self_size FROM blob "
-        "WHERE codec = 'zstd' AND codec_dict_id IS NULL"
+        "SELECT DISTINCT b.digest, b.payload, b.raw_size, b.stored_self_size "
+        "FROM blob b "
+        "WHERE b.codec = 'zstd' AND b.codec_dict_id IS NULL"
     )
     params: list = []
     if storage_class is not None:
-        query += " AND storage_class = ?"
+        query += " AND b.storage_class = ?"
         params.append(storage_class)
+
+    if series_key is not None:
+        query += (
+            " AND EXISTS ("
+            "SELECT 1 FROM locator_span ls "
+            "WHERE ls.digest = b.digest AND ls.series_key = ?"
+            ")"
+        )
+        params.append(series_key)
 
     cursor = conn.execute(query, params)
 

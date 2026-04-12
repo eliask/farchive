@@ -49,6 +49,9 @@ from farchive._types import (
     CompressionPolicy,
     Event,
     ImportStats,
+    PurgeStats,
+    LocatorHeadComparison,
+    BatchItem,
     RepackStats,
     RechunkStats,
     StateSpan,
@@ -64,6 +67,7 @@ def _sha256(data: bytes) -> str:
 
 def _row_to_span(row: sqlite3.Row) -> StateSpan:
     meta_json = row["last_metadata_json"]
+    row_keys = set(row.keys())
     return StateSpan(
         span_id=row["span_id"],
         locator=row["locator"],
@@ -74,6 +78,7 @@ def _row_to_span(row: sqlite3.Row) -> StateSpan:
         last_confirmed_at=_ms_to_dt(row["last_confirmed_at"])
         or datetime.fromtimestamp(0, tz=timezone.utc),
         observation_count=row["observation_count"],
+        series_key=row["series_key"] if "series_key" in row_keys else None,
         last_metadata=json.loads(meta_json) if meta_json else None,
     )
 
@@ -166,6 +171,12 @@ class Farchive:
         # File-based write lock (POSIX only)
         self._lock_path = self._db_path.with_name(self._db_path.name + ".writer.lock")
         self._lock_held = False
+        self._supports_span_series_key = self._has_column("locator_span", "series_key")
+
+    def _has_column(self, table: str, column: str) -> bool:
+        """Check schema shape without requiring a fixed migration version."""
+        rows = self._conn.execute(f"PRAGMA table_info({table})").fetchall()
+        return any(row[1] == column for row in rows)
 
     @contextmanager
     def _write_lock(self):
@@ -303,41 +314,75 @@ class Farchive:
         locator: str,
         raw_size: int,
         storage_class: str | None,
+        series_key: str | None,
     ) -> list[str]:
         """Return up to delta_candidate_count eligible base digests for locator.
 
         Candidates must be non-delta blobs with raw_size within ratio bounds.
         """
         policy = self._policy
-        params: list = [
-            locator,
-            policy.delta_min_size,
-            int(raw_size * policy.delta_size_ratio_min),
-            int(raw_size * policy.delta_size_ratio_max),
-            policy.delta_candidate_count,
-        ]
-        sc_clause = ""
-        if storage_class is not None:
-            sc_clause = " AND b.storage_class = ?"
-            params.insert(4, storage_class)
 
-        rows = self._conn.execute(
-            f"SELECT ls.digest "
-            f"FROM locator_span ls "
-            f"JOIN blob b ON ls.digest = b.digest "
-            f"WHERE ls.locator = ? "
-            # Chunked blobs excluded as delta bases: maintains clean separation
-            # between delta path (inline-to-inline) and chunking path (maintenance).
-            f"  AND b.codec IN ('raw', 'zstd', 'zstd_dict') "
-            f"  AND b.raw_size >= ? "
-            f"  AND b.raw_size BETWEEN ? AND ? "
-            f"  {sc_clause}"
-            f"GROUP BY ls.digest "
-            f"ORDER BY MAX(ls.observed_from) DESC, ls.digest DESC "
-            f"LIMIT ?",
-            params,
-        ).fetchall()
-        return [r[0] for r in rows]
+        size_floor = int(raw_size * policy.delta_size_ratio_min)
+        size_ceil = int(raw_size * policy.delta_size_ratio_max)
+
+        clauses = [
+            "b.codec IN ('raw', 'zstd', 'zstd_dict')",
+            "b.raw_size >= ?",
+            "b.raw_size BETWEEN ? AND ?",
+        ]
+        values = [
+            policy.delta_min_size,
+            size_floor,
+            size_ceil,
+        ]
+        if storage_class is not None:
+            clauses.append("b.storage_class = ?")
+            values.append(storage_class)
+
+        base_sql = (
+            "SELECT ls.digest "
+            "FROM locator_span ls "
+            "JOIN blob b ON ls.digest = b.digest "
+            "WHERE {where} "
+            "GROUP BY ls.digest "
+            "ORDER BY MAX(ls.observed_from) DESC, ls.digest DESC "
+            "LIMIT ?"
+        )
+
+        seen: set[str] = set()
+        candidates: list[str] = []
+
+        def _collect(where: str, extra_values: list[Any]) -> None:
+            rows = self._conn.execute(
+                base_sql.format(where=where),
+                tuple(extra_values),
+            ).fetchall()
+            for r in rows:
+                digest = r[0]
+                if digest in seen:
+                    continue
+                seen.add(digest)
+                candidates.append(digest)
+                if len(candidates) >= policy.delta_candidate_count:
+                    return
+
+        where_clauses: list[str]
+
+        # Prefer same series_key first when available, then same locator.
+        if self._supports_span_series_key and series_key is not None:
+            where_clauses = ["ls.series_key = ?", *clauses]
+            _collect(
+                " AND ".join(where_clauses),
+                [series_key, *values, policy.delta_candidate_count],
+            )
+
+        where_clauses = ["ls.locator = ?", *clauses]
+        _collect(
+            " AND ".join(where_clauses),
+            [locator, *values, policy.delta_candidate_count],
+        )
+
+        return candidates
 
     def _try_delta(
         self,
@@ -537,6 +582,7 @@ class Farchive:
         storage_class: str | None,
         *,
         locator: str | None = None,
+        series_key: str | None = None,
         dict_id: int | None = None,
     ) -> None:
         """Store blob with best available compression. Idempotent by digest."""
@@ -570,7 +616,9 @@ class Farchive:
             and len(raw) <= policy.delta_max_size
             and locator is not None
         ):
-            candidates = self._find_delta_candidates(locator, len(raw), storage_class)
+            candidates = self._find_delta_candidates(
+                locator, len(raw), storage_class, series_key=series_key
+            )
             delta_result = self._try_delta(raw, candidates, best_size)
             if delta_result is not None:
                 delta_payload, base_digest = delta_result
@@ -612,6 +660,7 @@ class Farchive:
         digest: str,
         now: int,
         *,
+        series_key: str | None = None,
         metadata: dict | None = None,
         _caller_provided_time: bool = False,
     ) -> StateSpan:
@@ -631,6 +680,10 @@ class Farchive:
             raise ValueError(
                 f"Digest {digest[:16]}.. not found — call put_blob() first"
             )
+        if series_key is not None and not isinstance(series_key, str):
+            raise TypeError(
+                f"series_key must be a str or None, got {type(series_key).__name__}"
+            )
 
         if metadata is not None:
             if not isinstance(metadata, dict):
@@ -646,7 +699,7 @@ class Farchive:
 
         # Find current open span for this locator
         current = self._conn.execute(
-            "SELECT span_id, digest, last_confirmed_at FROM locator_span "
+            "SELECT span_id, digest, series_key, last_confirmed_at FROM locator_span "
             "WHERE locator=? AND observed_until IS NULL "
             "ORDER BY span_id DESC LIMIT 1",
             (locator,),
@@ -679,13 +732,34 @@ class Farchive:
         if current is not None and current["digest"] == digest:
             # Case B: same digest — extend current span
             # metadata=None means "no update" (preserve existing), not "clear"
-            if metadata_json is not None:
+            update_series_key = (
+                self._supports_span_series_key
+                and series_key is not None
+                and series_key != current["series_key"]
+            )
+            if metadata_json is not None and update_series_key:
+                self._conn.execute(
+                    "UPDATE locator_span SET last_confirmed_at=?, "
+                    "observation_count=observation_count+1, "
+                    "series_key=?, last_metadata_json=? "
+                    "WHERE span_id=?",
+                    (now, series_key, metadata_json, current["span_id"]),
+                )
+            elif metadata_json is not None:
                 self._conn.execute(
                     "UPDATE locator_span SET last_confirmed_at=?, "
                     "observation_count=observation_count+1, "
                     "last_metadata_json=? "
                     "WHERE span_id=?",
                     (now, metadata_json, current["span_id"]),
+                )
+            elif update_series_key:
+                self._conn.execute(
+                    "UPDATE locator_span SET last_confirmed_at=?, "
+                    "observation_count=observation_count+1, "
+                    "series_key=? "
+                    "WHERE span_id=?",
+                    (now, series_key, current["span_id"]),
                 )
             else:
                 self._conn.execute(
@@ -702,14 +776,24 @@ class Farchive:
                     "UPDATE locator_span SET observed_until=? WHERE span_id=?",
                     (now, current["span_id"]),
                 )
+
             # Case A or C: insert new span
-            cursor = self._conn.execute(
-                "INSERT INTO locator_span (locator, digest, observed_from, "
-                "observed_until, last_confirmed_at, observation_count, "
-                "last_metadata_json) "
-                "VALUES (?, ?, ?, NULL, ?, 1, ?)",
-                (locator, digest, now, now, metadata_json),
-            )
+            if self._supports_span_series_key:
+                cursor = self._conn.execute(
+                    "INSERT INTO locator_span (locator, digest, observed_from, "
+                    "observed_until, last_confirmed_at, observation_count, "
+                    "series_key, last_metadata_json) "
+                    "VALUES (?, ?, ?, NULL, ?, 1, ?, ?)",
+                    (locator, digest, now, now, series_key, metadata_json),
+                )
+            else:
+                cursor = self._conn.execute(
+                    "INSERT INTO locator_span (locator, digest, observed_from, "
+                    "observed_until, last_confirmed_at, observation_count, "
+                    "last_metadata_json) "
+                    "VALUES (?, ?, ?, NULL, ?, 1, ?)",
+                    (locator, digest, now, now, metadata_json),
+                )
             span_id = cursor.lastrowid
 
         # Optionally record event
@@ -780,6 +864,7 @@ class Farchive:
         digest: str,
         *,
         observed_at: datetime | None = None,
+        series_key: str | None = None,
         metadata: dict | None = None,
     ) -> StateSpan:
         """Record an observation of a digest at a locator.
@@ -801,6 +886,7 @@ class Farchive:
                     locator,
                     digest,
                     now,
+                    series_key=series_key,
                     metadata=metadata,
                     _caller_provided_time=caller_ts,
                 )
@@ -812,9 +898,14 @@ class Farchive:
         *,
         observed_at: datetime | None = None,
         storage_class: str | None = None,
+        series_key: str | None = None,
         metadata: dict | None = None,
     ) -> str:
-        """Store content at a locator. put_blob + observe, atomic. Returns digest."""
+        """Store content at a locator.
+
+        `series_key` is an optimization hint for locating delta candidates:
+        candidates from the same series are preferred before same-locator candidates.
+        """
         if observed_at is not None:
             now, caller_ts = _dt_to_ms(observed_at), True
         else:
@@ -828,6 +919,7 @@ class Farchive:
                 digest,
                 now,
                 storage_class=storage_class,
+                series_key=series_key,
                 metadata=metadata,
                 _caller_provided_time=caller_ts,
             )
@@ -840,6 +932,7 @@ class Farchive:
         now: int,
         *,
         storage_class: str | None = None,
+        series_key: str | None = None,
         metadata: dict | None = None,
         _caller_provided_time: bool = False,
     ) -> str:
@@ -848,12 +941,18 @@ class Farchive:
 
         with self._conn:
             self._store_blob(
-                digest, data, storage_class, locator=locator, dict_id=dict_id
+                digest,
+                data,
+                storage_class,
+                locator=locator,
+                series_key=series_key,
+                dict_id=dict_id,
             )
             span = self._observe_impl(
                 locator,
                 digest,
                 now,
+                series_key=series_key,
                 metadata=metadata,
                 _caller_provided_time=_caller_provided_time,
             )
@@ -872,10 +971,11 @@ class Farchive:
 
     def store_batch(
         self,
-        items: list[tuple[str, bytes]],
+        items: list[tuple[str, bytes] | BatchItem],
         *,
         observed_at: datetime | None = None,
         storage_class: str | None = None,
+        series_key: str | None = None,
         progress: Callable[[int, int], None] | None = None,
     ) -> ImportStats:
         """Bulk store (locator, data) tuples. Efficient for import."""
@@ -885,15 +985,17 @@ class Farchive:
                 items,
                 observed_at=ms,
                 storage_class=storage_class,
+                series_key=series_key,
                 progress=progress,
             )
 
     def _store_batch_impl(
         self,
-        items: list[tuple[str, bytes]],
+        items: list[tuple[str, bytes] | BatchItem],
         *,
         observed_at: int | None = None,
         storage_class: str | None = None,
+        series_key: str | None = None,
         progress: Callable[[int, int], None] | None = None,
     ) -> ImportStats:
         stats = ImportStats()
@@ -904,14 +1006,75 @@ class Farchive:
             batch_ts = 0  # unused; per-item _now_ms() below
             caller_ts = False
 
-        # Use any trained dict for this storage class (not gated by auto-train eligibility)
-        dict_id = self._get_latest_dict_id(storage_class) if storage_class else None
+        # Per-class dict cache to support mixed per-item storage classes in batch mode.
+        dict_id_by_storage_class: dict[str | None, int | None] = {}
+
+        autotrain_classes: set[str] = set()
+
+        per_item_timestamps_used = False
+        per_item_metadata_used = False
+        per_item_series_key_used = False
 
         with self._conn:
-            for i, (locator, data) in enumerate(items):
+            for i, item in enumerate(items):
+                if isinstance(item, tuple):
+                    if len(item) != 2:
+                        raise TypeError("store_batch tuple items must be (locator, data)")
+                    locator, data = item
+                    item_observed_at = None
+                    item_storage_class = None
+                    item_series_key = None
+                    item_metadata = None
+                elif isinstance(item, BatchItem):
+                    locator = item.locator
+                    data = item.data
+                    item_observed_at = item.observed_at
+                    item_storage_class = item.storage_class
+                    item_series_key = item.series_key
+                    item_metadata = item.metadata
+                    if item_observed_at is not None:
+                        per_item_timestamps_used = True
+                    if item_series_key is not None:
+                        per_item_series_key_used = True
+                    if item_metadata is not None:
+                        per_item_metadata_used = True
+                else:
+                    raise TypeError(
+                        "store_batch accepts tuple[str, bytes] or BatchItem items only"
+                    )
+
                 stats.items_scanned += 1
-                now: int = batch_ts if caller_ts else _now_ms()
+                if item_observed_at is not None:
+                    now = _dt_to_ms(item_observed_at)
+                    if now is None:
+                        raise ValueError(
+                            f"Observed timestamp for {locator!r} is invalid: {item_observed_at!r}"
+                        )
+                    item_caller_ts = True
+                elif caller_ts:
+                    now = batch_ts
+                    item_caller_ts = True
+                else:
+                    now = _now_ms()
+                    item_caller_ts = False
                 digest = _sha256(data)
+                effective_storage_class = (
+                    item_storage_class if item_storage_class is not None else storage_class
+                )
+                effective_series_key = (
+                    item_series_key if item_series_key is not None else series_key
+                )
+                dict_id = None
+                if effective_storage_class is not None:
+                    if effective_storage_class in dict_id_by_storage_class:
+                        dict_id = dict_id_by_storage_class[effective_storage_class]
+                    else:
+                        dict_id = self._get_latest_dict_id(effective_storage_class)
+                        dict_id_by_storage_class[effective_storage_class] = dict_id
+                        if dict_id is None:
+                            autotrain_classes.add(effective_storage_class)
+                else:
+                    dict_id = None
 
                 # Check dedup
                 existing = self._conn.execute(
@@ -924,15 +1087,18 @@ class Farchive:
                         locator,
                         digest,
                         now,
-                        _caller_provided_time=caller_ts,
+                        series_key=effective_series_key,
+                        metadata=item_metadata,
+                        _caller_provided_time=item_caller_ts,
                     )
                     continue
 
                 self._store_blob(
                     digest,
                     data,
-                    storage_class,
+                    effective_storage_class,
                     locator=locator,
+                    series_key=effective_series_key,
                     dict_id=dict_id,
                 )
                 blob_row = self._conn.execute(
@@ -943,7 +1109,9 @@ class Farchive:
                     locator,
                     digest,
                     now,
-                    _caller_provided_time=caller_ts,
+                    series_key=effective_series_key,
+                    metadata=item_metadata,
+                    _caller_provided_time=item_caller_ts,
                 )
                 stats.items_stored += 1
                 stats.bytes_raw += len(data)
@@ -960,16 +1128,163 @@ class Farchive:
                         "items_stored": stats.items_stored,
                         "items_deduped": stats.items_deduped,
                         "storage_class": storage_class,
+                        "series_key": series_key,
+                        "per_item_timestamps_used": per_item_timestamps_used,
+                        "per_item_series_key_used": per_item_series_key_used,
+                        "per_item_metadata_used": per_item_metadata_used,
                     }
                 ),
                 occurred_at=batch_ts if caller_ts else None,
             )
 
         # Auto-train check after batch (non-fatal)
-        if dict_id is None:
-            self._try_auto_train(storage_class)
+        for storage_class_to_check in autotrain_classes:
+            self._try_auto_train(storage_class_to_check)
 
         return stats
+
+    def purge(self, locators: list[str], *, dry_run: bool = False) -> PurgeStats:
+        """Delete locator spans and unreferenced blobs/chunks.
+
+        Purge is safe and transactional:
+        - all spans for listed locators are removed
+        - blobs no longer referenced by any remaining locator span are collected
+        - any remaining blobs reachable via delta chains are kept
+        - chunk data is deleted only when not referenced by any kept blob
+        """
+        if not locators:
+            raise ValueError("At least one locator is required for purge().")
+
+        deduped_locators = list(dict.fromkeys(locators))
+        for locator in deduped_locators:
+            if not isinstance(locator, str):
+                raise TypeError("locators must be strings.")
+
+        params = tuple(deduped_locators)
+        placeholder = ", ".join(["?"] * len(params))
+
+        with self._write_lock():
+            locators_purged_row = self._conn.execute(
+                f"SELECT COUNT(DISTINCT locator) FROM locator_span WHERE locator IN ({placeholder})",
+                params,
+            ).fetchone()
+            locators_purged = locators_purged_row[0] if locators_purged_row else 0
+
+            spans_deleted_row = self._conn.execute(
+                f"SELECT COUNT(*) FROM locator_span WHERE locator IN ({placeholder})",
+                params,
+            ).fetchone()
+            spans_deleted = spans_deleted_row[0] if spans_deleted_row else 0
+
+            keep_rows = self._conn.execute(
+                f"""
+                WITH RECURSIVE keep(digest) AS (
+                    SELECT DISTINCT digest
+                    FROM locator_span
+                    WHERE locator NOT IN ({placeholder})
+                    UNION
+                    SELECT b.base_digest
+                    FROM keep k
+                    JOIN blob b ON b.digest = k.digest
+                    WHERE b.base_digest IS NOT NULL
+                )
+                SELECT digest FROM keep
+                """,
+                params,
+            ).fetchall()
+            keep_digests = [r[0] for r in keep_rows]
+
+            if keep_digests:
+                keep_placeholders = ", ".join(["?"] * len(keep_digests))
+                to_delete_rows = self._conn.execute(
+                    f"SELECT digest FROM blob WHERE digest NOT IN ({keep_placeholders})",
+                    keep_digests,
+                ).fetchall()
+            else:
+                to_delete_rows = self._conn.execute(
+                    "SELECT digest FROM blob"
+                ).fetchall()
+            to_delete = [r[0] for r in to_delete_rows]
+
+            if keep_digests:
+                keep_placeholders = ", ".join(["?"] * len(keep_digests))
+                chunk_deleted_row = self._conn.execute(
+                    f"""
+                    SELECT COUNT(*)
+                    FROM chunk
+                    WHERE chunk_digest NOT IN (
+                        SELECT DISTINCT bc.chunk_digest
+                        FROM blob_chunk bc
+                        WHERE bc.blob_digest IN ({keep_placeholders})
+                    )
+                    """,
+                    keep_digests,
+                ).fetchone()
+            else:
+                chunk_deleted_row = self._conn.execute("SELECT COUNT(*) FROM chunk").fetchone()
+            chunks_deleted = chunk_deleted_row[0] if chunk_deleted_row else 0
+
+            blobs_deleted = len(to_delete)
+
+            if dry_run:
+                return PurgeStats(
+                    locators_requested=len(deduped_locators),
+                    locators_purged=locators_purged,
+                    spans_deleted=spans_deleted,
+                    blobs_deleted=blobs_deleted,
+                    chunks_deleted=chunks_deleted,
+                    dry_run=True,
+                )
+
+            with self._conn:
+                self._conn.execute(
+                    f"DELETE FROM locator_span WHERE locator IN ({placeholder})",
+                    params,
+                )
+                if to_delete:
+                    delete_ph = ", ".join(["?"] * len(to_delete))
+                    self._conn.execute(
+                        f"DELETE FROM blob_chunk WHERE blob_digest IN ({delete_ph})",
+                        to_delete,
+                    )
+                    self._conn.execute(
+                        f"DELETE FROM blob WHERE digest IN ({delete_ph})",
+                        to_delete,
+                    )
+                    self._conn.execute(
+                        """
+                        DELETE FROM chunk
+                        WHERE NOT EXISTS (
+                            SELECT 1 FROM blob_chunk bc
+                            WHERE bc.chunk_digest = chunk.chunk_digest
+                        )
+                        """
+                    )
+
+            if not dry_run:
+                if locators_purged:
+                    self._emit_event(
+                        kind="fa.purge",
+                        locator="",
+                        metadata_json=json.dumps(
+                            {
+                                "locators_requested": len(deduped_locators),
+                                "locators_purged": locators_purged,
+                                "spans_deleted": spans_deleted,
+                                "blobs_deleted": blobs_deleted,
+                                "chunks_deleted": chunks_deleted,
+                            }
+                        ),
+                    )
+
+            return PurgeStats(
+                locators_requested=len(deduped_locators),
+                locators_purged=locators_purged,
+                spans_deleted=spans_deleted,
+                blobs_deleted=blobs_deleted,
+                chunks_deleted=chunks_deleted,
+                dry_run=dry_run,
+            )
 
     # ------------------------------------------------------------------
     # Public API — read
@@ -978,6 +1293,38 @@ class Farchive:
     def read(self, digest: str) -> bytes | None:
         """Read exact raw bytes by digest. None if not found."""
         return self._read_raw(digest)
+
+    def compare_current(
+        self,
+        locator: str,
+        *,
+        data: bytes | None = None,
+        digest: str | None = None,
+    ) -> LocatorHeadComparison:
+        """Compare candidate content to the current head for a locator.
+
+        Exactly one of `data` or `digest` must be provided.
+        """
+        if (data is None) == (digest is None):
+            raise ValueError("Exactly one of data or digest must be provided.")
+
+        candidate_digest = _sha256(data) if data is not None else digest
+        assert candidate_digest is not None
+
+        current = self.resolve(locator)
+        if current is None:
+            status = "absent"
+        elif current.digest == candidate_digest:
+            status = "same"
+        else:
+            status = "changed"
+
+        return LocatorHeadComparison(
+            locator=locator,
+            current_span=current,
+            candidate_digest=candidate_digest,
+            status=status,
+        )
 
     def resolve(self, locator: str, *, at: datetime | None = None) -> StateSpan | None:
         """Resolve the current or point-in-time span for a locator."""
@@ -1050,6 +1397,9 @@ class Farchive:
         locator: str | None = None,
         *,
         since: datetime | None = None,
+        kind: str | None = None,
+        digest: str | None = None,
+        locator_prefix: str | None = None,
         limit: int = 1000,
     ) -> list[Event]:
         """Query event log.
@@ -1071,9 +1421,18 @@ class Farchive:
         if locator is not None:
             conditions.append("locator = ?")
             params.append(locator)
+        if locator_prefix is not None:
+            conditions.append("locator LIKE ?")
+            params.append(f"{locator_prefix}%")
         if since_ms is not None:
             conditions.append("occurred_at >= ?")
             params.append(since_ms)
+        if kind is not None:
+            conditions.append("kind = ?")
+            params.append(kind)
+        if digest is not None:
+            conditions.append("digest = ?")
+            params.append(digest)
 
         where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
         params.append(limit)
@@ -1167,12 +1526,14 @@ class Farchive:
         *,
         dict_id: int | None = None,
         storage_class: str | None = None,
+        series_key: str | None = None,
         batch_size: int = 1000,
     ) -> RepackStats:
         """Recompress vanilla-zstd blobs with a dictionary."""
         return self._repack_impl(
             dict_id=dict_id,
             storage_class=storage_class,
+            series_key=series_key,
             batch_size=batch_size,
         )
 
@@ -1181,6 +1542,7 @@ class Farchive:
         *,
         dict_id: int | None = None,
         storage_class: str | None = None,
+        series_key: str | None = None,
         batch_size: int = 1000,
     ) -> RepackStats:
         if dict_id is None:
@@ -1218,6 +1580,7 @@ class Farchive:
                     d,
                     self._policy,
                     storage_class=storage_class,
+                    series_key=series_key,
                     batch_size=batch_size,
                 )
                 if stats.blobs_repacked > 0:
@@ -1238,6 +1601,7 @@ class Farchive:
         self,
         *,
         storage_class: str | None = None,
+        series_key: str | None = None,
         batch_size: int = 100,
         min_blob_size: int | None = None,
     ) -> RechunkStats:
@@ -1266,9 +1630,19 @@ class Farchive:
                 sc_clause = " AND storage_class = ?"
                 params.append(storage_class)
 
+            series_clause = ""
+            if series_key is not None:
+                if not self._supports_span_series_key:
+                    raise ValueError("rechunk() with series_key requires locator_span.series_key")
+                series_clause = " AND EXISTS (" \
+                    "SELECT 1 FROM locator_span ls " \
+                    "WHERE ls.digest = blob.digest AND ls.series_key = ?"
+                series_clause += ")"
+                params.append(series_key)
+
             rows = self._conn.execute(
                 f"SELECT digest, stored_self_size FROM blob "
-                f"WHERE codec != 'chunked' AND raw_size >= ?{sc_clause} "
+                f"WHERE codec != 'chunked' AND raw_size >= ?{sc_clause}{series_clause} "
                 f"ORDER BY raw_size DESC",
                 params,
             ).fetchall()

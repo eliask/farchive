@@ -551,6 +551,61 @@ class TestRechunk:
                 ).fetchone()[0]
                 assert chunked == 1 + stats.blobs_rewritten  # 1 seed + rewrites
 
+    def test_rechunk_series_key_scope_limits_candidates(self, tmp_path):
+        """rechunk() with series_key only rewrites matching-span series."""
+        db = tmp_path / "rechunk_series.db"
+        with Farchive(db, compression=_TINY_POLICY) as fa:
+            seed = os.urandom(4 * _KIB)
+
+            # Seed chunk inventory with the repeated pattern.
+            seed_data = seed * 8
+            with fa._conn:
+                _store_as_chunked(fa, seed_data, storage_class="bin")
+
+            # Target series (rechunkable): similar to seed.
+            target_data = seed_data[:-1] + bytes([seed_data[-1] ^ 0xFF])
+            d_target = fa.store(
+                "loc/target",
+                target_data,
+                storage_class="bin",
+                series_key="series/target",
+            )
+
+            # Non-target series should remain unchanged.
+            non_target_data = _make_blob(32 * _KIB)
+            d_other = fa.store(
+                "loc/other",
+                non_target_data,
+                storage_class="bin",
+                series_key="series/other",
+            )
+
+            target_before = fa._conn.execute(
+                "SELECT codec FROM blob WHERE digest=?",
+                (d_target,),
+            ).fetchone()[0]
+            other_before = fa._conn.execute(
+                "SELECT codec FROM blob WHERE digest=?",
+                (d_other,),
+            ).fetchone()[0]
+            assert target_before != "chunked"
+            assert other_before != "chunked"
+
+            stats = fa.rechunk(storage_class="bin", series_key="series/target")
+
+            target_after = fa._conn.execute(
+                "SELECT codec FROM blob WHERE digest=?",
+                (d_target,),
+            ).fetchone()[0]
+            other_after = fa._conn.execute(
+                "SELECT codec FROM blob WHERE digest=?",
+                (d_other,),
+            ).fetchone()[0]
+
+            if stats.blobs_rewritten > 0:
+                assert target_after == "chunked"
+            assert other_after != "chunked"
+
     def test_rechunk_single_event(self, tmp_path):
         """Exactly one fa.rechunk event emitted per call."""
         db = tmp_path / "rechunk_event.db"

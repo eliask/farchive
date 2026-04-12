@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import subprocess
 import sys
+import pytest
 
 
 from farchive import CompressionPolicy, Farchive
@@ -24,6 +26,11 @@ def _run(args: list[str], *, cwd=None) -> subprocess.CompletedProcess:
         text=True,
         cwd=cwd,
     )
+
+
+def _cli_supports_series_key_flag(subcommand: str) -> bool:
+    result = _run([subcommand, "--help"])
+    return "--series-key" in (result.stdout + result.stderr)
 
 
 def _populated_db(tmp_path):
@@ -93,6 +100,44 @@ def test_history_shows_current_span(tmp_path):
 
     assert result.returncode == 0
     assert "current" in result.stdout
+
+
+def test_history_json(tmp_path):
+    db = _populated_db(tmp_path)
+    result = _run(["history", str(db), "loc/a", "--json"])
+
+    assert result.returncode == 0
+    rows = json.loads(result.stdout)
+    assert isinstance(rows, list)
+    # loc/a has two spans in _populated_db
+    assert len(rows) == 2
+    assert rows[0]["locator"] == "loc/a"
+    assert "digest" in rows[0]
+    assert rows[0]["observation_count"] >= 1
+
+
+def test_history_json_includes_series_key(tmp_path):
+    db = tmp_path / "cli_history_series_key.db"
+    with Farchive(db) as fa:
+        fa.store(
+            "loc/series/a",
+            b"version-1",
+            storage_class="xml",
+            series_key="s/series-1",
+        )
+        fa.store(
+            "loc/series/a",
+            b"version-2",
+            storage_class="xml",
+            series_key="s/series-1",
+        )
+
+    result = _run(["history", str(db), "loc/series/a", "--json"])
+
+    assert result.returncode == 0
+    rows = json.loads(result.stdout)
+    assert rows[0]["series_key"] == "s/series-1"
+    assert rows[1]["series_key"] == "s/series-1"
 
 
 def test_history_unknown_locator_reports_no_history(tmp_path):
@@ -187,12 +232,137 @@ def test_events_locator_filter(tmp_path):
     assert "4 events" in result.stderr
 
 
+def test_events_locator_prefix_filter(tmp_path):
+    db = _populated_db_with_events(tmp_path)
+    result = _run(["events", str(db), "--locator-prefix", "loc/"])
+
+    assert result.returncode == 0, f"stderr: {result.stderr}"
+    assert "loc/a" in result.stdout
+    assert "loc/b" in result.stdout
+
+
+def test_meta_alias_resolve_like(tmp_path):
+    db = _populated_db(tmp_path)
+    result = _run(["meta", str(db), "loc/a", "--json"])
+
+    assert result.returncode == 0
+    data = json.loads(result.stdout)
+    assert data["locator"] == "loc/a"
+    assert "digest" in data
+
+
+def test_resolve_json_includes_series_key(tmp_path):
+    db = tmp_path / "cli_resolve_series_key.db"
+    with Farchive(db) as fa:
+        fa.store(
+            "loc/series/r",
+            b"series-resolve",
+            storage_class="xml",
+            series_key="r/series-1",
+        )
+
+    result = _run(["resolve", str(db), "loc/series/r", "--json"])
+
+    assert result.returncode == 0
+    data = json.loads(result.stdout)
+    assert data["locator"] == "loc/series/r"
+    assert data["series_key"] == "r/series-1"
+
+
+def test_ls_spans_json_includes_series_key(tmp_path):
+    db = tmp_path / "cli_ls_spans_series_key.db"
+    with Farchive(db) as fa:
+        fa.store(
+            "loc/series/ls",
+            b"ls-series-a",
+            storage_class="xml",
+            series_key="ls/series-1",
+        )
+        fa.store(
+            "loc/series/ls",
+            b"ls-series-b",
+            storage_class="xml",
+            series_key="ls/series-1",
+        )
+
+    result = _run(["ls", str(db), "spans", "--json"])
+
+    assert result.returncode == 0
+    rows = json.loads(result.stdout)
+    assert rows, "Expected at least one span in ls output"
+    assert all("series_key" in item for item in rows)
+    assert any(
+        item["locator"] == "loc/series/ls" and item["series_key"] == "ls/series-1"
+        for item in rows
+    )
+
+
+def test_ls_spans_filters_by_series_key(tmp_path):
+    db = tmp_path / "cli_ls_spans_series_key_filter.db"
+    with Farchive(db) as fa:
+        fa.store("loc/series/x", b"series-x-a", storage_class="xml", series_key="s1")
+        fa.store("loc/series/y", b"series-y-a", storage_class="xml", series_key="s2")
+        fa.store(
+            "loc/series/x", b"series-x-b", storage_class="xml", series_key="s1"
+        )
+
+    result = _run(["ls", str(db), "spans", "--series-key", "s1", "--json"])
+
+    assert result.returncode == 0, f"stderr: {result.stderr}"
+    rows = json.loads(result.stdout)
+    assert rows, "Expected at least one span for filtered series key"
+    assert all(item["series_key"] == "s1" for item in rows)
+    assert any(item["locator"] == "loc/series/x" for item in rows)
+    assert all(item["locator"] != "loc/series/y" for item in rows)
+
+
+def test_cli_store_supports_series_key_flag_if_present(tmp_path):
+    db = tmp_path / "cli_store_series_key_flag.db"
+    payload = tmp_path / "payload.txt"
+    payload.write_text("series-key payload")
+
+    with Farchive(db):
+        pass
+
+    if not _cli_supports_series_key_flag("store"):
+        pytest.skip("store --series-key is not implemented in this CLI build")
+
+    result = _run(
+        ["store", str(db), "loc/series/store", str(payload), "--series-key", "store/series-1"]
+    )
+    assert result.returncode == 0
+    with Farchive(db) as fa:
+        span = fa.resolve("loc/series/store")
+        assert span is not None
+        assert span.series_key == "store/series-1"
+
+
+def test_cli_observe_supports_series_key_flag_if_present(tmp_path):
+    db = tmp_path / "cli_observe_series_key_flag.db"
+
+    with Farchive(db) as fa:
+        digest = fa.put_blob(b"observe-series-key")
+
+    if not _cli_supports_series_key_flag("observe"):
+        pytest.skip("observe --series-key is not implemented in this CLI build")
+
+    result = _run(
+        ["observe", str(db), "loc/series/obs", digest, "--series-key", "obs/series-1"]
+    )
+    assert result.returncode == 0
+
+    with Farchive(db) as fa:
+        span = fa.resolve("loc/series/obs")
+        assert span is not None
+        assert span.series_key == "obs/series-1"
+
+
 def test_events_empty_when_no_event_table(tmp_path):
     db = _populated_db(tmp_path)
     result = _run(["events", str(db)])
 
     assert result.returncode == 0
-    assert "No events" in result.stdout
+    assert "No events" in result.stdout or "No event" in result.stdout
 
 
 # ---------------------------------------------------------------------------

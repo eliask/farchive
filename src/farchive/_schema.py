@@ -6,7 +6,7 @@ import sqlite3
 from datetime import datetime, timezone
 
 SCHEMA_VERSION = 3
-_GENERATOR = "farchive 3.0.0"
+_GENERATOR = "farchive 3.1.0"
 
 
 def _now_ms() -> int:
@@ -93,6 +93,7 @@ CREATE TABLE IF NOT EXISTS locator_span (
     observed_until      INTEGER,
     last_confirmed_at   INTEGER NOT NULL,
     observation_count   INTEGER NOT NULL DEFAULT 1,
+    series_key          TEXT,
     last_metadata_json  TEXT
 );
 
@@ -155,6 +156,13 @@ def _ensure_v3_indexes(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_blob_chunk_ref ON blob_chunk(chunk_digest)"
     )
+
+
+def _ensure_v3_series_key_column(conn: sqlite3.Connection) -> None:
+    """Best-effort migration for legacy v3 tables missing locator_span.series_key."""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(locator_span)").fetchall()}
+    if "series_key" not in cols:
+        conn.execute("ALTER TABLE locator_span ADD COLUMN series_key TEXT")
 
 
 def _migrate_v1_to_v2(conn: sqlite3.Connection) -> None:
@@ -270,6 +278,7 @@ def _migrate_v2_to_v3(conn: sqlite3.Connection) -> None:
         ).fetchall()
     }
     if "stored_self_size" in cols and "chunk" in tables and "blob_chunk" in tables:
+        _ensure_v3_series_key_column(conn)
         _ensure_v3_indexes(conn)
         conn.execute(
             "UPDATE schema_info SET version=?, migrated_at=?, generator=?",
@@ -361,6 +370,7 @@ def _migrate_v2_to_v3(conn: sqlite3.Connection) -> None:
                 PRIMARY KEY (blob_digest, ordinal)
             )
         """)
+        _ensure_v3_series_key_column(conn)
         _ensure_v3_indexes(conn)
         conn.execute(
             "UPDATE schema_info SET version=?, migrated_at=?, generator=?",
@@ -411,5 +421,6 @@ def init_schema(conn: sqlite3.Connection, *, enable_events: bool = False) -> Non
         }
         if "event" not in tables:
             conn.executescript(_EVENT_TABLE)
+    _ensure_v3_series_key_column(conn)
 
     conn.commit()

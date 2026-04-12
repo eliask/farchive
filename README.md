@@ -73,13 +73,26 @@ with Farchive("my_archive.farchive") as fa:
         print(f"{span.digest[:12]}  {span.observed_from}..{span.observed_until}")
 ```
 
+## Status
+
+Near-term priorities were:
+
+- importer-facing drift detection via `compare_current()`
+- machine-readable history and provenance ergonomics
+- better event filtering and locator metadata workflows
+- richer batch import ergonomics without changing core archive semantics
+
+Current status: these near-term items are now implemented.
+
 ## Core concepts
 
 - **Blob**: Immutable raw bytes identified by SHA-256 digest. Stored once, deduped by content.
 - **Locator**: Opaque string naming where content was observed (URL, path, any string).
 - **State span**: A contiguous run where one locator resolved to one blob. If the same content returns after an interruption, that's a new span — history is preserved.
 - **Event** (optional): Append-only audit log of archive operations, including observations and maintenance.
-- **Storage class**: A freeform string label (e.g. `"html"`, `"xml"`, `"pdf"`, `"bin"`, `"json"`, whatever you want) that guides compression strategy. There is no fixed set — any string is valid. Blobs in the same class share dictionaries and delta candidates. Common convention is to use MIME-like names, but the archive does not enforce or validate them.
+- **Storage class**: A freeform string label (e.g. `"html"`, `"xml"`, `"pdf"`, `"bin"`, `"json"`, whatever you want) that guides compression strategy. There is no fixed set — any string is valid. Blobs in the same class share dictionaries and local candidate strategy. Common convention is to use MIME-like names, but the archive does not enforce or validate them.
+- **Series key**: An optional opaque lineage hint used only to widen delta candidate selection across locators in the same version family. It is optional, advisory, and has no read-time semantic meaning.
+  For an open same-digest span, the current behavior is latest-non-null wins if a later confirmation provides a new non-null `series_key`.
 
 ## API
 
@@ -88,18 +101,38 @@ with Farchive("my_archive.farchive") as fa:
 ```python
 fa.put_blob(data, storage_class="xml")                      # store blob, return digest
 fa.observe(locator, digest)                                 # record observation
-fa.observe(locator, digest, observed_at=ts, metadata={"k": "v"})  # with time and metadata
+fa.observe(locator, digest, observed_at=ts, metadata={"k": "v"}, series_key="series/doc-123")  # with time, metadata, and lineage hint
 fa.store(locator, data)                                     # put_blob + observe (atomic)
-fa.store(locator, data, observed_at=ts, metadata={"k": "v"})       # with time and metadata
-fa.store_batch([(loc, data), ...], progress=callback)       # bulk import
+fa.store(locator, data, observed_at=ts, storage_class="html", series_key="series/doc-123", metadata={"k": "v"})       # with time, class, lineage hint, and metadata
+fa.store_batch([(loc, data), ...], progress=callback, series_key="series/doc-123")       # shared defaults for batch
+fa.store_batch(
+    [BatchItem(locator=loc, data=data, observed_at=ts, storage_class="html", series_key="series/doc-123", metadata={"k": "v"})],
+    progress=callback,
+)                                                           # per-item metadata/timestamps
 ```
 
-`store()` and `store_batch()` may use prior blobs from the same locator as delta candidates when beneficial. `put_blob()` has no locator context and skips delta encoding.
+`observe()`, `store()`, and `store_batch()` may use prior blobs from the same locator as delta candidates when beneficial. If `series_key` is provided, delta candidates can also come from other locators in the same lineage key. `put_blob()` has no locator context and skips delta encoding.
+`store_batch()` accepts both legacy tuples and `BatchItem`. Shared `observed_at` / `storage_class` / `series_key` defaults are used only when an item does not set its own value.
+
+Series key contract:
+
+- optional, typed hint; advisory and additive only
+- one value per span; never changes archive semantics
+- additive and explicit: no profile object, no profile switching
+- does not affect reads, span identity, resolver results, or history semantics
+- implemented to widen delta candidate lookup only
+
+Machine-readable span outputs:
+
+- in the API, `StateSpan` includes `series_key` when present
+- machine-readable CLI outputs (`resolve --json`, `history --json`, and `ls spans --json`) now include `series_key` when present
 
 ### Read
 
 ```python
 fa.read(digest)                    # exact bytes by digest
+fa.compare_current(locator, data=bytes)   # locator state vs candidate bytes (status: absent/same/changed)
+fa.compare_current(locator, digest=digest)   # locator state vs candidate digest
 fa.resolve(locator)                # current StateSpan
 fa.resolve(locator, at=timestamp)  # point-in-time span
 fa.get(locator)                    # convenience: resolve + read
@@ -111,12 +144,17 @@ fa.events(locator)                 # audit log (if event history exists)
 fa.events(locator, since=ts)       # events since timestamp
 ```
 
+`fa.compare_current()` requires exactly one of `data` or `digest`.
+
 ### Maintenance
 
 ```python
 fa.train_dict(storage_class="xml")          # train zstd dictionary, returns dict_id
-fa.repack(storage_class="xml")              # recompress with trained dict, returns RepackStats
-fa.rechunk(storage_class="bin")             # convert large blobs to chunked form, returns RechunkStats
+fa.repack(storage_class="xml")                                  # recompress with trained dict, returns RepackStats
+fa.repack(storage_class="xml", series_key="series/doc-123")       # recompress one lineage cohort
+fa.rechunk(storage_class="bin")                                 # convert large blobs to chunked form, returns RechunkStats
+fa.rechunk(storage_class="bin", series_key="series/doc-123")      # target one lineage cohort for chunking maintenance
+fa.purge(["loc/a", "loc/b"])                # remove locators and unreachable blobs, returns PurgeStats
 fa.stats()                                  # archive statistics, returns ArchiveStats
 fa.close()                                  # close connection (automatic with context manager)
 ```
@@ -125,12 +163,15 @@ fa.close()                                  # close connection (automatic with c
 
 All types are importable from `farchive`:
 
-- `StateSpan` — one contiguous run of a locator resolving to one blob
+- `StateSpan` — one contiguous run of a locator resolving to one blob, including optional `series_key`
 - `Event` — one audit record (event_id, occurred_at, locator, digest, kind, metadata)
 - `CompressionPolicy` — configurable storage optimization knobs
 - `ImportStats` — results from `store_batch()`
+- `BatchItem` — input envelope for richer batch ingestion (`series_key` optional lineage hint)
+- `LocatorHeadComparison` — result of `compare_current()`
 - `RepackStats` — results from `repack()` (blobs_repacked, bytes_saved)
 - `RechunkStats` — results from `rechunk()` (blobs_rewritten, chunks_added, bytes_saved)
+- `PurgeStats` — results from `purge()` (`locators_requested`, `locators_purged`, `spans_deleted`, `blobs_deleted`, `chunks_deleted`, `dry_run`)
 - `ArchiveStats` — snapshot of archive state (locator_count, blob_count, span_count, dict_count, total_raw_bytes, total_stored_bytes, compression_ratio, codec_distribution, db_path, schema_version, chunk_count, db_file_bytes)
 
 ### Constructor
@@ -155,13 +196,13 @@ Farchive uses layered storage optimization. Phase 1 and Phase 2 are automatic wr
 2. **Vanilla zstd** — standard compression
 3. **Dictionary zstd** — corpus-trained dictionaries for configured storage classes
 
-Storage classes are **freeform strings** — any value is valid (`"html"`, `"xml"`, `"bin"`, `"my-app/v2"`, whatever). The archive does not validate or enforce any convention. They are optimization buckets: dictionaries are trained per-class, and delta candidates are drawn from the same class.
+Storage classes are **freeform strings** — any value is valid (`"html"`, `"xml"`, `"bin"`, `"my-app/v2"`, whatever). The archive does not validate or enforce any convention. They are optimization buckets: dictionaries are trained per-class.
 
 ### Phase 2 — Delta encoding (write path)
 
 When storing a blob at a locator that has prior versions, farchive may encode it as a `zstd_delta` against a similar prior blob. This captures small changes (edits, patches, amendments) very efficiently.
 
-Delta is locator-local, depth-1 (delta bases are never themselves deltas), and only used when it beats the best inline frame by a configurable margin. Delta candidates are restricted to inline blobs (`raw`, `zstd`, `zstd_dict`) — chunked blobs are excluded to maintain a clean separation between the delta path (small changes between similar inline blobs) and the chunking path (large-blob dedup via maintenance). Disabled by setting `delta_enabled=False`.
+Delta is depth-1 (delta bases are never themselves deltas), and only used when it beats the best inline frame by a configurable margin. Candidate selection includes locator-local history and the optional same-`series_key` lane for related streams. Delta candidates remain inline-only (`raw`, `zstd`, `zstd_dict`) — chunked blobs are excluded to maintain a clean separation between the delta path (small changes between similar inline blobs) and the chunking path (large-blob dedup via maintenance). Disabled by setting `delta_enabled=False`.
 
 ### Phase 3 — Content-defined chunking (maintenance only)
 
@@ -215,6 +256,7 @@ Explicit maintenance operation that converts eligible inline blobs into chunked 
 ```python
 stats = fa.rechunk()                                    # all eligible blobs
 stats = fa.rechunk(storage_class="bin")                 # only one class
+stats = fa.rechunk(series_key="series/doc-123")         # one lineage cohort only
 stats = fa.rechunk(batch_size=50)                       # cap rewrites
 stats = fa.rechunk(min_blob_size=2*1024*1024)           # override threshold
 ```
@@ -222,6 +264,7 @@ stats = fa.rechunk(min_blob_size=2*1024*1024)           # override threshold
 | Parameter | Type | Default | Notes |
 |---|---|---|---|
 | `storage_class` | `str \| None` | `None` | Restrict candidates |
+| `series_key` | `str \| None` | `None` | Restrict to one lineage cohort |
 | `batch_size` | `int` | `100` | Max blobs rewritten per call |
 | `min_blob_size` | `int \| None` | from policy | Minimum raw size |
 
@@ -231,16 +274,20 @@ Returns `RechunkStats(blobs_rewritten, chunks_added, bytes_saved)`. Preserves di
 
 ```
 farchive stats [db_path]
-farchive history <locator> [db_path]
+farchive history [db_path] <locator> [--json]
 farchive locators [db_path] [--pattern PAT]
-farchive events [db_path] [--locator LOC]
-farchive inspect <digest> [db_path]
+farchive find [db_path] <query> [--prefix]
+farchive events [db_path] [--locator LOC] [--locator-prefix LOC] [--kind KIND] [--digest DIGEST] [--since TS] [--limit N]
+farchive resolve [db_path] <locator> [--at TS] [--json]
+farchive meta [db_path] <locator> [--at TS] [--json]
+farchive inspect [db_path] <digest>
 farchive train-dict [db_path] [--storage-class xml]
-farchive repack [db_path] [--batch-size 1000]
-farchive rechunk [db_path] [--storage-class bin] [--batch-size 100] [--min-blob-size N]
+farchive repack [db_path] [--storage-class xml] [--series-key key] [--batch-size 1000]
+farchive rechunk [db_path] [--storage-class bin] [--series-key key] [--batch-size 100] [--min-blob-size N]
+farchive purge [db_path] <locator> [<locator> ...] [--dry-run] [--confirm] [--json]
 ```
 
-`inspect` shows blob metadata including chunk references and unique stored size for chunked blobs. `events` shows the audit log when event history is enabled. `rechunk` converts eligible inline blobs to chunked form for cross-blob dedup.
+`inspect` shows blob metadata including chunk references and unique stored size for chunked blobs. `history --json`, `resolve --json`, and `ls spans --json` return machine-readable span records including `series_key` when present. `ls spans --series-key` filters a relationship cohort to the same lineage for operator inspection. `events --kind`, `events --digest`, and `events --locator-prefix` provide locator-oriented event filters for API-like event queries. `find` searches locators by substring, or by prefix with `--prefix`. `meta` is a thin CLI alias for `resolve`.
 
 ## Design
 

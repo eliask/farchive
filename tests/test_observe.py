@@ -158,6 +158,41 @@ def test_aba_first_span_closed_at_t1(archive):
     assert spans[2]["observed_until"] is None
 
 
+def test_observe_accepts_series_key(archive):
+    base_digest = archive.put_blob(b"base")
+    next_digest = archive.put_blob(b"next")
+
+    first_span = archive.observe(
+        "loc/series", base_digest, observed_at=_T0, series_key="law/series-1"
+    )
+    second_span = archive.observe(
+        "loc/series", next_digest, observed_at=_T1, series_key="law/series-1"
+    )
+
+    assert first_span.series_key == "law/series-1"
+    assert second_span.series_key == "law/series-1"
+    resolved = archive.resolve("loc/series")
+    assert resolved is not None
+    assert resolved.series_key == "law/series-1"
+
+
+def test_observe_same_digest_updates_series_key_latest_non_null_wins(archive):
+    digest = archive.put_blob(b"same-digest")
+
+    first_span = archive.observe(
+        "loc/series-update", digest, observed_at=_T0, series_key="series/a"
+    )
+    second_span = archive.observe(
+        "loc/series-update", digest, observed_at=_T1, series_key="series/b"
+    )
+
+    assert first_span.series_key == "series/a"
+    assert second_span.series_key == "series/b"
+    resolved = archive.resolve("loc/series-update")
+    assert resolved is not None
+    assert resolved.series_key == "series/b"
+
+
 # ---------------------------------------------------------------------------
 # Monotone time enforcement
 # ---------------------------------------------------------------------------
@@ -212,7 +247,6 @@ def test_empty_dict_metadata_stored(archive):
     digest = archive.put_blob(b"empty meta")
     span = archive.observe("loc/empty", digest, observed_at=_T0, metadata={})
     assert span.last_metadata == {}
-
 
 def test_implicit_timestamp_auto_bumps_on_rapid_changes(tmp_path):
     """Rapid store() calls without explicit timestamps should not fail."""

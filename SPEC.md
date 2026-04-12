@@ -70,6 +70,7 @@ A span has:
 - `last_confirmed_at` — latest confirming observation
 - `observation_count`
 - `last_metadata` — optional caller metadata snapshot
+- `series_key` — optional opaque lineage hint used only for delta candidate selection
 
 Example:
 
@@ -113,7 +114,43 @@ A storage class is a caller-provided compression hint such as `xml`, `html`, `pd
 
 Storage class is not normative MIME truth. It is an optimization bucket used for dictionary training and similar policy decisions.
 
-### 2.7 Inline Representation
+### 2.7 Series Key
+
+`series_key` is an optional caller-provided optimization hint for delta candidate grouping.
+
+- It does not define locator semantics.
+- It has no effect on reads, span identity, or resolver behavior.
+- It is advisory and may be absent.
+- It can be attached through `store(..., series_key=...)`, `observe(..., series_key=...)`, and `BatchItem.series_key`.
+- It is advisory and must be treated as a hint, not a correctness requirement.
+- It is additive: no profile object, no write-path policy switching.
+- It is persisted on resulting spans when provided.
+- For an open same-digest span, the official v2 behavior is latest-non-null wins:
+  providing a different non-null `series_key` on a later confirmation updates the
+  stored span value in place.
+
+### 2.8 Provenance Metadata Conventions
+
+Farchive keeps caller metadata schema-agnostic, but these keys are recommended
+for import/provenance metadata when available:
+
+- `source_url`
+- `source_surface`
+- `entry_name`
+- `fetched_at`
+- `import_run`
+- `artifact_role`
+- `upstream_etag`
+- `upstream_last_modified`
+- `upstream_version_id`
+
+Notes:
+
+- These keys are advisory, not required or enforced.
+- Prefer ISO 8601 UTC strings for timestamps.
+- Prefer `artifact_role` over storage-oriented names such as `storage_reason`.
+
+### 2.9 Inline Representation
 
 An inline representation is a blob stored directly in the `blob.payload` column, with one of these codecs:
 
@@ -122,13 +159,13 @@ An inline representation is a blob stored directly in the `blob.payload` column,
 - `zstd_dict`
 - `zstd_delta`
 
-### 2.8 Delta Representation
+### 2.10 Delta Representation
 
-A delta representation stores a blob as `zstd_delta` against one older base blob from the same locator.
+A delta representation stores a blob as `zstd_delta` against one older base blob from the same locator, or from another locator in the same non-null `series_key` lineage.
 
 Delta is:
 
-- locator-local
+- locator-local by default; optionally supplemented by same-`series_key` candidates
 - depth-1 only
 - optional and policy-driven
 - invisible to readers
@@ -137,7 +174,7 @@ At **selection time**, delta bases are drawn only from inline non-delta blobs (`
 
 After later maintenance, a blob serving as the historical base of an existing delta **may** be physically rewritten to another non-delta representation such as `chunked`, as long as its raw bytes remain readable. Delta decompression depends on the base blob’s raw bytes, not on its original inline storage form.
 
-### 2.9 Chunked Representation
+### 2.11 Chunked Representation
 
 A chunked representation stores a large blob as an ordered manifest of content-defined chunks.
 
@@ -150,7 +187,7 @@ Chunks are stored in a separate `chunk` table and deduplicated archive-wide by t
 
 Chunking is an **explicit maintenance optimization** in v2. It is applied by `rechunk()`, not by `store()` or `put_blob()`.
 
-### 2.10 Chunk
+### 2.12 Chunk
 
 A chunk is an immutable raw byte substring identified by SHA-256 of its raw bytes and stored independently in the `chunk` table.
 
@@ -365,6 +402,7 @@ class StateSpan:
     observed_until: int | None
     last_confirmed_at: int
     observation_count: int
+    series_key: str | None = None
     last_metadata: dict[str, Any] | None = None
 
 
@@ -393,6 +431,16 @@ class ImportStats:
 
 
 @dataclass
+class BatchItem:
+    locator: str
+    data: bytes
+    observed_at: datetime | None = None
+    storage_class: str | None = None
+    series_key: str | None = None
+    metadata: dict[str, Any] | None = None
+
+
+@dataclass
 class RepackStats:
     blobs_repacked: int = 0
     bytes_saved: int = 0
@@ -403,6 +451,24 @@ class RechunkStats:
     blobs_rewritten: int = 0
     chunks_added: int = 0
     bytes_saved: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class LocatorHeadComparison:
+    locator: str
+    current_span: StateSpan | None
+    candidate_digest: str
+    status: Literal["absent", "same", "changed"]
+
+
+@dataclass
+class PurgeStats:
+    locators_requested: int = 0
+    locators_purged: int = 0
+    spans_deleted: int = 0
+    blobs_deleted: int = 0
+    chunks_deleted: int = 0
+    dry_run: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -451,7 +517,7 @@ Semantics:
 - does **not** use chunking in v2
 - may trigger best-effort auto-training after a successful semantic write
 
-### 8.3 `observe(locator, digest, *, observed_at=None, metadata=None) -> StateSpan`
+### 8.3 `observe(locator, digest, *, observed_at=None, series_key=None, metadata=None) -> StateSpan`
 
 Records an observation of an existing digest at a locator.
 
@@ -460,8 +526,11 @@ Cases:
 - no current span → create new span
 - same digest → extend current span
 - different digest → close old span and create new span
+- optional `series_key` can be persisted on the new/active span when provided
+- when extending an open same-digest span, a non-null provided `series_key`
+  replaces the current stored `series_key` value
 
-### 8.4 `store(locator, data, *, observed_at=None, storage_class=None, metadata=None) -> str`
+### 8.4 `store(locator, data, *, observed_at=None, storage_class=None, metadata=None, series_key=None) -> str`
 
 Atomic `put_blob(data)` + `observe(locator, digest)`.
 
@@ -470,16 +539,19 @@ Semantics:
 - exact dedup first
 - may use trained dictionaries
 - may use locator-local delta if beneficial
+- may use same-`series_key` cross-locator delta candidates if `series_key` is provided
 - does **not** use chunking automatically in v2
 - emits `fa.observe` and `fa.store` when event history exists
 
-### 8.5 `store_batch(items, *, observed_at=None, storage_class=None, progress=None) -> ImportStats`
+### 8.5 `store_batch(items, *, observed_at=None, storage_class=None, progress=None, series_key=None) -> ImportStats`
 
-Stores `(locator, data)` items in one atomic batch.
+Stores `(locator, data)` or `BatchItem` items in one atomic batch.
 
 Semantics:
 
 - all-or-nothing for the batch
+- accepts both `list[tuple[str, bytes]]` (legacy) and `list[BatchItem]`
+- per-item `observed_at`, `storage_class`, `series_key`, and `metadata` override shared defaults
 - each item still follows exact dedup and optional delta rules
 - items later in the same batch may observe state written earlier in the same batch
 - may emit many `fa.observe` events and one `fa.store_batch` summary event
@@ -490,36 +562,50 @@ Semantics:
 
 Returns exact raw bytes for a digest, regardless of physical representation.
 
-### 8.7 `resolve(locator, *, at=None) -> StateSpan | None`
+### 8.7 `compare_current(locator, *, data=None, digest=None) -> LocatorHeadComparison`
+
+Compares candidate content to the locator head.
+
+Rules:
+
+- exactly one of `data` or `digest` must be provided
+- status is one of `absent`, `same`, or `changed`
+
+### 8.8 `resolve(locator, *, at=None) -> StateSpan | None`
 
 Returns:
 
 - current span if `at is None`
 - unique active span at time `at` otherwise
 
-### 8.8 `get(locator, *, at=None) -> bytes | None`
+### 8.9 `get(locator, *, at=None) -> bytes | None`
 
 Convenience: `resolve()` followed by `read()`.
 
-### 8.9 `history(locator) -> list[StateSpan]`
+### 8.10 `history(locator) -> list[StateSpan]`
 
 All spans for a locator, newest first.
+`StateSpan` carries `series_key` when present.
+Machine-readable outputs include `series_key` when present for:
+- `resolve --json`
+- `history --json`
+- `ls spans --json` (`farchive ls spans ... --json`)
 
-### 8.10 `has(locator, *, max_age_hours=float("inf")) -> bool`
+### 8.11 `has(locator, *, max_age_hours=float("inf")) -> bool`
 
 Returns `True` iff locator has a current span and, when a finite freshness window is supplied, that span is fresh enough.
 
-### 8.11 `locators(pattern="%") -> list[str]`
+### 8.12 `locators(pattern="%") -> list[str]`
 
 Returns distinct locators matching a SQL `LIKE` pattern, sorted lexicographically.
 
-### 8.12 `events(locator=None, *, since=None, limit=1000) -> list[Event]`
+### 8.13 `events(locator=None, *, since=None, kind=None, digest=None, locator_prefix=None, limit=1000) -> list[Event]`
 
 Returns newest-first events filtered by locator and/or lower time bound.
-
+Optional `kind`, `digest`, and `locator_prefix` filters are also supported.
 Returns empty list if the archive has no event table.
 
-### 8.13 `train_dict(*, storage_class, sample_size=500) -> int`
+### 8.14 `train_dict(*, storage_class, sample_size=500) -> int`
 
 Trains a zstd dictionary from sampled raw bytes in one storage class and returns `dict_id`.
 
@@ -530,7 +616,7 @@ Semantics:
 - existing blobs are unchanged until `repack()`
 - sampling operates over raw bytes, regardless of whether the sampled blobs are inline, delta, or chunked
 
-### 8.14 `repack(*, dict_id=None, storage_class=None, batch_size=1000) -> RepackStats`
+### 8.15 `repack(*, dict_id=None, storage_class=None, series_key=None, dict_group=None, batch_size=1000) -> RepackStats`
 
 Recompresses eligible vanilla-zstd inline blobs to `zstd_dict`.
 
@@ -538,10 +624,14 @@ Semantics:
 
 - targets only blobs with `codec='zstd'` and no dictionary
 - does not touch `raw`, `zstd_delta`, or `chunked`
+- optional cohort filters narrow the candidate set before rewrite:
+  - `storage_class` (existing semantics)
+  - `series_key` (blob must be referenced by at least one locator span with that `series_key`)
+  - `dict_group` is an optional future axis only if implemented
 - `batch_size` caps **successful repacks**, not rows examined
 - one call is atomic
 
-### 8.15 `rechunk(*, storage_class=None, batch_size=100, min_blob_size=None) -> RechunkStats`
+### 8.16 `rechunk(*, storage_class=None, series_key=None, dict_group=None, batch_size=100, min_blob_size=None) -> RechunkStats`
 
 Converts eligible inline or delta blobs to `chunked` representation when beneficial.
 
@@ -550,17 +640,35 @@ Semantics:
 - explicit maintenance operation
 - requires chunking capability (`pyfastcdc` or equivalent)
 - respects `chunk_enabled`
+- optional cohort filters narrow the candidate set before rewrite:
+  - `storage_class` (existing semantics)
+  - `series_key` (blob must be referenced by at least one locator span with that `series_key`)
+  - `dict_group` is an optional future axis only if implemented
 - candidates are non-chunked blobs with `raw_size >= min_blob_size`
 - may rewrite `raw`, `zstd`, `zstd_dict`, or `zstd_delta` blobs
 - `batch_size` caps **blobs rewritten per call**
 - each blob rewrite is atomic; the whole call is not required to be all-or-nothing
 - emits one `fa.rechunk` event if at least one blob is rewritten
 
-### 8.16 `stats() -> ArchiveStats`
+### 8.17 `purge(locators, *, dry_run=False) -> PurgeStats`
+
+Removes all spans for the listed locators and deletes unreferenced physical payloads.
+
+Semantics:
+
+- all-or-nothing for the call
+- all input locators are deduplicated before processing
+- removes locator spans for listed locators
+- computes kept blobs as digests still referenced by remaining locators
+- keeps any blobs reachable through `base_digest` chains from kept blobs
+- deletes all non-kept blobs and any unreferenced chunks when not in dry-run mode
+- emits a `fa.purge` event when not dry-run and at least one locator was purged
+
+### 8.18 `stats() -> ArchiveStats`
 
 Returns an informative archive snapshot.
 
-### 8.17 `close() -> None`
+### 8.19 `close() -> None`
 
 Closes the database connection. Using the instance afterward is invalid except via reopening a new instance.
 
@@ -594,7 +702,13 @@ Delta encoding is only considered by `store()` and `store_batch()`, because both
 
 ### 10.2 Candidate pool
 
-Candidate bases are drawn from recent unique digests previously observed at the same locator, filtered by policy:
+Candidate bases are drawn from recent unique digests previously observed at:
+
+- the same locator, and
+- when `series_key` is provided, other locators that share that `series_key`, with the same general policy filters.
+
+When both sources are available, locator-local candidates are always considered alongside
+`series_key` candidates using the same filters; exact ordering is implementation-defined and affects only performance.
 
 - count cap: `delta_candidate_count`
 - raw size lower bound: `delta_min_size`
@@ -699,6 +813,10 @@ One event per successful repack call that rewrites at least one blob.
 
 One event per successful rechunk call that rewrites at least one blob.
 
+### 12.7 `fa.purge`
+
+One event per successful purge call that deletes locator spans.
+
 ---
 
 ## 13. Failure Modes
@@ -717,6 +835,7 @@ The following behaviors are part of the public contract:
 | `repack()` with unknown `dict_id` | `ValueError` | `dict_id ... not found` |
 | `train_dict()` without storage class | `ValueError` | `requires storage_class` |
 | `train_dict()` with too few samples | `ValueError` | `Need at least 10 samples` |
+| `purge()` with no locators | `ValueError` | `At least one locator is required for purge().` |
 | `rechunk()` without chunking capability | `ValueError` | `requires pyfastcdc` or equivalent |
 | `rechunk()` when chunking policy disabled | `ValueError` | `chunking not enabled` |
 | DB version newer than library | `RuntimeError` | `Upgrade farchive` |

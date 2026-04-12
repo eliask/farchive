@@ -196,7 +196,28 @@ def _cmd_history(args: argparse.Namespace) -> None:
     with _open_ro(args) as fa:
         spans = fa.history(args.locator)
     if not spans:
-        print(f"No history for: {args.locator}")
+        if args.json:
+            print("[]")
+        else:
+            print(f"No history for: {args.locator}")
+        return
+    if args.json:
+        items = []
+        for s in spans:
+            items.append(
+                {
+                    "span_id": s.span_id,
+                    "locator": s.locator,
+                    "digest": s.digest,
+                    "observed_from": s.observed_from,
+                    "observed_until": s.observed_until,
+                    "last_confirmed_at": s.last_confirmed_at,
+                    "observation_count": s.observation_count,
+                    "series_key": s.series_key,
+                    "last_metadata": s.last_metadata,
+                }
+            )
+        print(_json_dumps(items, indent=2))
         return
     print(f"History for: {args.locator} ({len(spans)} spans)")
     print(
@@ -218,6 +239,63 @@ def _cmd_locators(args: argparse.Namespace) -> None:
     for loc in locs:
         print(loc)
     print(f"\n{len(locs)} locators", file=sys.stderr)
+
+
+def _cmd_find(args: argparse.Namespace) -> None:
+    """Find locators by substring or prefix match."""
+    _ensure_db(args)
+    with _open_ro(args) as fa:
+        locator_rows = fa.locators()
+    if args.prefix:
+        locs = [loc for loc in locator_rows if loc.startswith(args.query)]
+    else:
+        locs = [loc for loc in locator_rows if args.query in loc]
+
+    if locs:
+        for loc in locs:
+            print(loc)
+    else:
+        print(f"No locators found for query: {args.query}")
+    print(f"\n{len(locs)} locators", file=sys.stderr)
+
+
+def _cmd_purge(args: argparse.Namespace) -> None:
+    if not args.confirm and not args.dry_run:
+        print(
+            "Refusing to purge without --confirm. "
+            "Use --dry-run first to preview.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    with Farchive(args.db) as fa:
+        stats = fa.purge(args.locator, dry_run=args.dry_run)
+
+    if args.json:
+        print(
+            _json_dumps(
+                {
+                    "locators_requested": stats.locators_requested,
+                    "locators_purged": stats.locators_purged,
+                    "spans_deleted": stats.spans_deleted,
+                    "blobs_deleted": stats.blobs_deleted,
+                    "chunks_deleted": stats.chunks_deleted,
+                    "dry_run": stats.dry_run,
+                }
+            )
+        )
+    elif args.dry_run:
+        print(
+            f"Dry run: would remove {stats.locators_purged} locator(s), "
+            f"{stats.spans_deleted} span(s), {stats.blobs_deleted} blob(s), "
+            f"{stats.chunks_deleted} chunk row(s)."
+        )
+    else:
+        print(
+            f"Purged {stats.locators_purged} locator(s): "
+            f"{stats.spans_deleted} span(s), {stats.blobs_deleted} blob(s), "
+            f"{stats.chunks_deleted} chunk row(s)."
+        )
 
 
 def _cmd_train_dict(args: argparse.Namespace) -> None:
@@ -249,12 +327,16 @@ def _cmd_repack(args: argparse.Namespace) -> None:
     sc = args.storage_class
     with Farchive(args.db) as fa:
         try:
-            stats = fa.repack(storage_class=sc, batch_size=args.batch_size)
+            stats = fa.repack(
+                storage_class=sc,
+                series_key=args.series_key,
+                batch_size=args.batch_size,
+            )
         except ValueError as e:
             print(f"Error: {e}", file=sys.stderr)
             print(
                 "Hint: use -s/--storage-class to specify which class to repack, "
-                "or use 'farchive optimize' to repack all classes with dicts.",
+                "or use 'farchive optimize repack --storage-class ...'.",
                 file=sys.stderr,
             )
             sys.exit(1)
@@ -264,11 +346,40 @@ def _cmd_repack(args: argparse.Namespace) -> None:
 def _cmd_events(args: argparse.Namespace) -> None:
     _ensure_db(args)
     with _open_ro(args) as fa:
-        events = fa.events(
-            locator=args.locator or None,
-            since=_parse_timestamp(args.since) if args.since else None,
-            limit=args.limit,
-        )
+        has_table = fa._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='event'"
+        ).fetchone()
+        if not has_table:
+            print("No event table (events never enabled for this archive).")
+            return
+
+        query = "SELECT * FROM event WHERE 1=1"
+        params: list = []
+        if args.locator:
+            query += " AND locator = ?"
+            params.append(args.locator)
+        if args.kind:
+            query += " AND kind = ?"
+            params.append(args.kind)
+        if args.locator_prefix:
+            query += " AND locator LIKE ?"
+            params.append(f"{args.locator_prefix}%")
+        if args.digest:
+            query += " AND digest = ?"
+            params.append(args.digest)
+        if args.since:
+            query += " AND occurred_at >= ?"
+            params.append(
+                int(args.since)
+                if args.since.isdigit()
+                else int(_parse_timestamp(args.since).timestamp() * 1000)
+            )
+        query += " ORDER BY occurred_at DESC, event_id DESC"
+        if args.limit:
+            query += " LIMIT ?"
+            params.append(args.limit)
+
+        events = fa._conn.execute(query, params).fetchall()
     if not events:
         print("No events found.")
         return
@@ -277,9 +388,10 @@ def _cmd_events(args: argparse.Namespace) -> None:
     )
     print("-" * 88)
     for e in events:
-        digest = e.digest[:12] if e.digest else ""
+        digest = e["digest"][:12] if e["digest"] else ""
         print(
-            f"{e.event_id:>8}  {_format_dt(e.occurred_at):<20} {e.locator:<30} {digest:<14} {e.kind:<12}"
+            f"{e['event_id']:>8}  {_format_dt(datetime.fromtimestamp(e['occurred_at'] / 1000.0).astimezone()):<20} "
+            f"{e['locator']:<30} {digest:<14} {e['kind']:<12}"
         )
     print(f"\n{len(events)} events", file=sys.stderr)
 
@@ -290,6 +402,7 @@ def _cmd_rechunk(args: argparse.Namespace) -> None:
         sc = args.storage_class or None
         stats = fa.rechunk(
             storage_class=sc,
+            series_key=args.series_key,
             batch_size=args.batch_size,
             min_blob_size=args.min_size,
         )
@@ -445,6 +558,7 @@ def _cmd_store(args: argparse.Namespace) -> None:
             data,
             observed_at=_parse_timestamp(args.at) if args.at else None,
             storage_class=args.storage_class,
+            series_key=args.series_key,
             metadata=metadata,
         )
 
@@ -477,6 +591,7 @@ def _cmd_resolve(args: argparse.Namespace) -> None:
                     "observed_until": span.observed_until,
                     "last_confirmed_at": span.last_confirmed_at,
                     "observation_count": span.observation_count,
+                    "series_key": span.series_key,
                     "last_metadata": span.last_metadata,
                 }
             )
@@ -489,6 +604,8 @@ def _cmd_resolve(args: argparse.Namespace) -> None:
         print(f"Observed until: {until}")
         print(f"Last confirmed: {_format_dt(span.last_confirmed_at)}")
         print(f"Observations:   {span.observation_count}")
+        if span.series_key:
+            print(f"Series key:     {span.series_key}")
         if span.last_metadata:
             print(f"Metadata:       {_json_dumps(span.last_metadata)}")
 
@@ -719,11 +836,22 @@ def _cmd_ls(args: argparse.Namespace) -> None:
                 print(f"\n{len(rows)} locators", file=sys.stderr)
 
         elif subcmd == "spans":
+            supports_series_key = fa._supports_span_series_key
             query = "SELECT * FROM locator_span WHERE 1=1"
             params: list = []
+            if args.series_key is not None and not supports_series_key:
+                print(
+                    "This archive schema does not support --series-key filters "
+                    "(locator_span.series_key is missing).",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
             if args.locator:
                 query += " AND locator = ?"
                 params.append(args.locator)
+            if args.series_key is not None:
+                query += " AND series_key = ?"
+                params.append(args.series_key)
             if args.since:
                 query += " AND observed_from >= ?"
                 params.append(
@@ -756,6 +884,7 @@ def _cmd_ls(args: argparse.Namespace) -> None:
                             "observed_until": r["observed_until"],
                             "last_confirmed_at": r["last_confirmed_at"],
                             "observation_count": r["observation_count"],
+                            "series_key": r["series_key"] if supports_series_key else None,
                         }
                     )
                 print(_json_dumps(items, indent=2))
@@ -1016,6 +1145,7 @@ def _cmd_observe(args: argparse.Namespace) -> None:
             args.locator,
             args.digest,
             observed_at=_parse_timestamp(args.at) if args.at else None,
+            series_key=args.series_key,
             metadata=metadata,
         )
 
@@ -1029,6 +1159,7 @@ def _cmd_observe(args: argparse.Namespace) -> None:
                     "observed_from": span.observed_from,
                     "observed_until": span.observed_until,
                     "observation_count": span.observation_count,
+                    "series_key": span.series_key,
                 }
             )
         )
@@ -1128,7 +1259,13 @@ def _cmd_import_files(args: argparse.Namespace) -> None:
                 ).fetchone()[0]
                 == 0
             )
-            fa.store(locator, data, observed_at=ts, storage_class=sc)
+            fa.store(
+                locator,
+                data,
+                observed_at=ts,
+                storage_class=sc,
+                series_key=args.series_key,
+            )
             if was_new:
                 imported += 1
             else:
@@ -1172,6 +1309,8 @@ def _cmd_import_manifest(args: argparse.Namespace) -> None:
                 entry["observed_at"] = int(parts[3]) if parts[3] else None
             if len(parts) > 4:
                 entry["metadata"] = json.loads(parts[4]) if parts[4] else None
+            if len(parts) > 5:
+                entry["series_key"] = parts[5] if parts[5] else None
             items.append(entry)
 
     imported = 0
@@ -1200,6 +1339,7 @@ def _cmd_import_manifest(args: argparse.Namespace) -> None:
             continue
 
         sc = item.get("storage_class")
+        series_key = item.get("series_key")
         raw_ts = item.get("observed_at")
         ts: datetime | None = None
         if raw_ts is not None:
@@ -1219,7 +1359,14 @@ def _cmd_import_manifest(args: argparse.Namespace) -> None:
                 ).fetchone()[0]
                 == 0
             )
-            fa.store(locator, data, observed_at=ts, storage_class=sc, metadata=meta)
+            fa.store(
+                locator,
+                data,
+                observed_at=ts,
+                storage_class=sc,
+                series_key=series_key,
+                metadata=meta,
+            )
             if was_new:
                 imported += 1
             else:
@@ -1417,52 +1564,35 @@ def _cmd_optimize(args: argparse.Namespace) -> None:
     """Umbrella maintenance: train dicts, repack, rechunk."""
     _ensure_db(args)
     with Farchive(args.db) as fa:
-        if not args.no_repack:
-            sc = args.storage_class
-            if sc:
-                repack_stats = fa.repack(storage_class=sc, batch_size=1000)
+        match args.operation:
+            case "repack":
+                batch_size = args.batch_size if args.batch_size is not None else 1000
+                stats = fa.repack(
+                    storage_class=args.storage_class,
+                    series_key=args.series_key,
+                    batch_size=batch_size,
+                )
                 print(
-                    f"Repack: {repack_stats.blobs_repacked:,} blobs, "
-                    f"saved {repack_stats.bytes_saved:,} bytes",
+                    f"Repack: {stats.blobs_repacked:,} blobs, "
+                    f"saved {stats.bytes_saved:,} bytes",
                     file=sys.stderr,
                 )
-            else:
-                classes = fa._conn.execute(
-                    "SELECT DISTINCT storage_class FROM blob WHERE storage_class IS NOT NULL"
-                ).fetchall()
-                total_repacked = 0
-                total_saved = 0
-                for row in classes:
-                    try:
-                        rs = fa.repack(storage_class=row[0], batch_size=1000)
-                        total_repacked += rs.blobs_repacked
-                        total_saved += rs.bytes_saved
-                    except ValueError:
-                        pass
-                if total_repacked > 0:
-                    print(
-                        f"Repack: {total_repacked:,} blobs, "
-                        f"saved {total_saved:,} bytes",
-                        file=sys.stderr,
-                    )
-
-        if not args.no_rechunk:
-            try:
-                rechunk_stats = fa.rechunk(
+            case "rechunk":
+                batch_size = args.batch_size if args.batch_size is not None else 100
+                stats = fa.rechunk(
                     storage_class=args.storage_class,
-                    batch_size=100,
+                    series_key=args.series_key,
+                    batch_size=batch_size,
+                    min_blob_size=args.min_size,
                 )
-                if rechunk_stats.blobs_rewritten > 0:
-                    print(
-                        f"Rechunk: {rechunk_stats.blobs_rewritten:,} blobs, "
-                        f"{rechunk_stats.chunks_added:,} chunks, "
-                        f"saved {rechunk_stats.bytes_saved:,} bytes",
-                        file=sys.stderr,
-                    )
-            except ValueError as e:
-                print(f"Rechunk skipped: {e}", file=sys.stderr)
-
-        print("Optimize complete.", file=sys.stderr)
+                print(
+                    f"Rechunk: {stats.blobs_rewritten:,} blobs, "
+                    f"{stats.chunks_added:,} chunks added, "
+                    f"saved {stats.bytes_saved:,} bytes",
+                    file=sys.stderr,
+                )
+            case _:
+                raise RuntimeError("Unsupported optimize operation")
 
 
 def _cmd_vacuum(args: argparse.Namespace) -> None:
@@ -1694,11 +1824,30 @@ def main(argv: list[str] | None = None) -> None:
     p = sub.add_parser("history", help="Show span history for a locator")
     p.add_argument("db", help="DB path")
     p.add_argument("locator", help="Locator string")
+    p.add_argument("--json", action="store_true", help="Output as JSON")
 
     # locators
     p = sub.add_parser("locators", help="List locators")
     p.add_argument("db", help="DB path")
     p.add_argument("--pattern", default="%", help="SQL LIKE pattern (default: %%)")
+
+    # find
+    p = sub.add_parser("find", help="Find locators by locator substring")
+    p.add_argument("db", help="DB path")
+    p.add_argument("query", help="Locator substring")
+    p.add_argument("--prefix", action="store_true", help="Match only at start")
+
+    # purge
+    p = sub.add_parser("purge", help="Delete locator history and unreferenced blobs")
+    p.add_argument("db", help="DB path")
+    p.add_argument(
+        "locator",
+        nargs="+",
+        help="Locator(s) to purge",
+    )
+    p.add_argument("--dry-run", action="store_true", help="Show what would be deleted")
+    p.add_argument("--confirm", action="store_true", help="Confirm destructive purge")
+    p.add_argument("--json", action="store_true", help="Output as JSON")
 
     # train-dict
     p = sub.add_parser("train-dict", help="Train a zstd dictionary")
@@ -1710,12 +1859,16 @@ def main(argv: list[str] | None = None) -> None:
     p = sub.add_parser("repack", help="Recompress blobs with latest dict")
     p.add_argument("db", help="DB path")
     p.add_argument("-s", "--storage-class", default=None, help="Storage class")
+    p.add_argument("--series-key", default=None, help="Filter by series key")
     p.add_argument("-n", "--batch-size", type=int, default=1000, help="Max repacks")
 
     # events
     p = sub.add_parser("events", help="Query event log")
     p.add_argument("db", help="DB path")
     p.add_argument("-l", "--locator", default=None, help="Filter by locator")
+    p.add_argument("--locator-prefix", default=None, help="Filter by locator prefix")
+    p.add_argument("--kind", default=None, help="Filter by event kind")
+    p.add_argument("--digest", default=None, help="Filter by digest")
     p.add_argument("--since", default=None, help="Timestamp >= (ms or ISO 8601)")
     p.add_argument("-n", "--limit", type=int, default=1000, help="Max events")
 
@@ -1728,6 +1881,7 @@ def main(argv: list[str] | None = None) -> None:
     p = sub.add_parser("rechunk", help="Convert eligible blobs to chunked form")
     p.add_argument("db", help="DB path")
     p.add_argument("-s", "--storage-class", default=None, help="Storage class")
+    p.add_argument("--series-key", default=None, help="Filter by series key")
     p.add_argument("-n", "--batch-size", type=int, default=100, help="Max rewrites")
     p.add_argument("--min-size", type=int, default=None, help="Min raw bytes")
 
@@ -1745,12 +1899,20 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("locator", help="Locator string")
     p.add_argument("path", help="File path, or '-' for stdin")
     p.add_argument("-s", "--storage-class", default=None, help="Storage class")
+    p.add_argument("--series-key", default=None, help="Delta lineage hint")
     p.add_argument("--at", default=None, help="Timestamp (ms or ISO 8601)")
     p.add_argument("--metadata", default=None, help="JSON metadata")
     p.add_argument("--json", action="store_true", help="Output as JSON")
 
     # resolve LOCATOR
     p = sub.add_parser("resolve", help="Show what a locator resolves to")
+    p.add_argument("db", help="DB path")
+    p.add_argument("locator", help="Locator string")
+    p.add_argument("--at", default=None, help="Point-in-time (ms or ISO 8601)")
+    p.add_argument("--json", action="store_true", help="Output as JSON")
+
+    # meta is a thin alias for resolve (canonical machine-readable output already in resolve --json)
+    p = sub.add_parser("meta", help="Show locator metadata (alias for resolve)")
     p.add_argument("db", help="DB path")
     p.add_argument("locator", help="Locator string")
     p.add_argument("--at", default=None, help="Point-in-time (ms or ISO 8601)")
@@ -1788,6 +1950,7 @@ def main(argv: list[str] | None = None) -> None:
         help="What to list (default: locators)",
     )
     p.add_argument("-l", "--locator", default=None, help="Filter by locator")
+    p.add_argument("--series-key", default=None, help="Filter spans by series key")
     p.add_argument("-d", "--digest", default=None, help="Filter by digest")
     p.add_argument("-c", "--codec", default=None, help="Filter by codec")
     p.add_argument("-s", "--storage-class", default=None, help="Filter by class")
@@ -1810,6 +1973,7 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("locator", help="Locator string")
     p.add_argument("digest", help="SHA-256 digest")
     p.add_argument("--at", default=None, help="Timestamp (ms or ISO 8601)")
+    p.add_argument("--series-key", default=None, help="Delta lineage hint")
     p.add_argument("--metadata", default=None, help="JSON metadata")
     p.add_argument("--json", action="store_true", help="Output as JSON")
 
@@ -1820,6 +1984,7 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("-r", "--recursive", action="store_true", help="Recurse")
     p.add_argument("-p", "--prefix", default=None, help="Locator prefix")
     p.add_argument("-s", "--storage-class", default=None, help="Storage class")
+    p.add_argument("--series-key", default=None, help="Delta lineage hint")
     p.add_argument(
         "--class-by-ext",
         action="append",
@@ -1864,11 +2029,19 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--text", action="store_true", help="Show text diff if UTF-8")
 
     # optimize
-    p = sub.add_parser("optimize", help="Run maintenance: repack + rechunk")
+    p = sub.add_parser("optimize", help="Run one explicit maintenance operation")
     p.add_argument("db", help="DB path")
+    p.add_argument(
+        "operation",
+        choices=["repack", "rechunk"],
+        help="Which maintenance operation to run",
+    )
     p.add_argument("-s", "--storage-class", default=None, help="Storage class")
-    p.add_argument("--no-repack", action="store_true", help="Skip repack")
-    p.add_argument("--no-rechunk", action="store_true", help="Skip rechunk")
+    p.add_argument("--series-key", default=None, help="Filter by series key")
+    p.add_argument(
+        "-n", "--batch-size", type=int, default=None, help="Max rewritten rows"
+    )
+    p.add_argument("--min-size", type=int, default=None, help="Min raw bytes for rechunk")
 
     # vacuum
     p = sub.add_parser("vacuum", help="SQLite maintenance")
@@ -1901,6 +2074,8 @@ def main(argv: list[str] | None = None) -> None:
         "stats": _cmd_stats,
         "history": _cmd_history,
         "locators": _cmd_locators,
+        "find": _cmd_find,
+        "purge": _cmd_purge,
         "train-dict": _cmd_train_dict,
         "repack": _cmd_repack,
         "events": _cmd_events,
@@ -1909,6 +2084,7 @@ def main(argv: list[str] | None = None) -> None:
         "cat": _cmd_cat,
         "store": _cmd_store,
         "resolve": _cmd_resolve,
+        "meta": _cmd_resolve,
         "has": _cmd_has,
         "du": _cmd_du,
         "ls": _cmd_ls,
