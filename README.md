@@ -41,6 +41,8 @@ with Farchive("scrape.farchive") as fa:
 
 ## Install
 
+Farchive is published on PyPI: [pypi.org/project/farchive](https://pypi.org/project/farchive/).
+
 ```
 pip install farchive
 ```
