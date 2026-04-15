@@ -96,9 +96,9 @@ class TestCat:
         assert b"ambiguous" in result.stderr
         assert b"--digest" in result.stderr
 
-    def test_cat_by_explicit_locator_flag(self, tmp_path):
+    def test_cat_by_positional_locator(self, tmp_path):
         db = _populated_db(tmp_path)
-        result = _run(["cat", str(db), "--locator", "loc/a"])
+        result = _run(["cat", str(db), "loc/a"])
         assert result.returncode == 0
         assert result.stdout == b"hello world"
 

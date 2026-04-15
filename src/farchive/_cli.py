@@ -483,53 +483,83 @@ def _cmd_inspect(args: argparse.Namespace) -> None:
 def _cmd_cat(args: argparse.Namespace) -> None:
     """Write raw bytes to stdout. Errors to stderr. Nothing else."""
     _ensure_db(args)
+    refs = args.refs or []
+    pattern = args.pattern
+    has_digest = args.digest is not None
+
+    # Mutual exclusion checks
+    if has_digest and refs:
+        print("Error: --digest cannot be combined with positional locators", file=sys.stderr)
+        sys.exit(1)
+    if has_digest and pattern:
+        print("Error: --digest cannot be combined with --pattern", file=sys.stderr)
+        sys.exit(1)
+    if refs and pattern:
+        print("Error: positional locators cannot be combined with --pattern", file=sys.stderr)
+        sys.exit(1)
+    if not has_digest and not refs and not pattern:
+        print("Error: must specify locators, --digest, or --pattern", file=sys.stderr)
+        sys.exit(1)
+
+    at = _parse_timestamp(args.at) if args.at else None
+
     with _open_ro(args) as fa:
-        # Determine ref: explicit flag > positional > error
-        if args.digest:
-            ref = args.digest
-            is_digest = True
-        elif args.locator:
-            ref = args.locator
-            is_digest = False
-        elif args.ref:
-            ref = args.ref
-            # Heuristic: 64 hex chars could be digest OR could be opaque locator
-            # Error on ambiguous case to preserve opaque locator semantics
+        # Single digest mode
+        if has_digest:
+            data = fa.read(args.digest)
+            if data is None:
+                print(f"Digest not found: {args.digest}", file=sys.stderr)
+                sys.exit(1)
+            sys.stdout.buffer.write(data)
+            return
+
+        # Resolve locators: from positional args or from --pattern query
+        if pattern:
+            locators = fa.locators(pattern=pattern)
+            if not locators:
+                print(f"No locators matched pattern: {pattern}", file=sys.stderr)
+                sys.exit(1)
+        else:
+            locators = refs
+
+        # Single-ref 64-hex ambiguity check
+        if len(locators) == 1 and not pattern:
+            ref = locators[0]
             is_64_hex = len(ref) == 64 and all(
                 c in "0123456789abcdef" for c in ref.lower()
             )
             if is_64_hex:
                 print(
                     f"Error: ambiguous ref '{ref[:16]}...'. "
-                    f"Use --digest or --locator explicitly.",
+                    f"Use --digest explicitly.",
                     file=sys.stderr,
                 )
                 sys.exit(1)
-            is_digest = False
-        else:
-            print(
-                "Error: must specify --locator, --digest, or positional ref",
-                file=sys.stderr,
-            )
-            sys.exit(1)
 
-        at = _parse_timestamp(args.at) if args.at else None
-
-        if is_digest:
-            data = fa.read(ref)
-            if data is None:
-                print(f"Digest not found: {ref}", file=sys.stderr)
-                sys.exit(1)
-        else:
-            span = fa.resolve(ref, at=at)
+        # Stream each locator's content
+        had_error = False
+        prefix = args.prefix_with_locator and len(locators) > 1
+        seen_digests = set() if args.unique else None
+        for loc in locators:
+            span = fa.resolve(loc, at=at)
             if span is None:
-                print(f"No span found for locator: {ref}", file=sys.stderr)
-                sys.exit(1)
+                print(f"No span found for locator: {loc}", file=sys.stderr)
+                had_error = True
+                continue
+            if seen_digests is not None:
+                if span.digest in seen_digests:
+                    continue
+                seen_digests.add(span.digest)
             data = fa.read(span.digest)
             if data is None:
                 print(f"Blob missing for digest: {span.digest}", file=sys.stderr)
-                sys.exit(1)
-    sys.stdout.buffer.write(data)
+                had_error = True
+                continue
+            if prefix:
+                sys.stdout.buffer.write(f"==> {loc} <==\n".encode())
+            sys.stdout.buffer.write(data)
+        if had_error:
+            sys.exit(1)
 
 
 def _cmd_store(args: argparse.Namespace) -> None:
@@ -1885,13 +1915,17 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("-n", "--batch-size", type=int, default=100, help="Max rewrites")
     p.add_argument("--min-size", type=int, default=None, help="Min raw bytes")
 
-    # cat LOCATOR|DIGEST
+    # cat LOCATOR... or --pattern
     p = sub.add_parser("cat", help="Write raw bytes to stdout")
     p.add_argument("db", help="DB path")
-    p.add_argument("ref", nargs="?", default=None, help="Locator or SHA-256 digest")
-    p.add_argument("--locator", default=None, help="Explicit locator")
-    p.add_argument("--digest", default=None, help="Explicit digest")
+    p.add_argument("refs", nargs="*", help="Locators to concatenate")
+    p.add_argument("--digest", default=None, help="Explicit SHA-256 digest (single)")
+    p.add_argument("--pattern", default=None, help="LIKE pattern for locators (e.g. 'html://%%')")
     p.add_argument("--at", default=None, help="Point-in-time (ms or ISO 8601)")
+    p.add_argument("--prefix-with-locator", action="store_true",
+                    help="Prepend '==> locator <==' header before each locator's content")
+    p.add_argument("--unique", action="store_true",
+                    help="Skip locators that resolve to an already-emitted digest")
 
     # store LOCATOR FILE
     p = sub.add_parser("store", help="Store content at a locator")
